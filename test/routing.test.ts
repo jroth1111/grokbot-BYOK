@@ -1,7 +1,7 @@
 /**
  * Tests for provider routing, failover chains, and the circuit breaker.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { ProviderRegistry } from "../src/providers/registry.js";
 import { CircuitBreaker } from "../src/providers/failover.js";
 import { BaseProvider } from "../src/providers/base.js";
@@ -214,6 +214,10 @@ describe("CircuitBreaker.classifyError", () => {
   it("classifies 400 and 404 as request-error", () => {
     expect(breaker.classifyError(400)).toBe("request-error");
     expect(breaker.classifyError(404)).toBe("request-error");
+    // Other malformed-request codes are also request-error.
+    expect(breaker.classifyError(405)).toBe("request-error");
+    expect(breaker.classifyError(413)).toBe("request-error");
+    expect(breaker.classifyError(422)).toBe("request-error");
   });
 
   it("classifies 401, 402, and 403 as auth-error", () => {
@@ -231,10 +235,20 @@ describe("CircuitBreaker.classifyError", () => {
     expect(breaker.classifyError(502)).toBe("server-error");
     expect(breaker.classifyError(503)).toBe("server-error");
     expect(breaker.classifyError(504)).toBe("server-error");
+    // Upper boundary of the 5xx range is inclusive.
+    expect(breaker.classifyError(599)).toBe("server-error");
   });
 
   it("classifies 0 (and other unknown codes) as network-error", () => {
     expect(breaker.classifyError(0)).toBe("network-error");
+    // 408 is an explicit request-timeout -> network-error special case.
+    expect(breaker.classifyError(408)).toBe("network-error");
+    // A 4xx code that is not in any explicit bucket is "unknown".
+    expect(breaker.classifyError(418)).toBe("network-error");
+    // Codes at or above 600 fall through to network-error.
+    expect(breaker.classifyError(600)).toBe("network-error");
+    // Negative / nonsensical codes are treated as transport failures too.
+    expect(breaker.classifyError(-1)).toBe("network-error");
   });
 });
 
@@ -295,6 +309,9 @@ describe("CircuitBreaker.recordFailure", () => {
 });
 
 describe("CircuitBreaker.setProviderConfig", () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
   it("uses per-provider cooldowns when set", () => {
     const breaker = new CircuitBreaker({ failureThreshold: 2 });
     breaker.setProviderConfig("p", {
@@ -306,12 +323,8 @@ describe("CircuitBreaker.setProviderConfig", () => {
     breaker.recordFailure("p", "rate-limit");
     expect(breaker.shouldTry("p")).toBe(false);
     // After the short cooldown elapses, a half-open probe is allowed.
-    return new Promise<void>((resolve) => {
-      setTimeout(() => {
-        expect(breaker.shouldTry("p")).toBe(true);
-        resolve();
-      }, 80);
-    });
+    vi.advanceTimersByTime(80);
+    expect(breaker.shouldTry("p")).toBe(true);
   });
 
   it("uses per-provider failureThreshold when set", () => {
@@ -324,24 +337,23 @@ describe("CircuitBreaker.setProviderConfig", () => {
 });
 
 describe("CircuitBreaker half-open probe", () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
   it("allows a probe after cooldown, closes on success, re-opens on failure", () => {
     const breaker = new CircuitBreaker({ failureThreshold: 3, rateLimitCooldownMs: 50 });
     breaker.recordFailure("p", "rate-limit");
     breaker.recordFailure("p", "rate-limit");
     breaker.recordFailure("p", "rate-limit");
     expect(breaker.shouldTry("p")).toBe(false);
-    return new Promise<void>((resolve) => {
-      setTimeout(() => {
-        // Half-open: probe allowed after cooldown.
-        expect(breaker.shouldTry("p")).toBe(true);
-        // A successful probe closes the circuit.
-        breaker.recordSuccess("p");
-        expect(breaker.shouldTry("p")).toBe(true);
-        expect(breaker.getState("p").open).toBe(false);
-        expect(breaker.getState("p").failures).toBe(0);
-        resolve();
-      }, 80);
-    });
+    // Half-open: probe allowed after cooldown.
+    vi.advanceTimersByTime(80);
+    expect(breaker.shouldTry("p")).toBe(true);
+    // A successful probe closes the circuit.
+    breaker.recordSuccess("p");
+    expect(breaker.shouldTry("p")).toBe(true);
+    expect(breaker.getState("p").open).toBe(false);
+    expect(breaker.getState("p").failures).toBe(0);
   });
 
   it("re-opens the circuit on recordFailure after a half-open probe", () => {
@@ -349,21 +361,20 @@ describe("CircuitBreaker half-open probe", () => {
     breaker.recordFailure("p", "rate-limit");
     breaker.recordFailure("p", "rate-limit");
     breaker.recordFailure("p", "rate-limit");
-    return new Promise<void>((resolve) => {
-      setTimeout(() => {
-        // Half-open: probe allowed.
-        expect(breaker.shouldTry("p")).toBe(true);
-        // A failed probe re-opens the circuit.
-        breaker.recordFailure("p", "server-error");
-        expect(breaker.shouldTry("p")).toBe(false);
-        expect(breaker.getState("p").open).toBe(true);
-        resolve();
-      }, 80);
-    });
+    // Half-open: probe allowed.
+    vi.advanceTimersByTime(80);
+    expect(breaker.shouldTry("p")).toBe(true);
+    // A failed probe re-opens the circuit.
+    breaker.recordFailure("p", "server-error");
+    expect(breaker.shouldTry("p")).toBe(false);
+    expect(breaker.getState("p").open).toBe(true);
   });
 });
 
 describe("CircuitBreaker per-error-type cooldowns", () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
   it("uses rateLimitCooldownMs when opened by a rate-limit error", () => {
     const breaker = new CircuitBreaker({
       failureThreshold: 1,
@@ -373,12 +384,8 @@ describe("CircuitBreaker per-error-type cooldowns", () => {
     breaker.recordFailure("p", "rate-limit");
     expect(breaker.shouldTry("p")).toBe(false);
     // The short rate-limit cooldown should elapse quickly.
-    return new Promise<void>((resolve) => {
-      setTimeout(() => {
-        expect(breaker.shouldTry("p")).toBe(true);
-        resolve();
-      }, 80);
-    });
+    vi.advanceTimersByTime(80);
+    expect(breaker.shouldTry("p")).toBe(true);
   });
 
   it("uses serverErrorCooldownMs when opened by a server-error", () => {
@@ -390,12 +397,8 @@ describe("CircuitBreaker per-error-type cooldowns", () => {
     breaker.recordFailure("p", "server-error");
     expect(breaker.shouldTry("p")).toBe(false);
     // The long server-error cooldown should NOT have elapsed yet.
-    return new Promise<void>((resolve) => {
-      setTimeout(() => {
-        expect(breaker.shouldTry("p")).toBe(false);
-        resolve();
-      }, 80);
-    });
+    vi.advanceTimersByTime(80);
+    expect(breaker.shouldTry("p")).toBe(false);
   });
 });
 
@@ -554,9 +557,12 @@ describe("ProviderRegistry routing strategies", () => {
       true,
       selected.normalizedId,
     );
-    // Primary first, then other eligible providers, then the rest.
-    expect(chain[0].name).toBe("opencode-zen");
+    // Primary first, then the remaining eligible providers in round-robin
+    // order (continuing from the cursor position after the selection), then
+    // the rest. The cursor is at 2 after two resolutions, so the rotation
+    // starts at index 2 (local), wrapping to opencode-go.
     const names = chain.map((p) => p.name);
+    expect(names).toEqual(["opencode-zen", "local", "opencode-go"]);
     // All three providers present, no duplicates.
     expect(new Set(names).size).toBe(names.length);
     expect(names).toHaveLength(3);

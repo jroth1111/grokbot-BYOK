@@ -106,21 +106,35 @@ interface ProtoValue {
   listValue?: { values?: ProtoValue[] };
 }
 
-/** True if `v` looks like a google.protobuf.Value wrapper. */
+/** Known `google.protobuf.Value` wrapper variant keys. */
+const PROTO_VALUE_KEYS = [
+  "nullValue",
+  "numberValue",
+  "stringValue",
+  "boolValue",
+  "structValue",
+  "listValue",
+] as const;
+
+/**
+ * True if `v` looks like a google.protobuf.Value wrapper.
+ *
+ * A well-formed proto3 `Value` is a oneof carrying exactly one of the variant
+ * keys (`nullValue`/`numberValue`/`stringValue`/`boolValue`/`structValue`/
+ * `listValue`). Requiring a single key avoids false positives where a plain
+ * object merely happens to contain a wrapper-named field (e.g.
+ * `{ name: "x", stringValue: "y" }`) and would otherwise be collapsed, silently
+ * dropping the sibling fields.
+ */
 function isProtoValue(v: unknown): v is ProtoValue {
   if (typeof v !== "object" || v === null) {
     return false;
   }
   const keys = Object.keys(v as Record<string, unknown>);
-  const known = [
-    "nullValue",
-    "numberValue",
-    "stringValue",
-    "boolValue",
-    "structValue",
-    "listValue",
-  ];
-  return keys.some((k) => known.includes(k));
+  return (
+    keys.length === 1 &&
+    PROTO_VALUE_KEYS.includes(keys[0] as (typeof PROTO_VALUE_KEYS)[number])
+  );
 }
 
 /**

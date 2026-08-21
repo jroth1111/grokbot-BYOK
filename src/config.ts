@@ -64,6 +64,16 @@ export function interpolateEnv(value: string): string {
   });
 }
 
+/** Return `value` unless it is an empty string, in which case return `undefined`. */
+function nonEmpty(value: string | undefined): string | undefined {
+  return value && value.length > 0 ? value : undefined;
+}
+
+/** Structurally clone a plain-JSON config value (no functions/dates expected). */
+function deepClone<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
 /**
  * Recursively walk a parsed config value, interpolating `${VAR}` references in
  * every string. Objects and arrays are traversed; non-string primitives are
@@ -104,18 +114,28 @@ function interpolateDeep<T>(value: T): T {
  */
 export function loadConfig(configPath?: string): ShimConfig {
   const resolved =
-    configPath ??
-    process.env.SHIM_CONFIG ??
+    nonEmpty(configPath) ??
+    nonEmpty(process.env.SHIM_CONFIG) ??
     path.resolve(process.cwd(), DEFAULT_CONFIG_PATH);
 
   let raw: string;
   try {
     raw = fs.readFileSync(resolved, "utf8");
   } catch {
-    return applyEnvOverrides(DEFAULT_CONFIG);
+    // File missing or unreadable: boot with a *copy* of the built-in defaults
+    // so callers cannot mutate the module-level DEFAULT_CONFIG object.
+    return applyEnvOverrides(deepClone(DEFAULT_CONFIG));
   }
 
-  const parsed = JSON.parse(raw) as unknown;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    // A present-but-malformed config is a real error: surface it with the
+    // resolved path rather than silently falling back to defaults (which would
+    // mask the misconfiguration) or leaking a raw, context-free SyntaxError.
+    throw new Error(`Failed to parse config file at ${resolved}: ${(e as Error).message}`);
+  }
   const interpolated = interpolateDeep(parsed);
   return applyEnvOverrides(parseConfig(interpolated));
 }
@@ -125,11 +145,25 @@ export function loadConfig(configPath?: string): ShimConfig {
  * This preserves backward compatibility with v1 scripts that set SHIM_PORT,
  * SHIM_HOST, etc. directly rather than editing the config file.
  */
+
+/** String values (case-insensitive, trimmed) treated as boolean `false`. */
+const FALSY_ENV_VALUES = new Set(["0", "false", "no", "off", ""]);
+
 function applyEnvOverrides(config: ShimConfig): ShimConfig {
   const overrides: Partial<ShimConfig> = {};
-  if (process.env.SHIM_PORT) overrides.port = parseInt(process.env.SHIM_PORT, 10);
+  if (process.env.SHIM_PORT) {
+    const port = parseInt(process.env.SHIM_PORT, 10);
+    if (!Number.isFinite(port)) {
+      throw new Error(
+        `SHIM_PORT is not a valid integer: ${JSON.stringify(process.env.SHIM_PORT)}`,
+      );
+    }
+    overrides.port = port;
+  }
   if (process.env.SHIM_HOST) overrides.host = process.env.SHIM_HOST;
   if (process.env.SHIM_LOG_DIR !== undefined) overrides.logDir = process.env.SHIM_LOG_DIR;
-  if (process.env.SHIM_FAILOVER !== undefined) overrides.failover = process.env.SHIM_FAILOVER !== "0";
+  if (process.env.SHIM_FAILOVER !== undefined) {
+    overrides.failover = !FALSY_ENV_VALUES.has(process.env.SHIM_FAILOVER.trim().toLowerCase());
+  }
   return { ...config, ...overrides };
 }

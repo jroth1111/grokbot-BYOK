@@ -42,10 +42,15 @@ export class ToolCallAccumulator {
         continue;
       }
       for (const tc of toolCalls) {
-        const idx = tc.index;
+        // Composite key: combine the choice index with the per-choice
+        // tool_call index so that tool calls from different choices (n > 1)
+        // sharing the same tool_call index don't collide into one entry.
+        const idx = choice.index * 1000000 + tc.index;
         const existing = this.calls.get(idx);
-        const id = tc.id ?? existing?.id ?? "";
-        const name = tc.function?.name ?? existing?.name ?? "";
+        // Use || (not ??) for id/name so that an explicit empty string in a
+        // later delta doesn't overwrite a previously accumulated valid value.
+        const id = tc.id || existing?.id || "";
+        const name = tc.function?.name || existing?.name || "";
         const args = (existing?.args ?? "") + (tc.function?.arguments ?? "");
         this.calls.set(idx, { id, name, args });
       }

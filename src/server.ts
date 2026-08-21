@@ -505,6 +505,13 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
     let streamError = false;
     let promptTokens = 0;
     let completionTokens = 0;
+    // Set to true once the stream has ended (normally or on error) so a
+    // late-firing idle-timeout callback doesn't flip streamError after the
+    // finally block has already committed the success path. The stream-timeout
+    // guard's clear() cancels a pending timer, but a timer that has already
+    // fired (callback queued behind the finally block) would still run; this
+    // flag makes the callback a no-op in that race window.
+    let streamClosed = false;
 
     // The reader is assigned inside the try block; the timeout callback
     // references it via this outer variable so it can cancel a stalled stream.
@@ -512,6 +519,12 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
     const streamTimeout = createStreamTimeout(
       network.streamIdleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS,
       () => {
+        // Ignore a timeout that fires after the stream has already closed
+        // (e.g. the timer fired but its callback was queued behind the
+        // finally block's streamClosed/clear()).
+        if (streamClosed) {
+          return;
+        }
         streamError = true;
         logger.error("stream idle timeout", {
           model,
@@ -600,6 +613,9 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
         });
       }
     } finally {
+      // Mark the stream closed before clearing the timeout so a
+      // late-firing idle-timeout callback is ignored (see streamClosed).
+      streamClosed = true;
       streamTimeout.clear();
 
       // Flush accumulated tool calls. When the stream errored, emit them as
@@ -649,6 +665,18 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
   };
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
+
+  // When the server is closed — either by the graceful-shutdown path above
+  // or by an external server.close() call (e.g. in tests) — remove the
+  // signal handlers from the global process and clear the cleanup interval.
+  // Without this, repeated createServer() calls accumulate SIGTERM/SIGINT
+  // listeners on process (a handler leak) and leave orphaned intervals
+  // running after the server they belong to is gone.
+  server.on("close", () => {
+    process.removeListener("SIGTERM", shutdown);
+    process.removeListener("SIGINT", shutdown);
+    clearInterval(cleanupHandle);
+  });
 
   return server;
 }

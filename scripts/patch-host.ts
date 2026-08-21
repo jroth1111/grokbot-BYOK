@@ -20,8 +20,23 @@ import * as path from "node:path";
 import { execSync } from "node:child_process";
 import { loadConfig } from "../src/config.js";
 import { createLogger } from "../src/log.js";
+import type { ShimConfig } from "../src/types.js";
 
 const log = createLogger();
+
+/**
+ * Escape a string so it can be embedded verbatim inside a double-quoted
+ * JavaScript string literal in the generated source. Backslashes and double
+ * quotes are escaped, and raw newlines are converted to their escape sequences
+ * so the emitted line stays a single valid string literal.
+ */
+function escapeJsStringLiteral(s: string): string {
+  return s
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\r/g, "\\r")
+    .replace(/\n/g, "\\n");
+}
 
 /**
  * The routing-client function body that replaces the original
@@ -70,45 +85,195 @@ const ROUTING_CLIENT_BODY = `{
 const PATCH_MARKER = "routingClient";
 
 /**
- * The exact original function body (string match attempted first). Bundles
- * vary, so this is a best-effort literal that we fall back from to regex.
+ * Matches the function signature up to (and including) its opening brace.
+ * The parameter list is captured so it can be preserved verbatim in the
+ * replacement. We deliberately do NOT try to match the body with a regex:
+ * the original bundle contains nested blocks whose closing braces would
+ * terminate a non-greedy `[\s\S]*?\}` far too early. Instead the body is
+ * located by brace counting in {@link patchFunction}.
  */
-const ORIGINAL_FUNCTION_REGEX =
-  /function\s+createCursorInferencePromptSession\s*\([^)]*\)\s*\{[\s\S]*?\n\s*\}/;
+const FUNCTION_SIGNATURE_REGEX =
+  /function\s+createCursorInferencePromptSession\s*\(([^)]*)\)\s*\{/;
 
 /**
  * Replace the SAND_DEFAULT_MODEL_ID assignment with the configured model.
- * Matches `SAND_DEFAULT_MODEL_ID = "..."` or `SAND_DEFAULT_MODEL_ID="..."`.
+ * Matches `SAND_DEFAULT_MODEL_ID = "..."` and `SAND_DEFAULT_MODEL_ID = '...'`
+ * (with arbitrary surrounding whitespace), normalizing the result to a
+ * double-quoted literal.
+ *
+ * The configured model is escaped for inclusion in a JS string literal and
+ * substituted via a replacer *function* so that any `$` characters in the
+ * model name are not interpreted as `String.prototype.replace` patterns
+ * (e.g. `$&`, `$1`, `` $` ``, `$'`).
  */
 function patchDefaultModel(src: string, defaultModel: string): string {
-  const re = /SAND_DEFAULT_MODEL_ID\s*=\s*"[^"]*"/;
-  if (re.test(src)) {
-    return src.replace(re, `SAND_DEFAULT_MODEL_ID = "${defaultModel}"`);
+  // Match a complete JS string literal (double or single quoted), honouring
+  // backslash escapes so an existing value like `"my\"model"` is matched in
+  // full rather than truncating at the escaped quote.
+  const re = /\bSAND_DEFAULT_MODEL_ID\b\s*=\s*("([^"\\]|\\.)*"|'([^'\\]|\\.)*')/;
+  if (!re.test(src)) {
+    log.warn("patch-host: SAND_DEFAULT_MODEL_ID assignment not found; leaving unchanged");
+    return src;
   }
-  return src;
+  const escaped = escapeJsStringLiteral(defaultModel);
+  return src.replace(re, () => `SAND_DEFAULT_MODEL_ID = "${escaped}"`);
 }
 
 /**
  * Replace the createCursorInferencePromptSession function body with the
- * routing client. Tries an exact string match first, then a regex fallback.
+ * routing client. The signature is located with {@link FUNCTION_SIGNATURE_REGEX}
+ * and the matching closing brace is found by counting braces (ignoring braces
+ * inside string/template literals, regex literals, and comments) so that
+ * nested blocks in the original body do not terminate the match early.
+ *
  * Returns the patched source and whether a replacement was made.
  */
 function patchFunction(src: string): { src: string; patched: boolean } {
-  // Try exact string match against a few known original bodies first.
-  // (The original bundle's body is not available here, so we go straight to
-  // the regex fallback which handles arbitrary whitespace/content.)
-  const match = src.match(ORIGINAL_FUNCTION_REGEX);
-  if (match && match.index !== undefined) {
-    const signatureMatch = match[0].match(/function\s+createCursorInferencePromptSession\s*\([^)]*\)/);
-    if (signatureMatch) {
-      const replaced = `function createCursorInferencePromptSession${signatureMatch[0].slice(signatureMatch[0].indexOf("("))} ${ROUTING_CLIENT_BODY}`;
-      return {
-        src: src.slice(0, match.index) + replaced + src.slice(match.index + match[0].length),
-        patched: true,
-      };
-    }
+  const sigMatch = src.match(FUNCTION_SIGNATURE_REGEX);
+  if (!sigMatch || sigMatch.index === undefined) {
+    return { src, patched: false };
   }
-  return { src, patched: false };
+
+  // Index of the opening `{` of the function body (last char of the signature).
+  const openBraceIdx = sigMatch.index + sigMatch[0].length - 1;
+  const endIdx = findMatchingBrace(src, openBraceIdx);
+  if (endIdx === -1) {
+    log.warn("patch-host: could not find matching brace for createCursorInferencePromptSession");
+    return { src, patched: false };
+  }
+
+  const params = sigMatch[1];
+  const replaced = `function createCursorInferencePromptSession(${params}) ${ROUTING_CLIENT_BODY}`;
+  return {
+    src: src.slice(0, sigMatch.index) + replaced + src.slice(endIdx + 1),
+    patched: true,
+  };
+}
+
+/**
+ * Given the index of an opening `{` in `src`, return the index of the matching
+ * closing `}`, accounting for nested braces and skipping over string/template
+ * literals, regex literals, and line/block comments. Returns -1 if no match is
+ * found (unbalanced input).
+ */
+function findMatchingBrace(src: string, openIdx: number): number {
+  if (src[openIdx] !== "{") return -1;
+  let depth = 1;
+  let i = openIdx + 1;
+  let inStr: '"' | "'" | "`" | null = null;
+  let inLineComment = false;
+  let inBlockComment = false;
+  // Heuristic for distinguishing a regex literal (`/x/`) from division: a
+  // regex is assumed when the last non-space, non-comment significant char is
+  // one that can legally precede a regex (or when there is none yet).
+  let prevSignificant = "";
+
+  while (i < src.length && depth > 0) {
+    const ch = src[i];
+    const next = src[i + 1];
+
+    if (inLineComment) {
+      if (ch === "\n") inLineComment = false;
+      i++;
+      continue;
+    }
+    if (inBlockComment) {
+      if (ch === "*" && next === "/") {
+        inBlockComment = false;
+        i += 2;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    if (inStr) {
+      if (ch === "\\") {
+        i += 2;
+        continue;
+      }
+      if (ch === inStr) {
+        inStr = null;
+        prevSignificant = ch;
+      }
+      i++;
+      continue;
+    }
+
+    if (ch === "/" && next === "/") {
+      inLineComment = true;
+      i += 2;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      inBlockComment = true;
+      i += 2;
+      continue;
+    }
+    if (ch === "/") {
+      const regexAfter =
+        prevSignificant === "" || /[(,=:;!&|?{}[\];]/.test(prevSignificant);
+      if (regexAfter) {
+        // Scan to the closing `/`, skipping escaped chars and character classes.
+        i++;
+        let inClass = false;
+        while (i < src.length) {
+          const c = src[i];
+          if (c === "\\") {
+            i += 2;
+            continue;
+          }
+          if (c === "[") inClass = true;
+          else if (c === "]" && inClass) inClass = false;
+          else if (c === "/" && !inClass) {
+            i++;
+            break;
+          }
+          i++;
+        }
+        prevSignificant = "/";
+        continue;
+      }
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      inStr = ch;
+      i++;
+      continue;
+    }
+    if (ch === "{") {
+      depth++;
+    } else if (ch === "}") {
+      depth--;
+      if (depth === 0) return i;
+    }
+    if (!/\s/.test(ch)) prevSignificant = ch;
+    i++;
+  }
+  return -1;
+}
+
+/**
+ * Write the inference proxy URL to the proxy URL file so the patched host can
+ * discover the shim at runtime. The URL is taken from SAND_INFERENCE_PROXY_URL
+ * if set, otherwise derived from the shim's configured listen address
+ * (`http://<host>:<port>`). Nothing else in the project writes this file, so
+ * without this step the patched host would always throw
+ * "routingClient: no inference proxy URL configured" unless the env var is set.
+ *
+ * A write failure is non-fatal: the env-var fallback still works, and an
+ * already-running shim may itself refresh the file later.
+ */
+function writeProxyUrlFile(proxyUrlPath: string, config: ShimConfig): void {
+  const proxyUrl =
+    process.env.SAND_INFERENCE_PROXY_URL || `http://${config.host}:${config.port}`;
+  try {
+    writeFileSync(proxyUrlPath, proxyUrl + "\n", "utf8");
+    log.info("patch-host: wrote proxy URL file", { path: proxyUrlPath, proxyUrl });
+  } catch (err) {
+    log.warn("patch-host: failed to write proxy URL file", {
+      path: proxyUrlPath,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 function main(): void {
@@ -124,9 +289,11 @@ function main(): void {
     log.error("patch-host: host-main.cjs not found", { path: hostMainPath });
     process.exit(1);
   }
-  if (!existsSync(proxyUrlPath)) {
-    log.warn("patch-host: proxy URL file not found", { path: proxyUrlPath });
-  }
+
+  // Ensure the proxy URL file exists so the patched host can locate the shim.
+  // Done before reading host-main.cjs so it is refreshed even on the
+  // already-patched / no-op path.
+  writeProxyUrlFile(proxyUrlPath, config);
 
   let src: string;
   try {
@@ -136,24 +303,45 @@ function main(): void {
     process.exit(1);
   }
 
-  // Already patched?
+  // Already patched? Compare against the escaped form since that is what we
+  // write to disk; comparing the raw model would never match a name containing
+  // characters that get escaped (e.g. `"` or `\`).
   const hasMarker = src.includes(PATCH_MARKER);
-  const hasCorrectModel = src.includes(`SAND_DEFAULT_MODEL_ID = "${defaultModel}"`);
+  const expectedModelLiteral = `SAND_DEFAULT_MODEL_ID = "${escapeJsStringLiteral(defaultModel)}"`;
+  const hasCorrectModel = src.includes(expectedModelLiteral);
 
   if (hasMarker && hasCorrectModel) {
     log.info("patch-host: already patched, nothing to do");
     process.exit(0);
   }
 
-  // Apply patches.
+  // Apply patches. The function patch is only applied when the marker is
+  // absent; re-running patchFunction on an already-patched file would match
+  // the routing-client body (which itself contains nested braces) and
+  // corrupt it. When the marker is present we only need to refresh the model.
   let patched = src;
+  let fnPatched = false;
+  if (!hasMarker) {
+    const fnResult = patchFunction(patched);
+    patched = fnResult.src;
+    fnPatched = fnResult.patched;
+    if (!fnPatched) {
+      log.error("patch-host: could not locate createCursorInferencePromptSession to patch");
+      process.exit(1);
+    }
+  }
   patched = patchDefaultModel(patched, defaultModel);
-  const fnResult = patchFunction(patched);
-  patched = fnResult.src;
 
-  if (!fnResult.patched && !hasCorrectModel) {
-    log.error("patch-host: could not locate createCursorInferencePromptSession to patch");
-    process.exit(1);
+  // Create a backup before writing so the original can be recovered even if
+  // the process is killed between the write and the syntax check below.
+  const backupPath = `${hostMainPath}.bak`;
+  try {
+    writeFileSync(backupPath, src, "utf8");
+  } catch (err) {
+    log.warn("patch-host: failed to write backup", {
+      path: backupPath,
+      error: err instanceof Error ? err.message : String(err),
+    });
   }
 
   // Write back.
@@ -173,12 +361,12 @@ function main(): void {
     try {
       writeFileSync(hostMainPath, src, "utf8");
     } catch {
-      /* best-effort restore */
+      /* best-effort restore; the .bak backup still exists on disk */
     }
     process.exit(1);
   }
 
-  log.info("patch-host: patched successfully", { path: hostMainPath, defaultModel });
+  log.info("patch-host: patched successfully", { path: hostMainPath, defaultModel, fnPatched });
   process.exit(0);
 }
 

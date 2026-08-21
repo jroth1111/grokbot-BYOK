@@ -74,6 +74,8 @@ describe("interpolateEnv", () => {
     saved.FOO = process.env.FOO;
     saved.BAR = process.env.BAR;
     saved.MY_VAR = process.env.MY_VAR;
+    saved._MY_VAR = process.env._MY_VAR;
+    saved.MISSING_VAR = process.env.MISSING_VAR;
   });
 
   afterEach(() => {
@@ -104,8 +106,9 @@ describe("interpolateEnv", () => {
 
   it("only matches valid var names (starts with letter/underscore, alphanumeric+underscore)", () => {
     process.env.MY_VAR = "ok";
-    // Valid names replaced.
-    expect(interpolateEnv("${MY_VAR} ${_MY_VAR}")).toBe("ok ${_MY_VAR}");
+    process.env._MY_VAR = "also";
+    // Valid names (including a leading underscore) are replaced.
+    expect(interpolateEnv("${MY_VAR} ${_MY_VAR}")).toBe("ok also");
     // Invalid names (starting with a digit or containing invalid chars) are
     // left untouched because the regex doesn't match them.
     expect(interpolateEnv("${1BAD} ${BAD-NAME}")).toBe("${1BAD} ${BAD-NAME}");
@@ -126,7 +129,7 @@ describe("interpolateEnv", () => {
 // ---------------------------------------------------------------------------
 
 describe("loadConfig", () => {
-  const envKeys = ["SHIM_PORT", "SHIM_HOST", "SHIM_LOG_DIR", "SHIM_FAILOVER", "SHIM_CONFIG"];
+  const envKeys = ["SHIM_PORT", "SHIM_HOST", "SHIM_LOG_DIR", "SHIM_FAILOVER", "SHIM_CONFIG", "MY_API_KEY"];
   const saved: Record<string, string | undefined> = {};
 
   beforeEach(() => {
@@ -202,7 +205,6 @@ describe("loadConfig", () => {
       expect(cfg.providers.configs["opencode-go"].apiKey).toBe("interpolated-key");
     } finally {
       cleanupTemp(file);
-      delete process.env.MY_API_KEY;
     }
   });
 
@@ -311,6 +313,7 @@ describe("loadConfig", () => {
     const file = writeTempConfig({
       port: "not-a-number",
       host: "127.0.0.1",
+      sessionAffinity: validSessionAffinity(),
       providers: validProviders(),
       hostConfig: validHostConfig(),
     });
@@ -401,7 +404,9 @@ describe("shimConfigSchema / parseConfig", () => {
 
   it("config missing optional fields gets defaults (port, host, failover, etc.)", () => {
     const raw = {
-      sessionAffinity: validSessionAffinity(),
+      // sessionAffinity intentionally omitted except for the empty object so
+      // that `enabled` falls back to its schema default (false).
+      sessionAffinity: {},
       providers: validProviders(),
       hostConfig: validHostConfig(),
     };

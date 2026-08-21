@@ -13,6 +13,7 @@
  *   SHIM_LOG         Path to the shim log file (default: /tmp/inference-shim.log)
  *   HEALTH_WINDOW    Rolling window in seconds (default: 300)
  *   HEALTH_THRESHOLD Error-rate percentage that triggers CRITICAL (default: 50)
+ *   HEALTH_INTERVAL  Watch-mode check interval in seconds (default: 60)
  *   SHIM_PORT        Port to TCP-probe (default: from config)
  */
 import { readFileSync, existsSync } from "node:fs";
@@ -95,8 +96,15 @@ function tallyLog(
     } catch {
       continue;
     }
+    // JSON.parse("null") returns null; accessing .ts on null throws an
+    // uncaught TypeError because the try/catch above only wraps the parse.
+    // Also skip non-object primitives (numbers, booleans, strings) that
+    // JSON.parse can return.
+    if (rec === null || typeof rec !== "object") continue;
     const ts = parseTs(rec.ts);
-    if (Number.isNaN(ts) || ts < cutoff) continue;
+    // Skip records outside the rolling window: older than the cutoff OR
+    // implausibly far in the future (clock skew / bogus timestamps).
+    if (Number.isNaN(ts) || ts < cutoff || ts > now + 60_000) continue;
     total++;
     const msg = rec.msg ?? "";
     if (msg.includes("connected") || msg.includes("HTTP")) {
@@ -116,9 +124,14 @@ function computeStatus(
   thresholdPct: number,
 ): Status {
   if (!portUp) return "CRITICAL";
-  if (!tally || tally.responses === 0) {
+  if (!tally || tally.total === 0) {
     // No traffic yet — treat as OK (shim is up, just idle).
     return "OK";
+  }
+  if (tally.responses === 0) {
+    // There are log entries but none were recognized as response lines.
+    // If any are errors, treat as 100% error rate (CRITICAL); otherwise OK.
+    return tally.errors > 0 ? "CRITICAL" : "OK";
   }
   const errorRate = (tally.errors / tally.responses) * 100;
   if (errorRate >= thresholdPct) return "CRITICAL";
@@ -155,6 +168,7 @@ async function main(): Promise<void> {
   const logFile = process.env.SHIM_LOG ?? "/tmp/inference-shim.log";
   const windowSec = parseInt(process.env.HEALTH_WINDOW ?? "300", 10);
   const thresholdPct = parseInt(process.env.HEALTH_THRESHOLD ?? "50", 10);
+  const intervalSec = parseInt(process.env.HEALTH_INTERVAL ?? "60", 10);
   const port = parseInt(process.env.SHIM_PORT ?? String(config.port), 10);
   const host = config.host || "127.0.0.1";
 
@@ -167,6 +181,13 @@ async function main(): Promise<void> {
         log.warn("health-check: CRITICAL — auto-running deploy");
         try {
           execSync("node dist/scripts/deploy.js", { stdio: "inherit" });
+          // Re-check after deploy; exit 0 if the system recovered.
+          const recheck = await runOnce();
+          if (recheck !== "CRITICAL") {
+            log.info("health-check: recovered after deploy", { status: recheck });
+            process.exit(0);
+          }
+          log.error("health-check: still CRITICAL after deploy");
         } catch (err) {
           log.error("health-check: auto-deploy failed", { error: err instanceof Error ? err.message : String(err) });
           process.exit(1);
@@ -177,20 +198,33 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  // --watch: loop forever at 60s intervals.
-  log.info("health-check: watch mode started", { intervalSec: 60 });
+  // --watch: loop forever at configurable intervals.
+  log.info("health-check: watch mode started", { intervalSec });
+  // Cooldown between deploy attempts in watch mode to avoid hammering the
+  // deploy script on a persistently CRITICAL system. Set to one rolling
+  // window so we retry at most once per window period.
+  const deployCooldownMs = windowSec * 1000;
+  let lastDeployMs = 0;
   // eslint-disable-next-line no-constant-condition
   while (true) {
     const status = await runOnce();
     if (status === "CRITICAL" && args.deploy) {
-      log.warn("health-check: CRITICAL — auto-running deploy");
-      try {
-        execSync("node dist/scripts/deploy.js", { stdio: "inherit" });
-      } catch (err) {
-        log.error("health-check: auto-deploy failed", { error: err instanceof Error ? err.message : String(err) });
+      const nowMs = Date.now();
+      if (nowMs - lastDeployMs >= deployCooldownMs) {
+        lastDeployMs = nowMs;
+        log.warn("health-check: CRITICAL — auto-running deploy");
+        try {
+          execSync("node dist/scripts/deploy.js", { stdio: "inherit" });
+        } catch (err) {
+          log.error("health-check: auto-deploy failed", { error: err instanceof Error ? err.message : String(err) });
+        }
+      } else {
+        log.warn("health-check: CRITICAL — deploy cooldown active, skipping", {
+          cooldownRemainingSec: Math.ceil((deployCooldownMs - (nowMs - lastDeployMs)) / 1000),
+        });
       }
     }
-    await sleep(60_000);
+    await sleep(intervalSec * 1000);
   }
 }
 

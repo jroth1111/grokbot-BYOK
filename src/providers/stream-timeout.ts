@@ -30,17 +30,40 @@ export function createStreamTimeout(
 ): StreamTimeoutGuard {
   let timer: ReturnType<typeof setTimeout> | null = null;
   let cleared = false;
+  let fired = false;
+
+  // Clamp non-positive timeouts to 0. Node coerces negative delays to 0
+  // implicitly, but making it explicit guarantees a next-tick fire rather
+  // than relying on platform-specific behavior.
+  const delay = timeoutMs > 0 ? timeoutMs : 0;
 
   const arm = (): void => {
-    if (cleared) return;
+    // Don't (re)arm once the guard has been cleared or has already fired —
+    // onTimeout is documented to be invoked at most once.
+    if (cleared || fired) return;
     timer = setTimeout(() => {
       timer = null;
+      // Guard against a re-entrant reset() inside onTimeout re-arming and
+      // double-firing.
+      if (fired) return;
+      fired = true;
       onTimeout();
-    }, timeoutMs);
+    }, delay);
+    // Unref the timer so an idle stream-timeout doesn't keep the Node event
+    // loop (and therefore the process) alive on its own. Guarded for
+    // non-Node environments where the handle is a number with no unref().
+    if (
+      timer !== null &&
+      typeof (timer as { unref?: () => void }).unref === "function"
+    ) {
+      (timer as { unref: () => void }).unref();
+    }
   };
 
   return {
     reset(): void {
+      // Once fired the guard is done; reset() must not re-arm it.
+      if (fired) return;
       if (timer !== null) {
         clearTimeout(timer);
         timer = null;

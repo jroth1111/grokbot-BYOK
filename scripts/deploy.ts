@@ -21,7 +21,7 @@
  *   SHIM_PORT      Port the shim listens on (default: from config)
  */
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, unlinkSync, copyFileSync, symlinkSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, unlinkSync, copyFileSync, symlinkSync, renameSync } from "node:fs";
 import * as path from "node:path";
 import * as net from "node:net";
 import { fileURLToPath } from "node:url";
@@ -66,19 +66,35 @@ function portIsListening(host: string, port: number, timeoutMs = 1000): Promise<
 }
 
 /** Kill a process by PID file, then pkill by pattern. Best-effort. */
-function stopOldShim(pidFile: string): void {
+async function stopOldShim(pidFile: string): Promise<void> {
   if (existsSync(pidFile)) {
+    let pid: number | undefined;
     try {
-      const pid = parseInt(readFileSync(pidFile, "utf8").trim(), 10);
-      if (!Number.isNaN(pid)) {
-        try {
-          process.kill(pid, "SIGTERM");
-        } catch {
-          /* already dead */
-        }
-      }
+      const parsed = parseInt(readFileSync(pidFile, "utf8").trim(), 10);
+      if (!Number.isNaN(parsed)) pid = parsed;
     } catch {
       /* ignore read errors */
+    }
+    if (pid !== undefined) {
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch {
+        /* already dead */
+      }
+      // Wait up to 5s for graceful exit, then SIGKILL if still alive.
+      for (let i = 0; i < 50; i++) {
+        try {
+          process.kill(pid, 0);
+        } catch {
+          break; // process has exited
+        }
+        await sleep(100);
+      }
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        /* already dead */
+      }
     }
   }
   try {
@@ -101,16 +117,22 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const config = loadConfig();
 
-  const projectRoot = process.cwd();
+  // SCRIPT_DIR = directory of the *built* script (dist/scripts).
+  // Derive projectRoot from the script location so the deploy works
+  // regardless of the caller's working directory.
+  const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+  const distDir = path.resolve(scriptDir, "..");
+  const projectRoot = path.resolve(distDir, "..");
   const sandHostDir = process.env.SAND_HOST_DIR || config.hostConfig.sandHostDir || path.join(process.env.HOME ?? "/root", "sand-host");
   const shimPort = parseInt(process.env.SHIM_PORT ?? String(config.port), 10);
+  if (Number.isNaN(shimPort) || shimPort <= 0 || shimPort > 65535) {
+    log.error("deploy: invalid shim port", { port: process.env.SHIM_PORT ?? config.port });
+    process.exit(1);
+  }
   const shimHost = config.host || "127.0.0.1";
   const pidFile = "/tmp/inference-shim.pid";
   const logFile = "/tmp/inference-shim.log";
 
-  // SCRIPT_DIR = directory of the *built* script (dist/scripts).
-  const scriptDir = path.dirname(fileURLToPath(import.meta.url));
-  const distDir = path.resolve(scriptDir, "..");
   const shimBuilt = path.join(distDir, "shim.js");
   const deployTarget = path.join(sandHostDir, "inference-shim.cjs");
 
@@ -134,24 +156,36 @@ async function main(): Promise<void> {
 
   // Step 3: stop old shim
   log.info("deploy: step 3/8 stop old shim");
-  stopOldShim(pidFile);
-  await sleep(2000);
+  await stopOldShim(pidFile);
+  // Brief pause for the OS to release the listening socket.
+  await sleep(500);
 
-  // Step 4: deploy (symlink or copy)
+  // Step 4: deploy (symlink or copy) — atomic via temp file + rename.
   log.info("deploy: step 4/8 deploy shim", { copy: args.copy, target: deployTarget });
+  const tmpTarget = `${deployTarget}.${process.pid}.tmp`;
   try {
-    // Remove existing target (file or symlink).
+    // Clean up any stale temp file from a previous failed run.
     try {
-      unlinkSync(deployTarget);
+      unlinkSync(tmpTarget);
     } catch {
       /* not present */
     }
     if (args.copy) {
-      copyFileSync(shimBuilt, deployTarget);
+      copyFileSync(shimBuilt, tmpTarget);
     } else {
-      symlinkSync(shimBuilt, deployTarget);
+      // Relative symlink so the link survives repo moves.
+      const linkTarget = path.relative(path.dirname(deployTarget), shimBuilt);
+      symlinkSync(linkTarget, tmpTarget);
     }
+    // Atomically replace the deploy target (POSIX rename).
+    renameSync(tmpTarget, deployTarget);
   } catch (err) {
+    // Clean up the temp file on failure.
+    try {
+      unlinkSync(tmpTarget);
+    } catch {
+      /* ignore */
+    }
     log.error("deploy: failed to deploy shim", { error: err instanceof Error ? err.message : String(err) });
     process.exit(1);
   }

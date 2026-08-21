@@ -109,11 +109,16 @@ describe("Connect envelopes — edge cases", () => {
     expect(env.data.length).toBe(10000);
   });
 
-  it("parseEnvelopes returns subarray views that match the slice offsets", () => {
+  it("parseEnvelopes returns independent copies of the body data", () => {
     const payload = Buffer.from("hello", "utf8");
     const encoded = encodeEnvelope(DATA_FLAGS, payload);
     const [env] = parseEnvelopes(encoded);
-    // The data view should start at offset 5 within the encoded buffer.
+    // The body data should be an independent copy, not a subarray view that
+    // aliases the input buffer. Verify content correctness, then mutate the
+    // input buffer and confirm the envelope data is unaffected.
+    expect(env.data.toString("utf8")).toBe("hello");
+    expect(env.data.length).toBe(5);
+    encoded[5] = 0x58; // overwrite 'h' with 'X' in the input buffer
     expect(env.data.toString("utf8")).toBe("hello");
   });
 });

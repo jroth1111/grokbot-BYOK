@@ -13,29 +13,53 @@
 import type { Logger, LogLevel } from "./types.js";
 
 /**
- * JSON.stringify replacer that handles `BigInt`, `Error`, and `Buffer`
- * values. Anything else is passed through unchanged.
+ * Build a JSON.stringify replacer that handles `BigInt`, `Error`, and
+ * `Buffer` values, and guards against circular references.
  *
  * `JSON.stringify` invokes a value's `toJSON()` method *before* the replacer
  * runs, so for `Buffer` (which defines `toJSON`) the `value` argument is
  * already the serialized `{ type: "Buffer", data: [...] }` shape rather than
  * the original `Buffer`. We therefore inspect the original value via
  * `this[key]` and serialize it ourselves.
+ *
+ * A per-call `WeakSet` tracks every object value we have already entered. If
+ * the same object reference is encountered again it is replaced with the
+ * string `"[Circular]"`, which prevents `JSON.stringify` from throwing
+ * `TypeError: Converting circular structure to JSON`. A logger must never
+ * throw, so this guard is essential. (Shared — non-cyclic — references are
+ * also rendered as `"[Circular]"` on their second sighting; this matches the
+ * behaviour of production loggers such as pino and is acceptable for log
+ * output.)
+ *
+ * A fresh replacer (and therefore a fresh `WeakSet`) is created for each
+ * `emit()` call so state never leaks between log lines.
  */
-function jsonReplacer(this: Record<string, unknown>, key: string, value: unknown): unknown {
-  const original = this[key];
+function makeReplacer(): (this: Record<string, unknown>, key: string, value: unknown) => unknown {
+  const seen = new WeakSet<object>();
+  return function jsonReplacer(this: Record<string, unknown>, key: string, value: unknown): unknown {
+    const original = this[key];
 
-  // BigInt is not JSON-serializable by default.
-  if (typeof original === "bigint") {
-    return original.toString();
-  }
-  if (original instanceof Error) {
-    return { message: original.message, stack: original.stack };
-  }
-  if (Buffer.isBuffer(original)) {
-    return original.toString("utf8");
-  }
-  return value;
+    // Cycle detection: track every object we enter and short-circuit a
+    // revisit. Primitives (including bigint) are skipped here.
+    if (original !== null && typeof original === "object") {
+      if (seen.has(original as object)) {
+        return "[Circular]";
+      }
+      seen.add(original as object);
+    }
+
+    // BigInt is not JSON-serializable by default.
+    if (typeof original === "bigint") {
+      return original.toString();
+    }
+    if (original instanceof Error) {
+      return { message: original.message, stack: original.stack };
+    }
+    if (Buffer.isBuffer(original)) {
+      return original.toString("utf8");
+    }
+    return value;
+  };
 }
 
 /**
@@ -52,7 +76,22 @@ function emit(level: LogLevel, msg: string, fields?: Record<string, unknown>): v
       record[k] = v;
     }
   }
-  process.stdout.write(JSON.stringify(record, jsonReplacer) + "\n");
+  // A logger must never throw: wrap serialization so an unexpected
+  // (non-circular) failure still emits a usable line rather than crashing
+  // the caller. The replacer handles the known hard cases (BigInt, Error,
+  // Buffer, circular references) up front.
+  let line: string;
+  try {
+    line = JSON.stringify(record, makeReplacer());
+  } catch (err) {
+    line = JSON.stringify({
+      ts: record.ts,
+      level,
+      msg,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  process.stdout.write(line + "\n");
 }
 
 /**

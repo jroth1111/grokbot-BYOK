@@ -5,6 +5,11 @@ import { describe, it, expect } from "vitest";
 import { SessionAffinity } from "../src/providers/session-affinity.js";
 import type { InferenceStreamRequest } from "../src/types.js";
 
+/** Promise that resolves after `ms` milliseconds. */
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // ---------------------------------------------------------------------------
 // extractSessionId
 // ---------------------------------------------------------------------------
@@ -45,15 +50,16 @@ describe("SessionAffinity.getBinding", () => {
     expect(sa.getBinding("sess-1")).toBe("opencode-go");
   });
 
-  it("returns null and deletes an expired binding", () => {
+  it("returns null and deletes an expired binding", async () => {
     const sa = new SessionAffinity({ enabled: true, ttlMs: 50 });
     sa.bind("sess-1", "opencode-go");
-    return new Promise<void>((resolve) => {
-      setTimeout(() => {
-        expect(sa.getBinding("sess-1")).toBeNull();
-        resolve();
-      }, 80);
-    });
+    await delay(80);
+    expect(sa.getBinding("sess-1")).toBeNull();
+    // Verify the binding was actually deleted from the map, not merely
+    // reported as expired (getBinding returns null in both cases).
+    const bindings = (sa as unknown as { bindings: Map<string, unknown> })
+      .bindings;
+    expect(bindings.has("sess-1")).toBe(false);
   });
 });
 
@@ -64,20 +70,15 @@ describe("SessionAffinity.bind", () => {
     expect(sa.getBinding("sess-1")).toBe("local");
   });
 
-  it("refreshes an existing binding", () => {
+  it("refreshes an existing binding", async () => {
     const sa = new SessionAffinity({ enabled: true, ttlMs: 200 });
     sa.bind("sess-1", "opencode-go");
     // Re-bind halfway through the TTL to refresh boundAt.
-    return new Promise<void>((resolve) => {
-      setTimeout(() => {
-        sa.bind("sess-1", "opencode-zen");
-        // Wait beyond the original TTL — the refreshed binding should survive.
-        setTimeout(() => {
-          expect(sa.getBinding("sess-1")).toBe("opencode-zen");
-          resolve();
-        }, 150);
-      }, 100);
-    });
+    await delay(100);
+    sa.bind("sess-1", "opencode-zen");
+    // Wait beyond the original TTL — the refreshed binding should survive.
+    await delay(150);
+    expect(sa.getBinding("sess-1")).toBe("opencode-zen");
   });
 });
 
@@ -97,15 +98,11 @@ describe("SessionAffinity.hasValidBinding", () => {
     expect(sa.hasValidBinding("nope")).toBe(false);
   });
 
-  it("returns false for an expired binding", () => {
+  it("returns false for an expired binding", async () => {
     const sa = new SessionAffinity({ enabled: true, ttlMs: 50 });
     sa.bind("sess-1", "opencode-go");
-    return new Promise<void>((resolve) => {
-      setTimeout(() => {
-        expect(sa.hasValidBinding("sess-1")).toBe(false);
-        resolve();
-      }, 80);
-    });
+    await delay(80);
+    expect(sa.hasValidBinding("sess-1")).toBe(false);
   });
 });
 
@@ -114,19 +111,15 @@ describe("SessionAffinity.hasValidBinding", () => {
 // ---------------------------------------------------------------------------
 
 describe("SessionAffinity.cleanup", () => {
-  it("removes expired bindings", () => {
+  it("removes expired bindings", async () => {
     const sa = new SessionAffinity({ enabled: true, ttlMs: 50 });
     sa.bind("expired", "opencode-go");
-    return new Promise<void>((resolve) => {
-      setTimeout(() => {
-        // Bind "fresh" now so it is still within its TTL after cleanup.
-        sa.bind("fresh", "opencode-zen");
-        sa.cleanup();
-        expect(sa.hasValidBinding("expired")).toBe(false);
-        expect(sa.hasValidBinding("fresh")).toBe(true);
-        resolve();
-      }, 80);
-    });
+    await delay(80);
+    // Bind "fresh" now so it is still within its TTL after cleanup.
+    sa.bind("fresh", "opencode-zen");
+    sa.cleanup();
+    expect(sa.hasValidBinding("expired")).toBe(false);
+    expect(sa.hasValidBinding("fresh")).toBe(true);
   });
 
   it("is a no-op when there are no bindings", () => {

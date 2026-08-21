@@ -66,7 +66,11 @@ export function parseEnvelopes(buf: Buffer): ConnectEnvelope[] {
       );
     }
 
-    envelopes.push({ flags, data: buf.subarray(bodyStart, bodyEnd) });
+    // Copy the body out of `buf` rather than returning a subarray view.
+    // A view would alias the input buffer, so if the caller reuses or mutates
+    // it (e.g. a recycled network read buffer) the envelope data would be
+    // silently corrupted. Buffer.from(Buffer) allocates an independent copy.
+    envelopes.push({ flags, data: Buffer.from(buf.subarray(bodyStart, bodyEnd)) });
     offset = bodyEnd;
   }
 

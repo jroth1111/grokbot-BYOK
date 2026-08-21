@@ -25,23 +25,40 @@ export class SseParser {
   /**
    * Feed a chunk of raw SSE text to the parser.
    *
-   * Lines are split on `\r\n` or `\n`. Non-`data:` field lines (`event:`,
-   * `id:`, comments) are ignored. A blank line dispatches the accumulated
-   * `data:` lines (joined with `\n`) into the queue, skipping empty payloads.
+   * Lines are split on `\r\n`, `\r`, or `\n` (all three are valid SSE line
+   * terminators). Non-`data:` field lines (`event:`, `id:`, comments) are
+   * ignored. A blank line dispatches the accumulated `data:` lines (joined
+   * with `\n`) into the queue, skipping empty payloads.
    *
    * @param chunk  Raw text received from the upstream stream.
    */
   feed(chunk: string): void {
     this.buffer += chunk;
 
-    // Normalize CRLF to LF so we can split on a single delimiter. Any stray
-    // lone \r is left in place and treated as ordinary content.
-    const normalized = this.buffer.replace(/\r\n/g, "\n");
-    const lines = normalized.split("\n");
+    // A trailing '\r' is ambiguous: it may be a lone CR (a line break on its
+    // own, per the SSE spec) or the opening byte of a CRLF whose '\n' has not
+    // arrived yet. Peel it off before normalizing so it is neither consumed as
+    // a lone-CR break nor collapsed into the wrong line; it is re-attached to
+    // the retained partial so the next feed can complete a CRLF.
+    let work = this.buffer;
+    let pendingCr = "";
+    if (work.endsWith("\r")) {
+      pendingCr = "\r";
+      work = work.slice(0, -1);
+    }
 
-    // The final element is whatever follows the last newline — it may be a
-    // partial line with more to come, so keep it buffered.
-    this.buffer = lines.pop() ?? "";
+    // Normalize every line terminator to '\n'. CRLF first (so the '\r' is not
+    // doubled into two breaks), then any remaining lone CR — the SSE spec
+    // recognizes a lone CR as a line terminator just like LF. After this,
+    // 'work' contains no '\r' characters.
+    work = work.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+    const lines = work.split("\n");
+
+    // The final element is whatever follows the last line break — it may be a
+    // partial line with more to come, so keep it buffered along with the
+    // peeled trailing CR (if any).
+    this.buffer = (lines.pop() ?? "") + pendingCr;
 
     for (const rawLine of lines) {
       this.processLine(rawLine);
@@ -63,12 +80,8 @@ export class SseParser {
    * Process a single complete line (no trailing newline).
    */
   private processLine(line: string): void {
-    // Strip a single trailing \r left from a CRLF that was split on \n only
-    // after normalization missed it (e.g. lone \r\n inside content already
-    // handled, but be defensive).
-    if (line.endsWith("\r")) {
-      line = line.slice(0, -1);
-    }
+    // 'line' is a complete line with its terminator already stripped by feed()'s
+    // normalization, so it contains no '\r' characters.
 
     // A blank line dispatches the current event.
     if (line === "") {

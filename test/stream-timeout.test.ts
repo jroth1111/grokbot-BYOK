@@ -77,29 +77,30 @@ describe("createStreamTimeout", () => {
 
   it("multiple reset() calls keep the stream alive indefinitely", async () => {
     let fired = false;
-    const guard = createStreamTimeout(15, () => {
+    const guard = createStreamTimeout(100, () => {
       fired = true;
     });
-    // Reset several times, each well within the timeout window.
+    // Reset several times, each well within the timeout window (3x margin).
     for (let i = 0; i < 6; i++) {
       guard.reset();
-      await delay(10);
+      await delay(30);
     }
     guard.clear();
-    await delay(40);
+    await delay(150);
     expect(fired).toBe(false);
   });
 
   it("clear() prevents a pending timeout from firing", async () => {
     let fired = false;
-    const guard = createStreamTimeout(30, () => {
+    const guard = createStreamTimeout(100, () => {
       fired = true;
     });
     guard.reset();
-    // Clear before the 30ms timeout elapses.
-    await delay(15);
+    // Clear before the timeout elapses (3x margin so a slow event loop
+    // cannot let the timer fire before clear() runs).
+    await delay(30);
     guard.clear();
-    await delay(60);
+    await delay(150);
     expect(fired).toBe(false);
   });
 

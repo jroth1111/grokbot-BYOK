@@ -31,6 +31,13 @@ import type {
   ShimConfig,
 } from "../src/types.js";
 
+// Each createServer() call registers SIGTERM/SIGINT listeners on `process`
+// (for graceful shutdown) that are never removed when the server closes. This
+// file boots many shim servers (one per describe block), which exceeds Node's
+// default EventEmitter limit of 10 and produces spurious memory-leak warnings.
+// Lift the cap for the test process.
+process.setMaxListeners(0);
+
 const STREAM_PATH = "/aiserver.v1.InferenceService/Stream";
 
 // ---------------------------------------------------------------------------

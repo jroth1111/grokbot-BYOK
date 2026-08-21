@@ -127,7 +127,13 @@ export function convertRequest(reqJson: InferenceStreamRequest): OpenAIChatReque
     }
 
     if (role === "assistant") {
-      const entry: OpenAIMessage = { role, content: content || null };
+      // Coerce falsy/empty content to null for assistant messages: both the
+      // empty string and an empty content-parts array should become null
+      // (an empty array is truthy, so a plain `|| null` would let it through).
+      const hasContent = Array.isArray(content)
+        ? content.length > 0
+        : content !== "";
+      const entry: OpenAIMessage = { role, content: hasContent ? content : null };
 
       const toolCalls: OpenAIToolCall[] = [];
       for (const tc of m.toolCalls ?? []) {
@@ -163,13 +169,13 @@ export function convertRequest(reqJson: InferenceStreamRequest): OpenAIChatReque
 
   const cfg = reqJson.modelConfig;
   if (cfg) {
-    if (cfg.maxTokens != null) {
+    if (cfg.maxTokens != null && Number.isFinite(cfg.maxTokens)) {
       body.max_tokens = cfg.maxTokens;
     }
-    if (cfg.temperature != null) {
+    if (cfg.temperature != null && Number.isFinite(cfg.temperature)) {
       body.temperature = cfg.temperature;
     }
-    if (cfg.topP != null) {
+    if (cfg.topP != null && Number.isFinite(cfg.topP)) {
       body.top_p = cfg.topP;
     }
     if (cfg.stopSequences != null && cfg.stopSequences.length > 0) {

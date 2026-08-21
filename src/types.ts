@@ -30,6 +30,26 @@ export interface InferenceStreamRequest {
   invocationId?: string;
   model_id?: string;
   modelId?: string;
+  /** Cursor conversation id (proto3 JSON camelCase). */
+  chatId?: string;
+  /** Whether to use server-side prompt caching. */
+  usePromptCache?: boolean;
+  /** Cache key for prompt caching. */
+  promptCacheKey?: string;
+  /** Workspace file paths included as context. */
+  workspacePaths?: string[];
+  /** When true, image content is stripped from the request. */
+  excludeImages?: boolean;
+  /** Cursor prompt-summarizer configuration (opaque message, passed through). */
+  promptSummarizerConfig?: unknown;
+  /** Cursor prompt template (opaque message, passed through). */
+  promptTmpl?: unknown;
+  /** Cursor prompt inputs (opaque message, passed through). */
+  promptInputs?: unknown;
+  /** Cursor request type enum (number or suffixed enum string). */
+  requestType?: number | string;
+  /** Cursor request checkpoint (opaque message, passed through). */
+  requestCheckpoint?: unknown;
 }
 
 /** A single message in the inference request. */
@@ -113,6 +133,12 @@ export interface OpenAIToolCall {
 export interface OpenAISSEChunk {
   id?: string;
   model?: string;
+  /** Always "chat.completion.chunk" for streaming responses. */
+  object?: string;
+  /** Unix timestamp (seconds) of chunk creation. */
+  created?: number;
+  /** Provider fingerprint of the model that served the request. */
+  system_fingerprint?: string;
   choices?: {
     index: number;
     delta: {
@@ -131,8 +157,12 @@ export interface OpenAISSEChunk {
   usage?: {
     prompt_tokens?: number;
     completion_tokens?: number;
+    /** Total tokens (prompt + completion); always present on the usage chunk. */
+    total_tokens?: number;
     promptTokens?: number;
     completionTokens?: number;
+    /** CamelCase alias for total_tokens (some OpenAI-compatible providers). */
+    totalTokens?: number;
   };
 }
 

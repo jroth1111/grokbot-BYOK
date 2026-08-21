@@ -18,6 +18,13 @@ import {
 } from "../src/protocol/connect.js";
 import type { InferenceStreamRequest, ShimConfig } from "../src/types.js";
 
+// Each createServer() call registers SIGTERM/SIGINT listeners on `process`
+// (for graceful shutdown) that are never removed when the server closes. With
+// multiple integration suites in one process this exceeds Node's default
+// EventEmitter limit of 10 and produces spurious memory-leak warnings. Lift
+// the cap for the test process.
+process.setMaxListeners(0);
+
 const STREAM_PATH = "/aiserver.v1.InferenceService/Stream";
 
 /** A config where every provider points at a closed localhost port. */
@@ -105,7 +112,15 @@ describe("e2e: shim server with no upstream", () => {
   });
 
   afterAll(() => {
-    server.close();
+    // Drop any lingering keep-alive connections before closing so the server
+    // fully releases its port and the worker can exit cleanly. Return the
+    // close promise so vitest waits for shutdown to actually complete instead
+    // of tearing down while the server is still bound.
+    const s = server as unknown as { closeAllConnections?: () => void };
+    s.closeAllConnections?.();
+    return new Promise<void>((resolve) => {
+      server.close(() => resolve());
+    });
   });
 
   it(

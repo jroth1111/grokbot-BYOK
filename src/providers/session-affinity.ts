@@ -116,9 +116,12 @@ export class SessionAffinity {
 
   /**
    * Determine whether a binding has exceeded its TTL.
-   * A binding is expired if Date.now() - boundAt > ttlMs.
+   * A binding is expired once it has lived for at least ttlMs, i.e. when
+   * Date.now() - boundAt >= ttlMs. Using >= (rather than >) ensures a binding
+   * is treated as expired exactly at its TTL boundary instead of one tick
+   * later.
    */
   private isExpired(binding: SessionBinding): boolean {
-    return Date.now() - binding.boundAt > this.ttlMs;
+    return Date.now() - binding.boundAt >= this.ttlMs;
   }
 }

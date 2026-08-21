@@ -48,23 +48,37 @@ export class BaseProvider implements Provider {
   readonly network: NetworkConfig;
   readonly models: Map<string, string>;
 
-  /** Round-robin cursor for key selection. */
+  /** Round-robin cursor for key selection. Bounded to prevent overflow. */
   private keyCursor: number = 0;
-  /** Keys that have been marked as failed and are temporarily out of rotation. */
-  private failedKeys: Set<KeyInfo> = new Set();
+  /**
+   * Values of keys that have been marked as failed and are temporarily out
+   * of rotation. Tracked by key *value* (string) rather than by object
+   * reference so that a caller who reconstructs or clones a KeyInfo can
+   * still mark it failed and have it skipped by selectKey.
+   */
+  private failedKeys: Set<string> = new Set();
 
   constructor(name: string, config: ProviderConfig) {
     this.name = name;
-    this.baseUrl = config.baseUrl.replace(/\/+$/, "");
+    // Guard against undefined/null baseUrl and trim surrounding whitespace
+    // before stripping trailing slashes so edge cases like
+    // "https://example.com/v1/ " are handled correctly.
+    this.baseUrl = (config.baseUrl ?? "").trim().replace(/\/+$/, "");
     this.defaultModel = config.defaultModel;
     this.network = config.network ?? {};
 
     // Build the keys array. If `config.keys` is provided and non-empty,
     // use those (filtering out explicitly disabled keys). Otherwise,
     // create a single KeyInfo from the legacy `config.apiKey` field.
+    // If all provided keys are disabled (leaving an empty array after
+    // filtering), fall back to the legacy `config.apiKey` so selectKey
+    // never returns undefined.
     if (config.keys && config.keys.length > 0) {
       this.keys = config.keys.filter((k) => k.enabled !== false);
     } else {
+      this.keys = [];
+    }
+    if (this.keys.length === 0) {
       this.keys = [{ value: config.apiKey, weight: 1, enabled: true }];
     }
 
@@ -73,8 +87,11 @@ export class BaseProvider implements Provider {
 
     // Build the merged models map: start from provider-level aliases,
     // then merge each key's per-key aliases (per-key overrides
-    // provider-level for the same alias).
-    const mergedModels = new Map<string, string>(Object.entries(config.models));
+    // provider-level for the same alias). Guard against undefined
+    // config.models so Object.entries doesn't throw at runtime.
+    const mergedModels = new Map<string, string>(
+      Object.entries(config.models ?? {}),
+    );
     for (const key of this.keys) {
       if (key.models) {
         for (const [alias, model] of Object.entries(key.models)) {
@@ -102,7 +119,7 @@ export class BaseProvider implements Provider {
    */
   selectKey(): KeyInfo {
     const enabled = this.keys.filter(
-      (k) => k.enabled !== false && !this.failedKeys.has(k),
+      (k) => k.enabled !== false && !this.failedKeys.has(k.value),
     );
     if (enabled.length === 0) {
       // All keys failed — reset and try again.
@@ -110,7 +127,11 @@ export class BaseProvider implements Provider {
       return this.keys[0];
     }
     const key = enabled[this.keyCursor % enabled.length];
-    this.keyCursor++;
+    // Wrap the cursor within enabled.length to prevent unbounded growth
+    // on long-running servers. This is safe because enabled.length only
+    // changes when markKeyFailed or resetKeyFailures is called, both of
+    // which reset keyCursor to 0.
+    this.keyCursor = (this.keyCursor + 1) % enabled.length;
     return key;
   }
 
@@ -124,7 +145,7 @@ export class BaseProvider implements Provider {
    * a now-shorter enabled array.
    */
   markKeyFailed(key: KeyInfo): void {
-    this.failedKeys.add(key);
+    this.failedKeys.add(key.value);
     this.keyCursor = 0;
   }
 

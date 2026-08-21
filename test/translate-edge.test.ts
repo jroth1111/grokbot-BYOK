@@ -340,6 +340,7 @@ describe("convertRequest — edge cases", () => {
 describe("response frame factories — edge cases", () => {
   it("makeTextFrame with an empty string yields text ''", () => {
     const frame = makeTextFrame("", true);
+    expect("textPart" in frame).toBe(true);
     if ("textPart" in frame) {
       expect(frame.textPart.text).toBe("");
     }
@@ -347,6 +348,7 @@ describe("response frame factories — edge cases", () => {
 
   it("makeTextFrame with null text coerces to ''", () => {
     const frame = makeTextFrame(null as unknown as string, false);
+    expect("textPart" in frame).toBe(true);
     if ("textPart" in frame) {
       expect(frame.textPart.text).toBe("");
       expect(frame.textPart.isFinal).toBe(false);
@@ -355,6 +357,7 @@ describe("response frame factories — edge cases", () => {
 
   it("makeTextFrame with undefined text coerces to ''", () => {
     const frame = makeTextFrame(undefined as unknown as string, true);
+    expect("textPart" in frame).toBe(true);
     if ("textPart" in frame) {
       expect(frame.textPart.text).toBe("");
       expect(frame.textPart.isFinal).toBe(true);
@@ -363,6 +366,7 @@ describe("response frame factories — edge cases", () => {
 
   it("makeTextFrame isFinal true sets isFinal true", () => {
     const frame = makeTextFrame("done", true);
+    expect("textPart" in frame).toBe(true);
     if ("textPart" in frame) {
       expect(frame.textPart.isFinal).toBe(true);
     }
@@ -370,6 +374,7 @@ describe("response frame factories — edge cases", () => {
 
   it("makeTextFrame isFinal false sets isFinal false", () => {
     const frame = makeTextFrame("chunk", false);
+    expect("textPart" in frame).toBe(true);
     if ("textPart" in frame) {
       expect(frame.textPart.isFinal).toBe(false);
     }
@@ -377,6 +382,7 @@ describe("response frame factories — edge cases", () => {
 
   it("makeToolCallFrame with empty args yields args ''", () => {
     const frame = makeToolCallFrame("call_1", "fn", "", true);
+    expect("toolCallPart" in frame).toBe(true);
     if ("toolCallPart" in frame) {
       expect(frame.toolCallPart.args).toBe("");
       expect(frame.toolCallPart.isComplete).toBe(true);
@@ -390,6 +396,7 @@ describe("response frame factories — edge cases", () => {
       null as unknown as string,
       false,
     );
+    expect("toolCallPart" in frame).toBe(true);
     if ("toolCallPart" in frame) {
       expect(frame.toolCallPart.args).toBe("");
     }
@@ -397,6 +404,7 @@ describe("response frame factories — edge cases", () => {
 
   it("makeToolCallFrame preserves id and name", () => {
     const frame = makeToolCallFrame("id-xyz", "tool_name", "{}", true);
+    expect("toolCallPart" in frame).toBe(true);
     if ("toolCallPart" in frame) {
       expect(frame.toolCallPart.toolCallId).toBe("id-xyz");
       expect(frame.toolCallPart.toolName).toBe("tool_name");
@@ -405,6 +413,7 @@ describe("response frame factories — edge cases", () => {
 
   it("makeUsageFrame with 0 tokens yields 0, 0", () => {
     const frame = makeUsageFrame(0, 0);
+    expect("usage" in frame).toBe(true);
     if ("usage" in frame) {
       expect(frame.usage).toEqual({ promptTokens: 0, completionTokens: 0 });
     }
@@ -415,6 +424,7 @@ describe("response frame factories — edge cases", () => {
       undefined as unknown as number,
       undefined as unknown as number,
     );
+    expect("usage" in frame).toBe(true);
     if ("usage" in frame) {
       expect(frame.usage).toEqual({ promptTokens: 0, completionTokens: 0 });
     }
@@ -422,6 +432,7 @@ describe("response frame factories — edge cases", () => {
 
   it("makeErrorFrame with an empty message defaults to 'inference error'", () => {
     const frame = makeErrorFrame("");
+    expect("error" in frame).toBe(true);
     if ("error" in frame) {
       expect(frame.error.message).toBe("inference error");
       expect(frame.error.code).toBe("");
@@ -433,6 +444,7 @@ describe("response frame factories — edge cases", () => {
 
   it("makeErrorFrame preserves a provided message", () => {
     const frame = makeErrorFrame("kaboom");
+    expect("error" in frame).toBe(true);
     if ("error" in frame) {
       expect(frame.error.message).toBe("kaboom");
     }
@@ -440,6 +452,7 @@ describe("response frame factories — edge cases", () => {
 
   it("makeErrorFrame with null message defaults to 'inference error'", () => {
     const frame = makeErrorFrame(null as unknown as string);
+    expect("error" in frame).toBe(true);
     if ("error" in frame) {
       expect(frame.error.message).toBe("inference error");
     }
@@ -447,6 +460,7 @@ describe("response frame factories — edge cases", () => {
 
   it("makeResponseInfoFrame produces a string createdAt timestamp", () => {
     const frame = makeResponseInfoFrame("chatcmpl-x", "gpt-4o");
+    expect("responseInfo" in frame).toBe(true);
     if ("responseInfo" in frame) {
       expect(typeof frame.responseInfo.createdAt).toBe("string");
       expect(frame.responseInfo.createdAt.length).toBeGreaterThan(0);
@@ -516,7 +530,10 @@ describe("ToolCallAccumulator — edge cases", () => {
       ],
     });
     expect(acc.size).toBe(1);
-    const tc = acc.flush(true)[0];
+    const frames = acc.flush(true);
+    expect(frames.length).toBeGreaterThanOrEqual(1);
+    const tc = frames[0];
+    expect("toolCallPart" in tc).toBe(true);
     if ("toolCallPart" in tc) {
       expect(tc.toolCallPart.args).toBe('{"a":1}');
     }
@@ -568,7 +585,10 @@ describe("ToolCallAccumulator — edge cases", () => {
         },
       ],
     });
-    const tc = acc.flush(true)[0];
+    const frames = acc.flush(true);
+    expect(frames.length).toBeGreaterThanOrEqual(1);
+    const tc = frames[0];
+    expect("toolCallPart" in tc).toBe(true);
     if ("toolCallPart" in tc) {
       expect(tc.toolCallPart.toolCallId).toBe("call_id");
       expect(tc.toolCallPart.toolName).toBe("tool_name");
@@ -588,7 +608,10 @@ describe("ToolCallAccumulator — edge cases", () => {
         },
       ],
     });
-    for (const frame of acc.flush(true)) {
+    const frames = acc.flush(true);
+    expect(frames.length).toBeGreaterThan(0);
+    for (const frame of frames) {
+      expect("toolCallPart" in frame).toBe(true);
       if ("toolCallPart" in frame) {
         expect(frame.toolCallPart.isComplete).toBe(true);
       }
@@ -607,7 +630,10 @@ describe("ToolCallAccumulator — edge cases", () => {
         },
       ],
     });
-    for (const frame of acc.flush(false)) {
+    const frames = acc.flush(false);
+    expect(frames.length).toBeGreaterThan(0);
+    for (const frame of frames) {
+      expect("toolCallPart" in frame).toBe(true);
       if ("toolCallPart" in frame) {
         expect(frame.toolCallPart.isComplete).toBe(false);
       }
@@ -713,7 +739,10 @@ describe("ToolCallAccumulator — edge cases", () => {
         },
       ],
     });
-    const tc = acc.flush(true)[0];
+    const frames = acc.flush(true);
+    expect(frames.length).toBeGreaterThanOrEqual(1);
+    const tc = frames[0];
+    expect("toolCallPart" in tc).toBe(true);
     if ("toolCallPart" in tc) {
       expect(tc.toolCallPart.toolCallId).toBe("");
       expect(tc.toolCallPart.toolName).toBe("");

@@ -20,8 +20,14 @@ export type RetryDecision = "retry" | "failover" | "stop";
  * retry uses attempt 0, the second attempt 1, etc.
  */
 export function computeBackoff(attempt: number, initialMs: number, maxMs: number): number {
-  const exponential = initialMs * Math.pow(2, attempt);
-  const capped = Math.min(exponential, maxMs);
+  // Clamp negative attempts to 0. A negative retry count is nonsensical and
+  // would otherwise shrink the backoff below `initialMs` via `2^negative`.
+  const safeAttempt = Math.max(0, attempt);
+  const exponential = initialMs * Math.pow(2, safeAttempt);
+  // Guard against `Math.pow` overflow: for very large attempts `2^attempt`
+  // becomes `Infinity`, and `0 * Infinity` becomes `NaN`. In either case fall
+  // back to the cap instead of letting `NaN` propagate through the jitter.
+  const capped = Number.isFinite(exponential) ? Math.min(exponential, maxMs) : maxMs;
   const jitter = 0.8 + Math.random() * 0.4; // 0.8 .. 1.2
   return Math.floor(capped * jitter);
 }
@@ -48,6 +54,10 @@ export function shouldRetry(
   attempt: number,
   maxRetries: number,
 ): RetryDecision {
+  // Clamp negative attempts to 0. A negative value would otherwise satisfy
+  // `attempt < maxRetries` even when `maxRetries` is 0, granting a retry that
+  // the caller never authorised.
+  const safeAttempt = Math.max(0, attempt);
   switch (errorType) {
     case "request-error":
       return "stop";
@@ -56,7 +66,7 @@ export function shouldRetry(
     case "rate-limit":
     case "server-error":
     case "network-error":
-      return attempt < maxRetries ? "retry" : "failover";
+      return safeAttempt < maxRetries ? "retry" : "failover";
     default:
       return "failover";
   }

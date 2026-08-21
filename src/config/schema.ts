@@ -65,7 +65,7 @@ export const shimConfigSchema = z.object({
   host: z.string().default("127.0.0.1"),
   logDir: z.string().default(""),
   failover: z.boolean().default(true),
-  requestTimeoutMs: z.number().default(30000),
+  requestTimeoutMs: z.number().positive().default(30000),
   routingStrategy: z.enum(["priority", "round-robin", "weighted-round-robin", "fill-first"]).default("priority"),
   sessionAffinity: sessionAffinitySchema,
   providers: providersSchema,

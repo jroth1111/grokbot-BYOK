@@ -65,9 +65,21 @@ export function makeToolCallFrame(
       toolCallId,
       toolName,
       args: args || "",
-      isComplete,
+      isComplete: !!isComplete,
     },
   };
+}
+
+/**
+ * Coerce a raw token count into a safe non-negative finite number.
+ *
+ * `NaN`, `Infinity`, `-Infinity`, `undefined`, and negative values all
+ * collapse to `0`; any other finite, non-negative value is returned as-is.
+ * This is stricter than a plain `value || 0`, which lets negatives and
+ * `Infinity` leak through (token counts can never be negative or infinite).
+ */
+function safeTokenCount(n: number): number {
+  return Number.isFinite(n) && n >= 0 ? n : 0;
 }
 
 /**
@@ -82,8 +94,8 @@ export function makeUsageFrame(
 ): InferenceStreamResponse {
   return {
     usage: {
-      promptTokens: promptTokens || 0,
-      completionTokens: completionTokens || 0,
+      promptTokens: safeTokenCount(promptTokens),
+      completionTokens: safeTokenCount(completionTokens),
     },
   };
 }

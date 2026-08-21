@@ -135,8 +135,23 @@ export class ProviderRegistry {
       return undefined;
     }
 
-    const weights = eligible.map((p) => this.providerWeight(p));
+    // Clamp each provider's effective weight to >= 0. A negative weight is
+    // invalid configuration; if left as-is it can shrink the total weight
+    // toward zero (or below), which breaks the SWRR invariant: subtracting
+    // a non-positive total from the selected provider's current weight would
+    // never reduce it (or would increase it), so that provider's current
+    // weight would grow without bound and it would be selected forever.
+    const weights = eligible.map((p) => Math.max(0, this.providerWeight(p)));
     const totalWeight = weights.reduce((sum, w) => sum + w, 0);
+
+    // When every eligible provider has zero weight, the SWRR algorithm is
+    // degenerate: every provider's current weight stays 0 and the strict
+    // `>` comparison always picks the first one. Fall back to plain
+    // round-robin so traffic still distributes evenly across eligible
+    // providers instead of hammering the first one forever.
+    if (totalWeight === 0) {
+      return this.selectRoundRobin(normalizedId);
+    }
 
     let state = this.weightedState.get(normalizedId);
     if (!state) {
@@ -256,7 +271,13 @@ export class ProviderRegistry {
 
     // Order the other eligible providers according to the strategy.
     let orderedEligible: Provider[];
-    if (this.strategy === "round-robin") {
+    if (eligible.length === 0) {
+      // No provider canHandle the model (e.g. the primary was the
+      // strategy-fallback default). Skip strategy ordering entirely — the
+      // priority-order tail below still gives failover somewhere to go.
+      // Guarding here also avoids `cursor % 0` producing NaN.
+      orderedEligible = [];
+    } else if (this.strategy === "round-robin") {
       // Continue the round-robin rotation from the position after the
       // selected provider so the failover chain mirrors live routing.
       const cursor = this.roundRobinCursors.get(normalizedModelId) ?? 0;

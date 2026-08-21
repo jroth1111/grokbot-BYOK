@@ -10,10 +10,11 @@
  *  - 5xx (server error): network.serverErrorCooldownMs (default 30000ms)
  *  - network error:      network.serverErrorCooldownMs (default 30000ms)
  *
- * Request-level errors (400/404) are not recorded at all — they will fail on
- * every provider so opening a circuit is pointless. Auth errors (401/403) are
- * a key-level concern and are likewise not recorded against the provider
- * circuit (the caller rotates the dead key instead).
+ * Request-level errors (400/404/405/413/422) are not recorded at all — they
+ * will fail on every provider so opening a circuit is pointless. Auth errors
+ * (401/402/403) are a key-level concern and are likewise not recorded against
+ * the provider circuit (the caller rotates the dead key instead). A 408
+ * (request timeout) is treated as a transient transport failure.
  */
 
 import type { NetworkConfig } from "../types.js";
@@ -88,15 +89,32 @@ export class CircuitBreaker {
   /**
    * Classify an HTTP status code into an error type.
    *
-   * - 400/404: request-error (don't retry, don't failover)
-   * - 401/402/403: auth-error (rotate key, no circuit)
+   * - 400/404/405/413/422: request-error (don't retry, don't failover — the
+   *   request itself is bad/malformed and will fail on every provider)
+   * - 401/402/403: auth-error (rotate key, no circuit — key/billing level)
+   * - 408:     network-error (request timeout — transient, retry/backoff)
    * - 429:     rate-limit   (retry/backoff then failover)
    * - 5xx:     server-error (retry/backoff then failover)
    * - other:   network-error (treat like a transport failure)
    */
   classifyError(status: number): ErrorType {
-    if (status === 400 || status === 404) return "request-error";
+    // Request-level errors: the request is malformed/unsupported and will
+    // fail on every provider, so neither retry nor open the circuit.
+    if (
+      status === 400 ||
+      status === 404 ||
+      status === 405 ||
+      status === 413 ||
+      status === 422
+    ) {
+      return "request-error";
+    }
+    // Auth/billing errors: a key-level concern — rotate the dead key rather
+    // than opening the provider circuit.
     if (status === 401 || status === 402 || status === 403) return "auth-error";
+    // Request timeout: transient, treat like a transport failure so it can be
+    // retried / failed over rather than stopping the whole request.
+    if (status === 408) return "network-error";
     if (status === 429) return "rate-limit";
     if (status >= 500 && status < 600) return "server-error";
     return "network-error";
@@ -153,14 +171,25 @@ export class CircuitBreaker {
   /**
    * Record a failure with error type classification.
    *
-   * - "request-error" (400/404): ignored — will fail on every provider.
-   * - "auth-error" (401/403):    ignored — key-level issue, not provider-level.
-   * - "rate-limit" (429):        increment failures; open with rateLimitCooldownMs.
-   * - "server-error" (5xx):      increment failures; open with serverErrorCooldownMs.
-   * - "network-error":           increment failures; open with serverErrorCooldownMs.
+   * - "request-error" (400/404/405/413/422): ignored — will fail on every
+   *   provider.
+   * - "auth-error" (401/402/403):    ignored — key-level issue, not
+   *   provider-level.
+   * - "rate-limit" (429):        increment failures; open with
+   *   rateLimitCooldownMs.
+   * - "server-error" (5xx):      increment failures; open with
+   *   serverErrorCooldownMs.
+   * - "network-error":           increment failures; open with
+   *   serverErrorCooldownMs.
    *
-   * A failure during a half-open probe re-opens the circuit, restarting the
-   * cooldown window using the new error type.
+   * A failure during a half-open probe (i.e. the cooldown has already
+   * elapsed) re-opens the circuit, restarting the cooldown window using the
+   * new error type. Failures that arrive while the circuit is still in its
+   * cooldown (e.g. retries within the same request) are recorded but do NOT
+   * push the cooldown window forward.
+   *
+   * A failure threshold of 0 disables the circuit breaker entirely — the
+   * circuit never opens — giving 0 a distinct meaning from 1.
    */
   recordFailure(providerName: string, errorType: ErrorType): void {
     // Request-level and auth errors don't affect the provider circuit.
@@ -174,8 +203,24 @@ export class CircuitBreaker {
     state.lastFailureTime = now;
 
     const threshold = this.getFailureThreshold(providerName);
-    // If already open (half-open probe failing) re-open with the new cooldown.
-    if (state.failures >= threshold || state.open) {
+
+    // Already-open circuit: only re-open (restart the cooldown window) when
+    // we are in a half-open probe — i.e. the cooldown has already elapsed.
+    // Failures that arrive while the circuit is still cooling down (e.g.
+    // retries within the same request) must NOT push the cooldown forward.
+    if (state.open) {
+      const halfOpen = now - state.openedAt >= state.cooldownMs;
+      if (halfOpen) {
+        state.openedAt = now;
+        state.openedByErrorType = errorType;
+        state.cooldownMs = this.getCooldownMs(providerName, errorType);
+      }
+      return;
+    }
+
+    // Closed circuit: open it once the failure threshold is reached. A
+    // threshold of 0 disables the circuit breaker entirely.
+    if (threshold > 0 && state.failures >= threshold) {
       state.open = true;
       state.openedAt = now;
       state.openedByErrorType = errorType;
