@@ -216,8 +216,9 @@ describe("CircuitBreaker.classifyError", () => {
     expect(breaker.classifyError(404)).toBe("request-error");
   });
 
-  it("classifies 401 and 403 as auth-error", () => {
+  it("classifies 401, 402, and 403 as auth-error", () => {
     expect(breaker.classifyError(401)).toBe("auth-error");
+    expect(breaker.classifyError(402)).toBe("auth-error");
     expect(breaker.classifyError(403)).toBe("auth-error");
   });
 
@@ -698,5 +699,74 @@ describe("BaseProvider config properties", () => {
     expect(provider.canHandle("key-alias")).toBe(true);
     // resolveModel uses the merged map.
     expect(provider.resolveModel("key-alias", "key-alias")).toBe("key-model");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Key rotation with auth errors (BUG 1 regression test)
+// ---------------------------------------------------------------------------
+
+describe("BaseProvider key rotation with auth errors", () => {
+  it("allows trying all keys even when maxRetries is 0", () => {
+    // Simulate the server's retry loop: maxRetries=0, 3 keys, all return 401.
+    // The fix: auth errors don't consume retry attempts, so all 3 keys
+    // should be tried before failing over.
+    const provider = new BaseProvider("p", {
+      baseUrl: "https://example.com/v1",
+      apiKey: "",
+      defaultModel: "m",
+      models: { "m": "m" },
+      keys: [
+        { value: "key-a", weight: 1 },
+        { value: "key-b", weight: 1 },
+        { value: "key-c", weight: 1 },
+      ],
+    });
+
+    const maxRetries = 0;
+    let authRotations = 0;
+    const triedKeys: string[] = [];
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      const key = provider.selectKey();
+      triedKeys.push(key.value);
+      // Simulate auth error
+      provider.markKeyFailed(key);
+      authRotations++;
+      if (authRotations >= provider.keys.length) {
+        break;
+      }
+      attempt--; // Don't consume a retry for key rotation
+    }
+
+    // All 3 keys should have been tried despite maxRetries=0.
+    // The exact order depends on cursor + enabled-set interactions as
+    // keys are marked failed, but the important invariant is that
+    // every key gets a turn.
+    expect(triedKeys).toHaveLength(3);
+    expect(new Set(triedKeys)).toEqual(new Set(["key-a", "key-b", "key-c"]));
+  });
+
+  it("resets failed keys and continues when all keys fail", () => {
+    // When all keys are marked as failed, selectKey resets and returns
+    // the first key. This ensures we don't get stuck.
+    const provider = new BaseProvider("p", {
+      baseUrl: "https://example.com/v1",
+      apiKey: "",
+      defaultModel: "m",
+      models: { "m": "m" },
+      keys: [
+        { value: "key-a", weight: 1 },
+        { value: "key-b", weight: 1 },
+      ],
+    });
+
+    // Mark all keys as failed
+    provider.markKeyFailed(provider.keys[0]);
+    provider.markKeyFailed(provider.keys[1]);
+
+    // selectKey should reset and return the first key
+    const key = provider.selectKey();
+    expect(key.value).toBe("key-a");
   });
 });

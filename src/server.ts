@@ -54,6 +54,9 @@ const STREAM_PATH = "/aiserver.v1.InferenceService/Stream";
 /** Force-exit grace period (ms) after a graceful-shutdown signal. */
 const SHUTDOWN_GRACE_MS = 10_000;
 
+/** Interval between session-affinity cleanup sweeps (ms). */
+const SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+
 /** Default stream idle timeout (ms) when a provider doesn't specify one. */
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 120_000;
 
@@ -119,6 +122,14 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
       breaker.setProviderConfig(name, provider.network);
     }
   }
+
+  // Periodically purge expired session-affinity bindings so the map doesn't
+  // grow unboundedly over a long-running server.
+  const cleanupHandle = setInterval(
+    () => sessionAffinity.cleanup(),
+    SESSION_CLEANUP_INTERVAL_MS,
+  );
+  cleanupHandle.unref();
 
   const server = http.createServer(async (req, res) => {
     // Only the streaming inference path is supported.
@@ -194,11 +205,25 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
       const boundName = sessionAffinity.getBinding(sessionId);
       if (boundName) {
         const bound = registry.getProvider(boundName);
-        if (bound) {
+        if (bound && bound.canHandle(normalizedId) && breaker.shouldTry(bound.name)) {
           primary = bound;
           logger.info("session affinity hit", {
             sessionId,
             provider: bound.name,
+          });
+        } else if (bound) {
+          // Binding exists but the bound provider can't be used — either it
+          // can't handle this model (model changed mid-conversation) or its
+          // circuit is open. Fall back to the resolved primary; the binding
+          // will be refreshed on the next successful request.
+          logger.info("session affinity skipped", {
+            sessionId,
+            boundProvider: bound.name,
+            resolvedProvider: resolvedPrimary.name,
+            model: rawModelId,
+            reason: !bound.canHandle(normalizedId)
+              ? "model-mismatch"
+              : "circuit-open",
           });
         }
       } else {
@@ -256,6 +281,7 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
       const requestTimeoutMs =
         provider.network.requestTimeoutMs ?? config.requestTimeoutMs;
 
+      let authRotations = 0;
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
         const key = provider.selectKey();
 
@@ -316,17 +342,33 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
           }
 
           // Auth error: rotate to the next key and retry within this provider.
+          // Key rotation does NOT consume a retry attempt — retries are for
+          // transient errors (429/5xx). We track auth rotations separately
+          // and bail out when every key has been tried with an auth error.
           if (errorType === "auth-error") {
             provider.markKeyFailed(key);
+            authRotations++;
             logger.warn("auth error, rotating key", {
               model,
               provider: provider.name,
               status: resp.status,
               key: maskKey(key.value),
               attempt,
+              authRotations,
               elapsed: Date.now() - attemptStart,
               error: errText.slice(0, 500),
             });
+            if (authRotations >= provider.keys.length) {
+              // All keys tried with auth errors — failover to next provider.
+              logger.warn("all keys exhausted with auth errors", {
+                model,
+                provider: provider.name,
+                keyCount: provider.keys.length,
+              });
+              break;
+            }
+            // Don't consume a retry attempt for key rotation.
+            attempt--;
             continue;
           }
 
@@ -596,6 +638,7 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
       return;
     }
     shuttingDown = true;
+    clearInterval(cleanupHandle);
     logger.info("server shutting down", {});
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(1), SHUTDOWN_GRACE_MS).unref();

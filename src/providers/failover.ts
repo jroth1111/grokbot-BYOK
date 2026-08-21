@@ -89,14 +89,14 @@ export class CircuitBreaker {
    * Classify an HTTP status code into an error type.
    *
    * - 400/404: request-error (don't retry, don't failover)
-   * - 401/403: auth-error   (rotate key, no circuit)
+   * - 401/402/403: auth-error (rotate key, no circuit)
    * - 429:     rate-limit   (retry/backoff then failover)
    * - 5xx:     server-error (retry/backoff then failover)
    * - other:   network-error (treat like a transport failure)
    */
   classifyError(status: number): ErrorType {
     if (status === 400 || status === 404) return "request-error";
-    if (status === 401 || status === 403) return "auth-error";
+    if (status === 401 || status === 402 || status === 403) return "auth-error";
     if (status === 429) return "rate-limit";
     if (status >= 500 && status < 600) return "server-error";
     return "network-error";
