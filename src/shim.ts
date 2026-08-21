@@ -22,6 +22,7 @@ const logger = createLogger();
 const registry = new ProviderRegistry(
   config.providers.configs,
   config.providers.priority,
+  config.routingStrategy,
 );
 const defaultProvider = registry.getDefaultProvider();
 const adapters = registry.getProviderNames();
@@ -31,6 +32,8 @@ logger.info("starting shim", {
   host: config.host,
   defaultProvider: defaultProvider.name,
   failover: config.failover,
+  routingStrategy: config.routingStrategy,
+  sessionAffinity: config.sessionAffinity.enabled,
   adapters,
 });
 

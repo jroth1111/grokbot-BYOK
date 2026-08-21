@@ -21,6 +21,8 @@ export const DEFAULT_CONFIG: ShimConfig = {
   logDir: "",
   failover: true,
   requestTimeoutMs: 30000,
+  routingStrategy: "priority",
+  sessionAffinity: { enabled: false },
   providers: {
     priority: ["opencode-go", "opencode-zen", "local"],
     configs: {

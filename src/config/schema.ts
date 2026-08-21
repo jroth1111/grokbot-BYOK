@@ -11,12 +11,34 @@ import type { ShimConfig } from "../types.js";
 /** Default path to the config file, relative to the process cwd. */
 export const DEFAULT_CONFIG_PATH = "config/config.json";
 
+/** Validation schema for a single API key entry. */
+const keyInfoSchema = z.object({
+  value: z.string(),
+  weight: z.number().positive().optional(),
+  models: z.record(z.string(), z.string()).optional(),
+  enabled: z.boolean().optional(),
+});
+
+/** Validation schema for per-provider network config. */
+const networkConfigSchema = z.object({
+  requestTimeoutMs: z.number().positive().optional(),
+  maxRetries: z.number().nonnegative().optional(),
+  retryBackoffInitialMs: z.number().positive().optional(),
+  retryBackoffMaxMs: z.number().positive().optional(),
+  streamIdleTimeoutMs: z.number().positive().optional(),
+  rateLimitCooldownMs: z.number().nonnegative().optional(),
+  serverErrorCooldownMs: z.number().nonnegative().optional(),
+  failureThreshold: z.number().positive().optional(),
+});
+
 /** Validation schema for a single provider entry. */
 export const providerConfigSchema = z.object({
   baseUrl: z.string().url(),
   apiKey: z.string(),
+  keys: z.array(keyInfoSchema).optional(),
   defaultModel: z.string(),
   models: z.record(z.string(), z.string()),
+  network: networkConfigSchema.optional(),
 });
 
 /** Validation schema for the `providers` block. */
@@ -31,6 +53,12 @@ const hostConfigSchema = z.object({
   defaultModel: z.string(),
 });
 
+/** Validation schema for session affinity. */
+const sessionAffinitySchema = z.object({
+  enabled: z.boolean().default(false),
+  ttlMs: z.number().positive().optional(),
+});
+
 /** Validation schema for the full shim configuration. */
 export const shimConfigSchema = z.object({
   port: z.number().default(8788),
@@ -38,6 +66,8 @@ export const shimConfigSchema = z.object({
   logDir: z.string().default(""),
   failover: z.boolean().default(true),
   requestTimeoutMs: z.number().default(30000),
+  routingStrategy: z.enum(["priority", "round-robin", "weighted-round-robin", "fill-first"]).default("priority"),
+  sessionAffinity: sessionAffinitySchema,
   providers: providersSchema,
   hostConfig: hostConfigSchema,
 });

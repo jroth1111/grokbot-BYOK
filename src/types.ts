@@ -151,31 +151,85 @@ export type InferenceStreamResponse =
 // Provider types
 // ---------------------------------------------------------------------------
 
+/** Routing strategy for selecting among providers that can handle a model. */
+export type RoutingStrategy = "priority" | "round-robin" | "weighted-round-robin" | "fill-first";
+
+/** A single API key with optional model aliases and weight. */
+export interface KeyInfo {
+  /** The API key value. */
+  value: string;
+  /** Weight for weighted-round-robin (default 1). */
+  weight?: number;
+  /** Per-key model aliases that override the provider-level map. */
+  models?: Record<string, string>;
+  /** Whether this key is enabled (default true). */
+  enabled?: boolean;
+}
+
+/** Per-provider network / retry configuration. */
+export interface NetworkConfig {
+  /** Request timeout in ms (overrides global requestTimeoutMs). */
+  requestTimeoutMs?: number;
+  /** Max retries within this provider before failing over (default 0). */
+  maxRetries?: number;
+  /** Initial backoff in ms for exponential retry (default 500). */
+  retryBackoffInitialMs?: number;
+  /** Max backoff cap in ms (default 5000). */
+  retryBackoffMaxMs?: number;
+  /** Stream idle timeout in ms — close if no data for this long (default 120000). */
+  streamIdleTimeoutMs?: number;
+  /** Cooldown in ms for 429 rate-limit errors (default 10000). */
+  rateLimitCooldownMs?: number;
+  /** Cooldown in ms for 5xx server errors (default 30000). */
+  serverErrorCooldownMs?: number;
+  /** Failure threshold before circuit opens (default 3). */
+  failureThreshold?: number;
+}
+
 /** A configured LLM provider adapter. */
 export interface Provider {
   readonly name: string;
   readonly baseUrl: string;
+  /** All API keys for this provider (may be one or many). */
+  readonly keys: KeyInfo[];
+  /** The first key's value (convenience for single-key providers). */
   readonly apiKey: string;
   readonly defaultModel: string;
-  /** Alias -> canonical model id map (this provider only, no shared aliases). */
+  readonly network: NetworkConfig;
+  /** Alias -> canonical model id map (provider-level, merged with per-key maps). */
   readonly models: Map<string, string>;
   /** Returns true if this provider has an alias for the given model id. */
   canHandle(normalizedModelId: string): boolean;
   /** Resolves a model id to the canonical id to send to this provider's API. */
   resolveModel(normalizedModelId: string, rawModelId: string): string;
+  /** Select the next API key (for key rotation). */
+  selectKey(): KeyInfo;
+  /** Mark a key as failed (for rotation). */
+  markKeyFailed(key: KeyInfo): void;
 }
 
 /** Configuration for a single provider. */
 export interface ProviderConfig {
   baseUrl: string;
   apiKey: string;
+  /** Additional API keys for this provider (optional, for key rotation). */
+  keys?: KeyInfo[];
   defaultModel: string;
   models: Record<string, string>;
+  /** Per-provider network/retry config. */
+  network?: NetworkConfig;
 }
 
 // ---------------------------------------------------------------------------
 // Config types
 // ---------------------------------------------------------------------------
+
+export interface SessionAffinityConfig {
+  /** Enable session-sticky routing (default false). */
+  enabled: boolean;
+  /** TTL for session-to-provider bindings in ms (default 3600000 = 1h). */
+  ttlMs?: number;
+}
 
 export interface ShimConfig {
   port: number;
@@ -183,6 +237,10 @@ export interface ShimConfig {
   logDir: string;
   failover: boolean;
   requestTimeoutMs: number;
+  /** Routing strategy for selecting among providers (default "priority"). */
+  routingStrategy: RoutingStrategy;
+  /** Session affinity / sticky routing config. */
+  sessionAffinity: SessionAffinityConfig;
   providers: {
     priority: string[];
     configs: Record<string, ProviderConfig>;

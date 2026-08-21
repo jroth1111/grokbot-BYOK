@@ -5,8 +5,9 @@
  * The server accepts POST requests on the
  * `aiserver.v1.InferenceService/Stream` Connect streaming path, translates the
  * inbound InferenceStreamRequest into an OpenAI chat completion request, routes
- * it to a provider (with failover + circuit breaking), and streams the OpenAI
- * SSE response back as Connect InferenceStreamResponse frames.
+ * it to a provider (with failover + circuit breaking + retry/backoff + key
+ * rotation + session affinity), and streams the OpenAI SSE response back as
+ * Connect InferenceStreamResponse frames.
  *
  * Nothing is written to the outbound response until an upstream provider has
  * accepted the request, so failover between providers is transparent to the
@@ -17,7 +18,9 @@ import type {
   ConnectEnvelope,
   InferenceStreamRequest,
   InferenceStreamResponse,
+  KeyInfo,
   Logger,
+  NetworkConfig,
   OpenAIChatRequest,
   OpenAISSEChunk,
   ShimConfig,
@@ -32,6 +35,10 @@ import {
 import { SseParser } from "./protocol/sse.js";
 import { ProviderRegistry } from "./providers/registry.js";
 import { CircuitBreaker } from "./providers/failover.js";
+import type { ErrorType } from "./providers/failover.js";
+import { computeBackoff, sleep, shouldRetry } from "./providers/retry.js";
+import { createStreamTimeout } from "./providers/stream-timeout.js";
+import { SessionAffinity } from "./providers/session-affinity.js";
 import { convertRequest } from "./translate/request.js";
 import {
   makeErrorFrame,
@@ -46,6 +53,23 @@ const STREAM_PATH = "/aiserver.v1.InferenceService/Stream";
 
 /** Force-exit grace period (ms) after a graceful-shutdown signal. */
 const SHUTDOWN_GRACE_MS = 10_000;
+
+/** Default stream idle timeout (ms) when a provider doesn't specify one. */
+const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 120_000;
+
+/** Default retry backoff settings when a provider doesn't specify them. */
+const DEFAULT_RETRY_BACKOFF_INITIAL_MS = 500;
+const DEFAULT_RETRY_BACKOFF_MAX_MS = 5_000;
+
+/**
+ * Mask an API key for logging, showing only the first and last few characters.
+ */
+function maskKey(key: string): string {
+  if (key.length <= 8) {
+    return "***";
+  }
+  return `${key.slice(0, 4)}...${key.slice(-4)}`;
+}
 
 /**
  * Write a single Connect data frame (JSON-encoded InferenceStreamResponse) to
@@ -73,16 +97,28 @@ function startConnectResponse(res: http.ServerResponse, status: number): void {
 /**
  * Create the HTTP server that handles Connect-RPC streaming inference requests.
  *
- * The {@link ProviderRegistry} and {@link CircuitBreaker} are constructed once
- * and shared across all requests so provider routing state and circuit state
- * persist for the lifetime of the server.
+ * The {@link ProviderRegistry}, {@link CircuitBreaker}, and
+ * {@link SessionAffinity} are constructed once and shared across all requests
+ * so provider routing state, circuit state, and session bindings persist for
+ * the lifetime of the server.
  */
 export function createServer(config: ShimConfig, logger: Logger): http.Server {
   const registry = new ProviderRegistry(
     config.providers.configs,
     config.providers.priority,
+    config.routingStrategy,
   );
   const breaker = new CircuitBreaker();
+  const sessionAffinity = new SessionAffinity(config.sessionAffinity);
+
+  // Configure per-provider network settings on the circuit breaker so
+  // cooldowns and failure thresholds can be tuned independently.
+  for (const name of registry.getProviderNames()) {
+    const provider = registry.getProvider(name);
+    if (provider) {
+      breaker.setProviderConfig(name, provider.network);
+    }
+  }
 
   const server = http.createServer(async (req, res) => {
     // Only the streaming inference path is supported.
@@ -117,6 +153,7 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
     // ---------------------------------------------------------------------
     let openaiBody: OpenAIChatRequest;
     let rawModelId: string;
+    let sessionId: string | null = null;
     try {
       const envelopes: ConnectEnvelope[] = parseEnvelopes(body);
       const dataEnvelope = envelopes.find((env) => (env.flags & 0x02) === 0);
@@ -134,6 +171,8 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
         reqJson.model_id ??
         "";
 
+      sessionId = sessionAffinity.extractSessionId(reqJson);
+
       openaiBody = convertRequest(reqJson);
     } catch (err) {
       logger.error("failed to parse request", { error: err });
@@ -144,25 +183,59 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
     }
 
     // ---------------------------------------------------------------------
-    // 5-6. Resolve provider and build the failover chain.
+    // 5-6. Resolve provider (honoring session affinity) and build the
+    //      failover chain.
     // ---------------------------------------------------------------------
-    const { provider: primary, normalizedId } = registry.resolveProvider(rawModelId);
-    const failoverChain = registry.getFailoverChain(primary, config.failover);
+    const { provider: resolvedPrimary, normalizedId } =
+      registry.resolveProvider(rawModelId);
+    let primary = resolvedPrimary;
+
+    if (sessionAffinity.isEnabled() && sessionId) {
+      const boundName = sessionAffinity.getBinding(sessionId);
+      if (boundName) {
+        const bound = registry.getProvider(boundName);
+        if (bound) {
+          primary = bound;
+          logger.info("session affinity hit", {
+            sessionId,
+            provider: bound.name,
+          });
+        }
+      } else {
+        logger.info("session affinity miss", { sessionId });
+      }
+    }
+
+    const failoverChain = registry.getFailoverChain(
+      primary,
+      config.failover,
+      normalizedId,
+    );
 
     logger.info("routing request", {
       model: rawModelId,
       provider: primary.name,
+      routingStrategy: config.routingStrategy,
       failoverChain: failoverChain.map((p) => p.name),
+      sessionId: sessionId ?? undefined,
     });
 
     // ---------------------------------------------------------------------
-    // 7. Try each provider in the failover chain until one accepts.
+    // 7-8. Try each provider in the failover chain until one accepts,
+    //      retrying within a provider with backoff and key rotation.
     // ---------------------------------------------------------------------
     let connected:
-      | { resp: Response; providerName: string; model: string }
+      | {
+          resp: Response;
+          providerName: string;
+          model: string;
+          key: KeyInfo;
+          network: NetworkConfig;
+        }
       | undefined;
+    let requestError = false;
 
-    for (const provider of failoverChain) {
+    providerLoop: for (const provider of failoverChain) {
       if (!breaker.shouldTry(provider.name)) {
         logger.warn("provider circuit open, skipping", {
           provider: provider.name,
@@ -175,71 +248,184 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
       const model = provider.resolveModel(normalizedId, rawModelId);
       openaiBody.model = model;
 
-      const headers: Record<string, string> = {
-        "Content-Type": "application/json",
-        Accept: "text/event-stream",
-      };
-      if (provider.apiKey) {
-        headers["Authorization"] = `Bearer ${provider.apiKey}`;
-      }
+      const maxRetries = provider.network.maxRetries ?? 0;
+      const backoffInitialMs =
+        provider.network.retryBackoffInitialMs ?? DEFAULT_RETRY_BACKOFF_INITIAL_MS;
+      const backoffMaxMs =
+        provider.network.retryBackoffMaxMs ?? DEFAULT_RETRY_BACKOFF_MAX_MS;
+      const requestTimeoutMs =
+        provider.network.requestTimeoutMs ?? config.requestTimeoutMs;
 
-      const controller = new AbortController();
-      const timeoutHandle = setTimeout(
-        () => controller.abort(),
-        config.requestTimeoutMs,
-      );
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        const key = provider.selectKey();
 
-      const attemptStart = Date.now();
-      try {
-        const resp = await fetch(`${provider.baseUrl}/chat/completions`, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(openaiBody),
-          signal: controller.signal,
-        });
-        clearTimeout(timeoutHandle);
+        const headers: Record<string, string> = {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+        };
+        if (key.value) {
+          headers["Authorization"] = `Bearer ${key.value}`;
+        }
 
-        if (resp.ok && resp.body) {
-          breaker.recordSuccess(provider.name);
-          logger.info("upstream connected", {
+        const controller = new AbortController();
+        const timeoutHandle = setTimeout(
+          () => controller.abort(),
+          requestTimeoutMs,
+        );
+
+        const attemptStart = Date.now();
+        try {
+          const resp = await fetch(`${provider.baseUrl}/chat/completions`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(openaiBody),
+            signal: controller.signal,
+          });
+          clearTimeout(timeoutHandle);
+
+          if (resp.ok && resp.body) {
+            breaker.recordSuccess(provider.name);
+            if (sessionAffinity.isEnabled() && sessionId) {
+              sessionAffinity.bind(sessionId, provider.name);
+            }
+            logger.info("upstream connected", {
+              model,
+              provider: provider.name,
+              status: resp.status,
+              key: maskKey(key.value),
+              attempt,
+              elapsed: Date.now() - attemptStart,
+            });
+            connected = {
+              resp,
+              providerName: provider.name,
+              model,
+              key,
+              network: provider.network,
+            };
+            break providerLoop;
+          }
+
+          // Non-2xx: classify the error and react accordingly.
+          const errorType = breaker.classifyError(resp.status);
+          let errText = "";
+          try {
+            errText = await resp.text();
+          } catch {
+            // ignore body read failure
+          }
+
+          // Auth error: rotate to the next key and retry within this provider.
+          if (errorType === "auth-error") {
+            provider.markKeyFailed(key);
+            logger.warn("auth error, rotating key", {
+              model,
+              provider: provider.name,
+              status: resp.status,
+              key: maskKey(key.value),
+              attempt,
+              elapsed: Date.now() - attemptStart,
+              error: errText.slice(0, 500),
+            });
+            continue;
+          }
+
+          // Request error (400/404): the request is malformed and will fail
+          // on every provider — stop immediately.
+          if (errorType === "request-error") {
+            logger.warn("request error, stopping", {
+              model,
+              provider: provider.name,
+              status: resp.status,
+              elapsed: Date.now() - attemptStart,
+              error: errText.slice(0, 500),
+            });
+            requestError = true;
+            break providerLoop;
+          }
+
+          // Rate-limit / server-error / network-error: record against the
+          // circuit and decide whether to retry or fail over.
+          breaker.recordFailure(provider.name, errorType);
+          logger.warn("upstream non-2xx", {
             model,
             provider: provider.name,
             status: resp.status,
+            errorType,
+            attempt,
             elapsed: Date.now() - attemptStart,
+            error: errText.slice(0, 500),
           });
-          connected = { resp, providerName: provider.name, model };
-          break;
-        }
 
-        // Non-2xx: record failure and try the next provider.
-        breaker.recordFailure(provider.name);
-        let errText = "";
-        try {
-          errText = await resp.text();
-        } catch {
-          // ignore body read failure
+          const decision = shouldRetry(errorType, attempt, maxRetries);
+          if (decision === "retry") {
+            const backoff = computeBackoff(attempt, backoffInitialMs, backoffMaxMs);
+            logger.info("retrying after backoff", {
+              model,
+              provider: provider.name,
+              attempt,
+              backoff,
+              errorType,
+            });
+            await sleep(backoff);
+            continue;
+          } else if (decision === "failover") {
+            break;
+          } else {
+            // "stop" — should not occur for non-request errors, but handle it.
+            requestError = true;
+            break providerLoop;
+          }
+        } catch (err) {
+          clearTimeout(timeoutHandle);
+          const errorType: ErrorType = "network-error";
+          breaker.recordFailure(provider.name, errorType);
+          logger.warn("upstream fetch failed", {
+            model,
+            provider: provider.name,
+            attempt,
+            elapsed: Date.now() - attemptStart,
+            error: err,
+          });
+
+          const decision = shouldRetry(errorType, attempt, maxRetries);
+          if (decision === "retry") {
+            const backoff = computeBackoff(attempt, backoffInitialMs, backoffMaxMs);
+            logger.info("retrying after backoff", {
+              model,
+              provider: provider.name,
+              attempt,
+              backoff,
+              errorType,
+            });
+            await sleep(backoff);
+            continue;
+          } else if (decision === "failover") {
+            break;
+          } else {
+            requestError = true;
+            break providerLoop;
+          }
         }
-        logger.warn("upstream non-2xx", {
-          model,
-          provider: provider.name,
-          status: resp.status,
-          elapsed: Date.now() - attemptStart,
-          error: errText.slice(0, 500),
-        });
-      } catch (err) {
-        clearTimeout(timeoutHandle);
-        breaker.recordFailure(provider.name);
-        logger.warn("upstream fetch failed", {
-          model,
-          provider: provider.name,
-          elapsed: Date.now() - attemptStart,
-          error: err,
-        });
       }
     }
 
     // ---------------------------------------------------------------------
-    // 8. All providers failed: emit an error and end the stream.
+    // Request-level error: the request is malformed, emit an error and stop.
+    // ---------------------------------------------------------------------
+    if (requestError) {
+      logger.error("request error, aborting", {
+        model: rawModelId,
+        elapsed: Date.now() - requestStart,
+      });
+      startConnectResponse(res, 200);
+      writeFrame(res, makeErrorFrame("request error"));
+      endStream(res);
+      return;
+    }
+
+    // ---------------------------------------------------------------------
+    // 9. All providers failed: emit an error and end the stream.
     // ---------------------------------------------------------------------
     if (!connected) {
       logger.error("all providers failed", {
@@ -254,15 +440,16 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
     }
 
     // ---------------------------------------------------------------------
-    // 9. A provider accepted: commit the response and emit responseInfo.
+    // 10. A provider accepted: commit the response and emit responseInfo.
     // ---------------------------------------------------------------------
-    const { resp, providerName, model } = connected;
+    const { resp, providerName, model, key, network } = connected;
     startConnectResponse(res, 200);
     const responseId = `chatcmpl-shim-${Date.now().toString(36)}`;
     writeFrame(res, makeResponseInfoFrame(responseId, model));
 
     // ---------------------------------------------------------------------
-    // 10-12. Stream the SSE response back as Connect frames.
+    // 11-12. Stream the SSE response back as Connect frames with an idle
+    //        timeout guard.
     // ---------------------------------------------------------------------
     const sseParser = new SseParser();
     const toolAcc = new ToolCallAccumulator();
@@ -272,6 +459,24 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
     let streamError = false;
     let promptTokens = 0;
     let completionTokens = 0;
+
+    // The reader is assigned inside the try block; the timeout callback
+    // references it via this outer variable so it can cancel a stalled stream.
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    const streamTimeout = createStreamTimeout(
+      network.streamIdleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+      () => {
+        streamError = true;
+        logger.error("stream idle timeout", {
+          model,
+          provider: providerName,
+          elapsed: Date.now() - requestStart,
+        });
+        void reader?.cancel().catch(() => {
+          // ignore cancel rejection
+        });
+      },
+    );
 
     const processData = (data: string): void => {
       if (data === "[DONE]") {
@@ -313,13 +518,16 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
       if (!resp.body) {
         throw new Error("upstream response has no body");
       }
-      const reader = resp.body.getReader();
+      const r = resp.body.getReader();
+      reader = r;
+      streamTimeout.reset();
       // eslint-disable-next-line no-constant-condition
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } = await r.read();
         if (done) {
           break;
         }
+        streamTimeout.reset();
         const text = decoder.decode(value, { stream: true });
         sseParser.feed(text);
         for (const data of sseParser.drain()) {
@@ -336,13 +544,18 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
         processData(data);
       }
     } catch (err) {
-      streamError = true;
-      logger.error("stream error", {
-        model,
-        provider: providerName,
-        error: err,
-      });
+      // Don't overwrite a streamError already set by the idle timeout.
+      if (!streamError) {
+        streamError = true;
+        logger.error("stream error", {
+          model,
+          provider: providerName,
+          error: err,
+        });
+      }
     } finally {
+      streamTimeout.clear();
+
       // Flush accumulated tool calls. When the stream errored, emit them as
       // incomplete so the host knows a tool call was attempted but unfinished.
       const toolFrames = toolAcc.flush(!streamError);
@@ -365,6 +578,7 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
       logger.info("request complete", {
         model,
         provider: providerName,
+        key: maskKey(key.value),
         sawFinish,
         promptTokens,
         completionTokens,

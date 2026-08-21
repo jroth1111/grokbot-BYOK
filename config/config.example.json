@@ -4,6 +4,11 @@
   "logDir": "",
   "failover": true,
   "requestTimeoutMs": 30000,
+  "routingStrategy": "priority",
+  "sessionAffinity": {
+    "enabled": false,
+    "ttlMs": 3600000
+  },
   "providers": {
     "priority": ["opencode-go", "opencode-zen", "local"],
     "configs": {
@@ -27,7 +32,20 @@
           "sand-default": "ox-alpha-free",
           "sand default": "ox-alpha-free",
           "default": "ox-alpha-free"
-        }
+        },
+        "network": {
+          "maxRetries": 2,
+          "retryBackoffInitialMs": 500,
+          "retryBackoffMaxMs": 5000,
+          "streamIdleTimeoutMs": 120000,
+          "rateLimitCooldownMs": 10000,
+          "serverErrorCooldownMs": 30000,
+          "failureThreshold": 3
+        },
+        "keys": [
+          { "value": "${OPENCODE_GO_API_KEY}", "weight": 1 },
+          { "value": "${OPENCODE_GO_API_KEY_2}", "weight": 1, "enabled": true }
+        ]
       },
       "opencode-zen": {
         "baseUrl": "https://opencode.ai/zen/v1",
@@ -43,6 +61,11 @@
           "ox-alpha": "x-preview-f-free",
           "ox": "x-preview-f-free",
           "x-preview-f-free": "x-preview-f-free"
+        },
+        "network": {
+          "maxRetries": 1,
+          "rateLimitCooldownMs": 5000,
+          "serverErrorCooldownMs": 30000
         }
       },
       "local": {
@@ -71,6 +94,11 @@
           "deepseek-v4-flash": "deepseek-v4-flash",
           "deepseek-v4-pro": "deepseek-v4-pro",
           "muse-spark": "muse-spark-1.2-contributor"
+        },
+        "network": {
+          "requestTimeoutMs": 5000,
+          "maxRetries": 0,
+          "streamIdleTimeoutMs": 60000
         }
       }
     }
