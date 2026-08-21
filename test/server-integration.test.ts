@@ -400,6 +400,52 @@ function reasoningSseChunks(): OpenAISSEChunk[] {
   ];
 }
 
+/**
+ * Build SSE chunks mimicking glm-5.2 on opencode-go: the usage arrives
+ * in a SEPARATE chunk with an empty choices array (not on the finish
+ * chunk). The shim must extract usage from this empty-choices chunk
+ * rather than skipping it as a cost-annotation frame.
+ */
+function separateUsageSseChunks(): OpenAISSEChunk[] {
+  return [
+    {
+      id: "test-glm52",
+      object: "chat.completion.chunk",
+      created: 1787334152,
+      model: "test-model",
+      choices: [
+        { index: 0, delta: { role: "assistant", content: "", reasoning_content: "" } },
+      ],
+    },
+    {
+      id: "test-glm52",
+      choices: [
+        { index: 0, delta: { content: "Hello world!" } },
+      ],
+    },
+    {
+      id: "test-glm52",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      // finish chunk has no usage — it arrives in the next chunk
+      usage: undefined,
+    },
+    // Usage arrives in a separate chunk with EMPTY choices — must NOT be skipped.
+    {
+      id: "test-glm52",
+      choices: [],
+      usage: {
+        prompt_tokens: 14,
+        completion_tokens: 719,
+        total_tokens: 733,
+        prompt_tokens_details: { cached_tokens: 0 },
+        completion_tokens_details: { reasoning_tokens: 698 },
+      },
+    } as unknown as OpenAISSEChunk,
+    // Trailing cost-annotation frame (also empty choices, no usage) — skip.
+    { choices: [] } as unknown as OpenAISSEChunk,
+  ];
+}
+
 // ---------------------------------------------------------------------------
 // Cleanup helpers
 // ---------------------------------------------------------------------------
@@ -543,6 +589,64 @@ describe("server integration: reasoning_content and extended usage", () => {
 
       // The trailing cost frame (empty choices) must not produce any
       // spurious frames — only responseInfo, textParts, usage, final, trailer.
+      expect(frames.filter((f) => "error" in f)).toHaveLength(0);
+      expect(upstream.callCount.value).toBe(1);
+    },
+    5000,
+  );
+});
+
+describe("server integration: usage in separate empty-choices chunk (glm-5.2)", () => {
+  let shim: { server: http.Server; port: number };
+  let upstream: MockUpstream;
+
+  beforeAll(async () => {
+    upstream = await startMockUpstream({ sseChunks: separateUsageSseChunks() });
+    const config = makeConfig({ primary: upstream.url });
+    shim = await startShim(config);
+  });
+
+  afterAll(() => cleanup(shim.server, upstream.server));
+
+  it(
+    "extracts usage from a separate empty-choices chunk without skipping it",
+    async () => {
+      const { status, body } = await sendRequest(shim.port, basicRequest());
+      expect(status).toBe(200);
+
+      const { frames } = parseResponse(body);
+
+      // Text content should be present.
+      const textParts = frames.filter(
+        (f) => "textPart" in f && !(f as { textPart: { isFinal: boolean } }).textPart.isFinal,
+      );
+      const text = textParts
+        .map((f) => (f as { textPart: { text: string } }).textPart.text)
+        .join("");
+      expect(text).toContain("Hello world!");
+
+      // The critical assertion: usage must be extracted from the
+      // empty-choices chunk, not lost. Without the fix, this would be
+      // { promptTokens: 0, completionTokens: 0 }.
+      const usage = frames.find((f) => "usage" in f) as
+        | {
+            usage: {
+              promptTokens: number;
+              completionTokens: number;
+              totalTokens?: number;
+              reasoningTokens?: number;
+              cachedTokens?: number;
+            };
+          }
+        | undefined;
+      expect(usage).toBeDefined();
+      expect(usage!.usage.promptTokens).toBe(14);
+      expect(usage!.usage.completionTokens).toBe(719);
+      expect(usage!.usage.totalTokens).toBe(733);
+      expect(usage!.usage.reasoningTokens).toBe(698);
+      expect(usage!.usage.cachedTokens).toBe(0);
+
+      // No errors, one upstream call.
       expect(frames.filter((f) => "error" in f)).toHaveLength(0);
       expect(upstream.callCount.value).toBe(1);
     },

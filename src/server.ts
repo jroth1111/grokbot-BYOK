@@ -554,13 +554,10 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
         return;
       }
 
-      // Some providers (e.g. opencode-go) send a trailing cost-annotation
-      // frame after [DONE] with an empty choices array: {"choices":[],"cost":"0"}.
-      // There's nothing to translate from it; skip early to avoid no-op work.
-      if (chunk.choices && chunk.choices.length === 0) {
-        return;
-      }
-
+      // Extract usage data BEFORE the empty-choices skip below: some
+      // providers (e.g. opencode-go's glm-5.2) send the usage in a
+      // separate chunk with an empty choices array, and we must not
+      // lose those token counts.
       if (chunk.usage) {
         promptTokens =
           chunk.usage.prompt_tokens ?? chunk.usage.promptTokens ?? promptTokens;
@@ -573,6 +570,15 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
           chunk.usage.completion_tokens_details?.reasoning_tokens ?? reasoningTokens;
         cachedTokens =
           chunk.usage.prompt_tokens_details?.cached_tokens ?? cachedTokens;
+      }
+
+      // Some providers (e.g. opencode-go) send a trailing cost-annotation
+      // frame after [DONE] with an empty choices array: {"choices":[],"cost":"0"}.
+      // There's nothing to translate from it; skip early to avoid no-op work.
+      // (Usage was already extracted above, so a usage-only empty-choices
+      // chunk is safely handled before this point.)
+      if (chunk.choices && chunk.choices.length === 0) {
+        return;
       }
 
       // Feed the whole chunk; the accumulator skips choices without tool_calls.
