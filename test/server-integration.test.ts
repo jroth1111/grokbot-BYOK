@@ -355,6 +355,51 @@ function toolCallSseChunks(): OpenAISSEChunk[] {
   ];
 }
 
+/**
+ * Build SSE chunks mimicking a reasoning model (e.g. opencode-go's
+ * ox-alpha-free): reasoning_content deltas followed by content, with
+ * extended usage (total_tokens, reasoning_tokens, cached_tokens) and a
+ * trailing cost-annotation frame with empty choices.
+ */
+function reasoningSseChunks(): OpenAISSEChunk[] {
+  return [
+    {
+      id: "test-reasoning",
+      object: "chat.completion.chunk",
+      created: 1787333165,
+      model: "test-model",
+      choices: [
+        { index: 0, delta: { role: "assistant", reasoning_content: "The user wants" } },
+      ],
+    },
+    {
+      id: "test-reasoning",
+      choices: [
+        { index: 0, delta: { reasoning_content: " me to say hello" } },
+      ],
+    },
+    {
+      id: "test-reasoning",
+      choices: [
+        { index: 0, delta: { content: "Hello!" } },
+      ],
+    },
+    {
+      id: "test-reasoning",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      usage: {
+        prompt_tokens: 92,
+        completion_tokens: 18,
+        total_tokens: 110,
+        prompt_tokens_details: { cached_tokens: 64 },
+        completion_tokens_details: { reasoning_tokens: 5 },
+      },
+    },
+    // Trailing cost-annotation frame (empty choices) — must be skipped.
+    { choices: [] } as unknown as OpenAISSEChunk,
+  ];
+}
+
 // ---------------------------------------------------------------------------
 // Cleanup helpers
 // ---------------------------------------------------------------------------
@@ -439,6 +484,66 @@ describe("server integration: successful streaming", () => {
       expect(frames.some((f) => "error" in f)).toBe(false);
 
       // Only one upstream call was made.
+      expect(upstream.callCount.value).toBe(1);
+    },
+    5000,
+  );
+});
+
+describe("server integration: reasoning_content and extended usage", () => {
+  let shim: { server: http.Server; port: number };
+  let upstream: MockUpstream;
+
+  beforeAll(async () => {
+    upstream = await startMockUpstream({ sseChunks: reasoningSseChunks() });
+    const config = makeConfig({ primary: upstream.url });
+    shim = await startShim(config);
+  });
+
+  afterAll(() => cleanup(shim.server, upstream.server));
+
+  it(
+    "forwards reasoning_content as textPart frames and carries extended usage fields",
+    async () => {
+      const { status, body } = await sendRequest(shim.port, basicRequest());
+      expect(status).toBe(200);
+
+      const { frames } = parseResponse(body);
+
+      // All non-final text parts (reasoning + content).
+      const textParts = frames.filter(
+        (f) => "textPart" in f && !(f as { textPart: { isFinal: boolean } }).textPart.isFinal,
+      );
+      const text = textParts
+        .map((f) => (f as { textPart: { text: string } }).textPart.text)
+        .join("");
+
+      // reasoning_content ("The user wants...") arrives before content ("Hello!").
+      expect(text).toContain("The user wants");
+      expect(text).toContain("Hello!");
+
+      // Usage frame with extended token details.
+      const usage = frames.find((f) => "usage" in f) as
+        | {
+            usage: {
+              promptTokens: number;
+              completionTokens: number;
+              totalTokens?: number;
+              reasoningTokens?: number;
+              cachedTokens?: number;
+            };
+          }
+        | undefined;
+      expect(usage).toBeDefined();
+      expect(usage!.usage.promptTokens).toBe(92);
+      expect(usage!.usage.completionTokens).toBe(18);
+      expect(usage!.usage.totalTokens).toBe(110);
+      expect(usage!.usage.reasoningTokens).toBe(5);
+      expect(usage!.usage.cachedTokens).toBe(64);
+
+      // The trailing cost frame (empty choices) must not produce any
+      // spurious frames — only responseInfo, textParts, usage, final, trailer.
+      expect(frames.filter((f) => "error" in f)).toHaveLength(0);
       expect(upstream.callCount.value).toBe(1);
     },
     5000,

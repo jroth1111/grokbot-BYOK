@@ -163,6 +163,10 @@ export interface OpenAISSEChunk {
     completionTokens?: number;
     /** CamelCase alias for total_tokens (some OpenAI-compatible providers). */
     totalTokens?: number;
+    /** Breakdown of prompt tokens (e.g. cached tokens from prompt caching). */
+    prompt_tokens_details?: { cached_tokens?: number };
+    /** Breakdown of completion tokens (e.g. reasoning tokens for o1-style models). */
+    completion_tokens_details?: { reasoning_tokens?: number };
   };
 }
 
@@ -174,7 +178,18 @@ export type InferenceStreamResponse =
   | { responseInfo: { id: string; model: string; createdAt: string; messages: unknown[] } }
   | { textPart: { text: string; isFinal: boolean } }
   | { toolCallPart: { toolCallId: string; toolName: string; args: string; isComplete: boolean } }
-  | { usage: { promptTokens: number; completionTokens: number } }
+  | {
+      usage: {
+        promptTokens: number;
+        completionTokens: number;
+        /** Total tokens (prompt + completion), if reported by the provider. */
+        totalTokens?: number;
+        /** Reasoning tokens consumed by chain-of-thought models, if reported. */
+        reasoningTokens?: number;
+        /** Cached prompt tokens (prompt caching), if reported. */
+        cachedTokens?: number;
+      };
+    }
   | { error: { message: string; code: string; errorType: string } };
 
 // ---------------------------------------------------------------------------

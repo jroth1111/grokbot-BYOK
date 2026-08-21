@@ -87,17 +87,39 @@ function safeTokenCount(n: number): number {
  *
  * @param promptTokens     The number of prompt tokens consumed.
  * @param completionTokens The number of completion tokens consumed.
+ * @param totalTokens      Total tokens (prompt + completion), if reported.
+ * @param reasoningTokens  Reasoning tokens (chain-of-thought), if reported.
+ * @param cachedTokens     Cached prompt tokens, if reported.
  */
 export function makeUsageFrame(
   promptTokens: number,
   completionTokens: number,
+  totalTokens?: number,
+  reasoningTokens?: number,
+  cachedTokens?: number,
 ): InferenceStreamResponse {
-  return {
-    usage: {
-      promptTokens: safeTokenCount(promptTokens),
-      completionTokens: safeTokenCount(completionTokens),
-    },
+  const usage: {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens?: number;
+    reasoningTokens?: number;
+    cachedTokens?: number;
+  } = {
+    promptTokens: safeTokenCount(promptTokens),
+    completionTokens: safeTokenCount(completionTokens),
   };
+  // Only include extended fields when the provider actually reported them,
+  // so the frame stays compact for providers that don't send token details.
+  if (totalTokens != null && Number.isFinite(totalTokens)) {
+    usage.totalTokens = safeTokenCount(totalTokens);
+  }
+  if (reasoningTokens != null && Number.isFinite(reasoningTokens)) {
+    usage.reasoningTokens = safeTokenCount(reasoningTokens);
+  }
+  if (cachedTokens != null && Number.isFinite(cachedTokens)) {
+    usage.cachedTokens = safeTokenCount(cachedTokens);
+  }
+  return { usage };
 }
 
 /**

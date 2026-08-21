@@ -505,6 +505,9 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
     let streamError = false;
     let promptTokens = 0;
     let completionTokens = 0;
+    let totalTokens: number | undefined;
+    let reasoningTokens: number | undefined;
+    let cachedTokens: number | undefined;
     // Set to true once the stream has ended (normally or on error) so a
     // late-firing idle-timeout callback doesn't flip streamError after the
     // finally block has already committed the success path. The stream-timeout
@@ -551,6 +554,13 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
         return;
       }
 
+      // Some providers (e.g. opencode-go) send a trailing cost-annotation
+      // frame after [DONE] with an empty choices array: {"choices":[],"cost":"0"}.
+      // There's nothing to translate from it; skip early to avoid no-op work.
+      if (chunk.choices && chunk.choices.length === 0) {
+        return;
+      }
+
       if (chunk.usage) {
         promptTokens =
           chunk.usage.prompt_tokens ?? chunk.usage.promptTokens ?? promptTokens;
@@ -558,12 +568,24 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
           chunk.usage.completion_tokens ??
           chunk.usage.completionTokens ??
           completionTokens;
+        totalTokens = chunk.usage.total_tokens ?? chunk.usage.totalTokens ?? totalTokens;
+        reasoningTokens =
+          chunk.usage.completion_tokens_details?.reasoning_tokens ?? reasoningTokens;
+        cachedTokens =
+          chunk.usage.prompt_tokens_details?.cached_tokens ?? cachedTokens;
       }
 
       // Feed the whole chunk; the accumulator skips choices without tool_calls.
       toolAcc.feed(chunk);
 
       for (const choice of chunk.choices ?? []) {
+        // Forward reasoning_content (chain-of-thought) as text frames so the
+        // host sees the model's reasoning alongside the final answer. Some
+        // OpenAI-compatible providers (opencode-go, opencode-zen) stream
+        // reasoning_content separately from content for reasoning models.
+        if (choice.delta?.reasoning_content) {
+          writeFrame(res, makeTextFrame(choice.delta.reasoning_content, false));
+        }
         if (choice.delta?.content) {
           writeFrame(res, makeTextFrame(choice.delta.content, false));
         }
@@ -625,8 +647,12 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
         writeFrame(res, frame);
       }
 
-      // Emit usage totals.
-      writeFrame(res, makeUsageFrame(promptTokens, completionTokens));
+      // Emit usage totals (including extended token details if the provider
+      // reported them: total tokens, reasoning tokens, cached tokens).
+      writeFrame(
+        res,
+        makeUsageFrame(promptTokens, completionTokens, totalTokens, reasoningTokens, cachedTokens),
+      );
 
       // Final frame: a terminal textPart on success, or an error on failure.
       if (streamError) {
@@ -644,6 +670,9 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
         sawFinish,
         promptTokens,
         completionTokens,
+        totalTokens,
+        reasoningTokens,
+        cachedTokens,
         toolCalls: toolAcc.size,
         streamError,
         elapsed: Date.now() - requestStart,

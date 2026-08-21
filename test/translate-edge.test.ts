@@ -430,6 +430,43 @@ describe("response frame factories — edge cases", () => {
     }
   });
 
+  it("makeUsageFrame without extended fields omits them (compact frame)", () => {
+    const frame = makeUsageFrame(10, 20);
+    expect("usage" in frame).toBe(true);
+    if ("usage" in frame) {
+      expect(frame.usage.promptTokens).toBe(10);
+      expect(frame.usage.completionTokens).toBe(20);
+      expect(frame.usage.totalTokens).toBeUndefined();
+      expect(frame.usage.reasoningTokens).toBeUndefined();
+      expect(frame.usage.cachedTokens).toBeUndefined();
+    }
+  });
+
+  it("makeUsageFrame forwards extended token details when provided", () => {
+    const frame = makeUsageFrame(92, 18, 110, 5, 64);
+    expect("usage" in frame).toBe(true);
+    if ("usage" in frame) {
+      expect(frame.usage.promptTokens).toBe(92);
+      expect(frame.usage.completionTokens).toBe(18);
+      expect(frame.usage.totalTokens).toBe(110);
+      expect(frame.usage.reasoningTokens).toBe(5);
+      expect(frame.usage.cachedTokens).toBe(64);
+    }
+  });
+
+  it("makeUsageFrame coerces negative/NaN extended fields to 0", () => {
+    const frame = makeUsageFrame(10, 20, -5, NaN, Infinity);
+    expect("usage" in frame).toBe(true);
+    if ("usage" in frame) {
+      // totalTokens: -5 is finite but negative → safeTokenCount → 0
+      expect(frame.usage.totalTokens).toBe(0);
+      // reasoningTokens: NaN → not finite → not included
+      expect(frame.usage.reasoningTokens).toBeUndefined();
+      // cachedTokens: Infinity → not finite → not included
+      expect(frame.usage.cachedTokens).toBeUndefined();
+    }
+  });
+
   it("makeErrorFrame with an empty message defaults to 'inference error'", () => {
     const frame = makeErrorFrame("");
     expect("error" in frame).toBe(true);
