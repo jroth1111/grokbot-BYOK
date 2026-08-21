@@ -1,0 +1,24 @@
+{
+  "name": "grokbot-byok",
+  "version": "2.0.0",
+  "description": "Connect-RPC to OpenAI translation shim for Cursor sand-host BYOK inference",
+  "type": "module",
+  "main": "dist/shim.js",
+  "scripts": {
+    "build": "esbuild src/shim.ts --bundle --platform=node --format=esm --outfile=dist/shim.js --target=node18 --banner:js='#!/usr/bin/env node' && chmod +x dist/shim.js",
+    "build:scripts": "esbuild scripts/deploy.ts scripts/health-check.ts scripts/patch-host.ts scripts/watch-host.ts --bundle --platform=node --format=esm --outdir=dist/scripts --target=node18 --banner:js='#!/usr/bin/env node' && chmod +x dist/scripts/*.js",
+    "build:all": "npm run build && npm run build:scripts",
+    "test": "node --experimental-vm-modules node_modules/.bin/vitest run",
+    "test:watch": "node --experimental-vm-modules node_modules/.bin/vitest",
+    "typecheck": "tsc --noEmit",
+    "dev": "tsx src/shim.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "esbuild": "^0.20.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.0",
+    "vitest": "^1.2.0",
+    "zod": "^3.22.0"
+  }
+}

@@ -1,0 +1,82 @@
+{
+  "port": 8788,
+  "host": "127.0.0.1",
+  "logDir": "",
+  "failover": true,
+  "requestTimeoutMs": 30000,
+  "providers": {
+    "priority": ["opencode-go", "opencode-zen", "local"],
+    "configs": {
+      "opencode-go": {
+        "baseUrl": "https://opencode.ai/zen/go/v1",
+        "apiKey": "${OPENCODE_GO_API_KEY}",
+        "defaultModel": "ox-alpha-free",
+        "models": {
+          "ox alpha free": "ox-alpha-free",
+          "ox alpha": "ox-alpha-free",
+          "ox-alpha": "ox-alpha-free",
+          "ox-alpha-free": "ox-alpha-free",
+          "ox": "ox-alpha-free",
+          "0x alpha": "ox-alpha-free",
+          "0x-alpha": "ox-alpha-free",
+          "0x": "ox-alpha-free",
+          "x-preview-f-free": "ox-alpha-free",
+          "go alpha": "ox-alpha-free",
+          "go-alpha": "ox-alpha-free",
+          "go": "ox-alpha-free",
+          "sand-default": "ox-alpha-free",
+          "sand default": "ox-alpha-free",
+          "default": "ox-alpha-free"
+        }
+      },
+      "opencode-zen": {
+        "baseUrl": "https://opencode.ai/zen/v1",
+        "apiKey": "${OPENCODE_ZEN_API_KEY}",
+        "defaultModel": "x-preview-f-free",
+        "models": {
+          "0x alpha free": "x-preview-f-free",
+          "0x alpha": "x-preview-f-free",
+          "0x-alpha": "x-preview-f-free",
+          "0x": "x-preview-f-free",
+          "ox alpha free": "x-preview-f-free",
+          "ox alpha": "x-preview-f-free",
+          "ox-alpha": "x-preview-f-free",
+          "ox": "x-preview-f-free",
+          "x-preview-f-free": "x-preview-f-free"
+        }
+      },
+      "local": {
+        "baseUrl": "http://127.0.0.1:3003/v1",
+        "apiKey": "${OPENCODE_API_KEY}",
+        "defaultModel": "glm-5-2",
+        "models": {
+          "glm-5.2 high": "glm-5-2-max",
+          "glm-5.2 max": "glm-5-2-max",
+          "glm-5-2-high": "glm-5-2-max",
+          "glm-5-2-max": "glm-5-2-max",
+          "glm-5.2": "glm-5-2",
+          "glm-5-2": "glm-5-2",
+          "glm5.2": "glm-5-2",
+          "glm": "glm-5-2",
+          "swe-1.7 max": "swe-1-7",
+          "swe-1.7": "swe-1-7",
+          "swe-1-7": "swe-1-7",
+          "swe-1.6 slow": "swe-1-6-slow",
+          "swe-1.6 fast": "swe-1-6-fast",
+          "swe-1.6": "swe-1-6-fast",
+          "swe-1-6-slow": "swe-1-6-slow",
+          "swe-1-6-fast": "swe-1-6-fast",
+          "swe": "swe-1-7",
+          "sand-default": "glm-5-2",
+          "deepseek-v4-flash": "deepseek-v4-flash",
+          "deepseek-v4-pro": "deepseek-v4-pro",
+          "muse-spark": "muse-spark-1.2-contributor"
+        }
+      }
+    }
+  },
+  "hostConfig": {
+    "sandHostDir": "${SAND_HOST_DIR}",
+    "defaultModel": "Ox Alpha Free"
+  }
+}
