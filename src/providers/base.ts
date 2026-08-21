@@ -116,9 +116,25 @@ export class BaseProvider implements Provider {
 
   /**
    * Mark a key as failed, removing it from rotation until all keys have
-   * failed (at which point `selectKey` resets the failure set).
+   * failed (at which point `selectKey` resets the failure set) or until
+   * `resetKeyFailures` is called (at the start of a new request).
+   *
+   * The cursor is reset so the next `selectKey` picks the first remaining
+   * enabled key in stable order rather than a cursor-dependent offset into
+   * a now-shorter enabled array.
    */
   markKeyFailed(key: KeyInfo): void {
     this.failedKeys.add(key);
+    this.keyCursor = 0;
+  }
+
+  /**
+   * Clear the failed-key set and reset the cursor. Called at the start of
+   * each request so a transient 401 on one key in a previous request
+   * doesn't permanently remove it from rotation.
+   */
+  resetKeyFailures(): void {
+    this.failedKeys.clear();
+    this.keyCursor = 0;
   }
 }

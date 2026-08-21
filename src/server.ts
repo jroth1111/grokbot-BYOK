@@ -269,6 +269,10 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
         continue;
       }
 
+      // Reset per-request key-failure state so a 401 on a key in a
+      // previous request doesn't permanently remove it from rotation.
+      provider.resetKeyFailures();
+
       // Re-resolve the model for this specific provider.
       const model = provider.resolveModel(normalizedId, rawModelId);
       openaiBody.model = model;

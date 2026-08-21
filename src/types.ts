@@ -206,6 +206,8 @@ export interface Provider {
   selectKey(): KeyInfo;
   /** Mark a key as failed (for rotation). */
   markKeyFailed(key: KeyInfo): void;
+  /** Clear failed-key state (called at the start of each request). */
+  resetKeyFailures(): void;
 }
 
 /** Configuration for a single provider. */

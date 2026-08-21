@@ -740,11 +740,36 @@ describe("BaseProvider key rotation with auth errors", () => {
     }
 
     // All 3 keys should have been tried despite maxRetries=0.
-    // The exact order depends on cursor + enabled-set interactions as
-    // keys are marked failed, but the important invariant is that
-    // every key gets a turn.
+    // After the keyCursor reset fix, the order should be stable: A, B, C.
     expect(triedKeys).toHaveLength(3);
-    expect(new Set(triedKeys)).toEqual(new Set(["key-a", "key-b", "key-c"]));
+    expect(triedKeys).toEqual(["key-a", "key-b", "key-c"]);
+  });
+
+  it("tries keys in stable round-robin order after markKeyFailed", () => {
+    // With the keyCursor reset fix, marking a key as failed resets the
+    // cursor so the next selectKey picks the first remaining enabled key.
+    const provider = new BaseProvider("p", {
+      baseUrl: "https://example.com/v1",
+      apiKey: "",
+      defaultModel: "m",
+      models: { "m": "m" },
+      keys: [
+        { value: "key-a", weight: 1 },
+        { value: "key-b", weight: 1 },
+        { value: "key-c", weight: 1 },
+      ],
+    });
+
+    // First key
+    expect(provider.selectKey().value).toBe("key-a");
+    // Mark A as failed — cursor resets to 0
+    provider.markKeyFailed(provider.keys[0]);
+    // Next should be B (first in the remaining enabled set)
+    expect(provider.selectKey().value).toBe("key-b");
+    // Mark B as failed — cursor resets to 0
+    provider.markKeyFailed(provider.keys[1]);
+    // Next should be C (only remaining enabled key)
+    expect(provider.selectKey().value).toBe("key-c");
   });
 
   it("resets failed keys and continues when all keys fail", () => {
@@ -768,5 +793,28 @@ describe("BaseProvider key rotation with auth errors", () => {
     // selectKey should reset and return the first key
     const key = provider.selectKey();
     expect(key.value).toBe("key-a");
+  });
+
+  it("resetKeyFailures clears the failed set for a fresh request", () => {
+    // A 401 on a key in request 1 should not permanently remove it.
+    // resetKeyFailures is called at the start of each request.
+    const provider = new BaseProvider("p", {
+      baseUrl: "https://example.com/v1",
+      apiKey: "",
+      defaultModel: "m",
+      models: { "m": "m" },
+      keys: [
+        { value: "key-a", weight: 1 },
+        { value: "key-b", weight: 1 },
+      ],
+    });
+
+    // Request 1: key-a gets a 401
+    provider.markKeyFailed(provider.keys[0]);
+    expect(provider.selectKey().value).toBe("key-b");
+
+    // Request 2: reset failed keys — key-a should be available again
+    provider.resetKeyFailures();
+    expect(provider.selectKey().value).toBe("key-a");
   });
 });
