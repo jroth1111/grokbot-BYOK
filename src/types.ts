@@ -236,6 +236,9 @@ export interface NetworkConfig {
   retryBackoffMaxMs?: number;
   /** Stream idle timeout in ms — close if no data for this long (default 120000). */
   streamIdleTimeoutMs?: number;
+  /** TTFB timeout in ms — if no first token arrives within this window,
+   *  abort and failover to the next provider (default 15000, 0 disables). */
+  ttfbTimeoutMs?: number;
   /** Cooldown in ms for 429 rate-limit errors (default 10000). */
   rateLimitCooldownMs?: number;
   /** Cooldown in ms for 5xx server errors (default 30000). */

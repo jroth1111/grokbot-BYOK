@@ -89,6 +89,10 @@ const SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 /** Default stream idle timeout (ms) when a provider doesn't specify one. */
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 120_000;
 
+/** Default TTFB timeout (ms): if no first token arrives within this window,
+ *  abort the stream and failover to the next provider. Set to 0 to disable. */
+const DEFAULT_TTFB_TIMEOUT_MS = 15_000;
+
 /** Default retry backoff settings when a provider doesn't specify them. */
 const DEFAULT_RETRY_BACKOFF_INITIAL_MS = 500;
 const DEFAULT_RETRY_BACKOFF_MAX_MS = 5_000;
@@ -811,6 +815,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       hasVisibleContent: boolean;
       sawFinish: boolean;
       streamError: boolean;
+      ttfbTimedOut: boolean;
       promptTokens: number;
       completionTokens: number;
       totalTokens: number | undefined;
@@ -868,6 +873,13 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       // Time to first token (TTFB): timestamp of the first content/reasoning
       // delta. Key latency metric — measures provider prefill + network.
       let ttfbMs: number | undefined;
+      // TTFB timeout: if no first token arrives within this window, abort the
+      // stream so the caller can failover to the next provider. Unlike the
+      // idle timeout (which fires between tokens), this fires only once —
+      // before the first token is seen.
+      let ttfbTimedOut = false;
+      let ttfbTimer: ReturnType<typeof setTimeout> | undefined;
+      const ttfbTimeoutMs = network.ttfbTimeoutMs ?? DEFAULT_TTFB_TIMEOUT_MS;
       let totalTokens: number | undefined;
       let reasoningTokens: number | undefined;
       let cachedTokens: number | undefined;
@@ -963,14 +975,20 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
               delta.reasoning_text ||
               "";
             if (reasoningText) {
-              if (ttfbMs === undefined) ttfbMs = Date.now() - requestStart;
+              if (ttfbMs === undefined) {
+                ttfbMs = Date.now() - requestStart;
+                if (ttfbTimer) { clearTimeout(ttfbTimer); ttfbTimer = undefined; }
+              }
               frames.push(makeTextFrame(reasoningText, false));
               if (reasoningText.length > 0) {
                 hasVisibleContent = true;
               }
             }
             if (delta.content) {
-              if (ttfbMs === undefined) ttfbMs = Date.now() - requestStart;
+              if (ttfbMs === undefined) {
+                ttfbMs = Date.now() - requestStart;
+                if (ttfbTimer) { clearTimeout(ttfbTimer); ttfbTimer = undefined; }
+              }
               if (markupHealer) {
                 // Provider leaks chat-template markup into content — route
                 // through the streaming markup healer, which strips tool-call
@@ -1104,6 +1122,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
               hasVisibleContent: false,
               sawFinish: false,
               streamError: true,
+              ttfbTimedOut: false,
               promptTokens,
               completionTokens,
               totalTokens,
@@ -1127,6 +1146,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
             hasVisibleContent: false,
             sawFinish: false,
             streamError: true,
+            ttfbTimedOut: false,
             promptTokens,
             completionTokens,
             totalTokens,
@@ -1154,6 +1174,23 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
           try { r.cancel(); } catch { /* already closed */ }
         }
         streamTimeout.reset();
+        // Start the TTFB timer: if no first token arrives within the
+        // timeout, abort the stream so the caller can failover to the
+        // next provider instead of waiting indefinitely.
+        if (ttfbTimeoutMs > 0 && ttfbMs === undefined) {
+          ttfbTimer = setTimeout(() => {
+            if (streamClosed || ttfbMs !== undefined) return;
+            ttfbTimedOut = true;
+            streamError = true;
+            logger.warn("ttfb timeout, aborting stream for failover", {
+              model,
+              provider: providerName,
+              ttfbTimeoutMs,
+              elapsed: Date.now() - requestStart,
+            });
+            void reader?.cancel().catch(() => { /* ignore */ });
+          }, ttfbTimeoutMs);
+        }
         // eslint-disable-next-line no-constant-condition
         while (true) {
           if (clientDisconnected) {
@@ -1205,6 +1242,9 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         // late-firing idle-timeout callback is ignored (see streamClosed).
         streamClosed = true;
         streamTimeout.clear();
+        // Clear the TTFB timer if it's still pending (first token arrived
+        // or stream ended before it fired).
+        if (ttfbTimer) { clearTimeout(ttfbTimer); ttfbTimer = undefined; }
         // Clear the abort handler so the client-disconnect listener can't
         // call cancel() on an already-closed reader.
         abortUpstream = null;
@@ -1377,6 +1417,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         hasVisibleContent,
         sawFinish,
         streamError,
+        ttfbTimedOut,
         promptTokens,
         completionTokens,
         totalTokens,
@@ -1387,7 +1428,31 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       };
     };
 
+    // ---------------------------------------------------------------------
+    // 10b. Stream with cross-provider failover on empty completion or TTFB
+    //      timeout. The first attempt uses the already-connected provider.
+    //      On empty completion or TTFB timeout, instead of retrying the same
+    //      provider, we try the NEXT provider in the failover chain. This
+    //      avoids getting stuck on a slow provider when a faster one is
+    //      available. The client is unaware of the provider switch — the
+    //      shim silently fails over and returns whichever provider responds.
+    // ---------------------------------------------------------------------
     let lastResult: AttemptResult | undefined;
+    let activeProviderName = providerName;
+    let activeModel = model;
+    let activeKey = key;
+    let activeBaseUrl = baseUrl;
+    let activeCompat = compat;
+    let activeNetwork = network;
+
+    // Build the list of providers to try: the connected provider first,
+    // then the remaining providers in the failover chain (excluding the
+    // ones already tried during the connection phase).
+    const triedProviderNames = new Set<string>([providerName]);
+    const remainingProviders = failoverChain.filter(
+      (p) => !triedProviderNames.has(p.name),
+    );
+
     for (
       let emptyAttempt = 0;
       emptyAttempt <= MAX_EMPTY_COMPLETION_RETRIES;
@@ -1401,30 +1466,60 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         emptyAttempt === 0 ? firstResp : undefined,
       );
       lastResult = result;
-      if (result.hasVisibleContent || result.streamError) {
+
+      // Success or non-retryable error: stop.
+      if (result.hasVisibleContent || (result.streamError && !result.ttfbTimedOut)) {
         break;
       }
-      // Record the empty-completion attempt in the trace so the failover
-      // trail shows the retries (not just the final outcome).
-      recordAttempt(providerName, model, "empty_completion", emptyAttemptStart, "empty completion");
-      if (emptyAttempt < MAX_EMPTY_COMPLETION_RETRIES) {
-        logger.info("empty completion, retrying", {
-          model,
-          provider: providerName,
-          attempt: emptyAttempt,
-          completionTokens: result.completionTokens,
-          toolCalls: result.toolCallCount,
-          elapsed: Date.now() - requestStart,
-        });
+
+      // TTFB timeout or empty completion: try the next provider if available.
+      const failoverReason = result.ttfbTimedOut ? "ttfb_timeout" : "empty_completion";
+      recordAttempt(activeProviderName, activeModel, failoverReason as AttemptOutcome, emptyAttemptStart, failoverReason);
+
+      // Find the next provider to try. On the first failover, switch to
+      // the next in the chain. On subsequent failovers, continue down.
+      const nextProvider = remainingProviders.shift();
+      if (!nextProvider) {
+        // No more providers to try — log and stop.
+        if (emptyAttempt < MAX_EMPTY_COMPLETION_RETRIES) {
+          logger.info(`${failoverReason}, no more providers to try`, {
+            model: activeModel,
+            provider: activeProviderName,
+            attempt: emptyAttempt,
+            elapsed: Date.now() - requestStart,
+          });
+        }
+        break;
       }
+
+      // Switch to the next provider for the next attempt.
+      logger.warn(`${failoverReason}, failing over to next provider`, {
+        model: activeModel,
+        from: activeProviderName,
+        to: nextProvider.name,
+        attempt: emptyAttempt,
+        elapsed: Date.now() - requestStart,
+      });
+
+      // Re-resolve model + apply compat for the new provider.
+      openaiBody = JSON.parse(JSON.stringify(openaiBodySnapshot)) as typeof openaiBody;
+      activeProviderName = nextProvider.name;
+      activeModel = nextProvider.resolveModel(normalizedId);
+      openaiBody.model = activeModel;
+      activeKey = nextProvider.selectKey();
+      activeBaseUrl = nextProvider.baseUrl;
+      activeCompat = nextProvider.compat;
+      activeNetwork = nextProvider.network;
+      applyCompatToRequest(openaiBody, activeCompat, activeModel, nextProvider.name, nextProvider.baseUrl);
+      triedProviderNames.add(nextProvider.name);
     }
 
     // Surface failover to the caller: if the provider that served the request
     // differs from the primary (the one the routing strategy selected), add an
     // x-failover header so clients that care can detect they got a fallback.
     const failoverHeaders: Record<string, string> = {};
-    if (providerName !== primary.name) {
-      failoverHeaders["x-failover"] = `${primary.name}->${providerName}`;
+    if (activeProviderName !== primary.name) {
+      failoverHeaders["x-failover"] = `${primary.name}->${activeProviderName}`;
     }
 
     startConnectResponse(res, 200, failoverHeaders);

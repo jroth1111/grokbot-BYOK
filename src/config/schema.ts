@@ -25,6 +25,7 @@ const networkConfigSchema = z.object({
   retryBackoffInitialMs: z.number().positive().optional(),
   retryBackoffMaxMs: z.number().positive().optional(),
   streamIdleTimeoutMs: z.number().positive().optional(),
+  ttfbTimeoutMs: z.number().nonnegative().optional(),
   rateLimitCooldownMs: z.number().nonnegative().optional(),
   serverErrorCooldownMs: z.number().nonnegative().optional(),
   failureThreshold: z.number().positive().optional(),
