@@ -591,6 +591,21 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
     // Request-level error: the request is malformed, emit an error and stop.
     // ---------------------------------------------------------------------
     if (requestError) {
+      // Log the attempt trail even on request errors — the consecutive
+      // breaker may have tripped after multiple provider failures.
+      if (trace.records.length > 0) {
+        logger.warn("failover trail", {
+          model: rawModelId,
+          trail: trace.records.map((r) => ({
+            ordinal: r.ordinal,
+            provider: r.platform,
+            model: r.modelId,
+            outcome: r.outcome,
+            durationMs: r.durationMs,
+            error: r.errorSummary,
+          })),
+        });
+      }
       logger.error("request error, aborting", {
         model: rawModelId,
         elapsed: Date.now() - requestStart,
@@ -982,8 +997,15 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         if (thinkTail.reasoning) {
           frames.push(makeTextFrame(thinkTail.reasoning, false));
         }
+        // Route think-tags flush content through the dialect hold-window,
+        // not directly to frames — the held-back content could contain a
+        // dialect marker that should be rescued as tool calls.
         if (thinkTail.content) {
-          frames.push(makeTextFrame(thinkTail.content, false));
+          if (dialectMode === "passthrough") {
+            frames.push(makeTextFrame(thinkTail.content, false));
+          } else {
+            heldText += thinkTail.content;
+          }
         }
 
         // Flush the dialect hold-window. If we buffered text that turned out
@@ -991,7 +1013,11 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         // <function=>, Qwen XML), rescue it into structured tool calls.
         // Detected-but-unparseable = dead turn (the model emitted gibberish).
         if (heldText.length > 0) {
-          if ((dialectMode as string) === "dialect" || containsDialectMarker(heldText)) {
+          // Check for dialect markers in the held text. This covers both the
+          // case where dialectMode was set to "dialect" during streaming (the
+          // text starts with a known marker) and the case where dialectMode
+          // is still "hold" (stream ended before the hold-window could decide).
+          if (containsDialectMarker(heldText)) {
             const toolNames = new Set(
               (openaiBody.tools ?? []).map((t) => t.function.name),
             );
@@ -1041,10 +1067,13 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         // schema all pass through untouched.
         if (!streamError && isToolArgumentValidationEnabled() && toolAcc.size > 0) {
           const schemas = toolAcc.getSchemaMap();
-          const calls = toolFrames.map((f) => {
-            const tc = (f as { toolCallPart?: { toolCallId?: string; toolCall?: { name?: string; arguments?: string } } }).toolCallPart;
-            return tc?.toolCall ? { function: tc.toolCall } : undefined;
-          }).filter((c): c is { function: { name?: string; arguments?: string } } => c !== undefined);
+          // Map Connect tool-call frames to the { function: { name, arguments } }
+          // shape that invalidToolCallReasons expects. The frame shape is
+          // { toolCallPart: { toolName, args, isComplete } }.
+          const calls = toolFrames.map((f): { function?: { name?: string; arguments?: string } } | undefined => {
+            const tc = (f as { toolCallPart?: { toolName?: string; args?: string } }).toolCallPart;
+            return tc?.toolName ? { function: { name: tc.toolName, arguments: tc.args ?? "" } } : undefined;
+          }).filter((c): c is { function?: { name?: string; arguments?: string } } => c !== undefined);
           const reasons = invalidToolCallReasons(calls, schemas);
           if (reasons.length > 0) {
             logger.warn("invalid tool arguments", {
