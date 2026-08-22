@@ -488,7 +488,7 @@ describe("server integration: successful streaming", () => {
       expect(status).toBe(200);
       expect(headers["content-type"]).toBe(CONTENT_TYPE);
 
-      const { envelopes, trailer, frames } = parseResponse(body);
+      const { trailer, frames } = parseResponse(body);
 
       // The last envelope is the end-stream trailer.
       expect(trailer.flags & 0x02).toBe(END_STREAM_FLAGS);
@@ -807,7 +807,7 @@ describe("server integration: 400 request error stops immediately", () => {
   afterAll(() => cleanup(shim.server, primary.server, secondary.server));
 
   it(
-    "emits a 'request error' frame and does not fail over",
+    "emits a 'request rejected by provider' frame and does not fail over",
     async () => {
       const { status, body } = await sendRequest(shim.port, basicRequest());
       expect(status).toBe(200);
@@ -819,7 +819,7 @@ describe("server integration: 400 request error stops immediately", () => {
         | { error: { message: string } }
         | undefined;
       expect(errorFrame).toBeDefined();
-      expect(errorFrame!.error.message).toBe("request error");
+      expect(errorFrame!.error.message).toBe("request rejected by provider");
 
       // Only the primary was attempted — no failover to the secondary.
       expect(primary.callCount.value).toBe(1);

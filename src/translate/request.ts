@@ -10,7 +10,6 @@
 import type {
   InferenceStreamRequest,
   InferenceTool,
-  InferenceMessage,
   InferenceContentPart,
   InferenceToolResultPart,
   OpenAIChatRequest,
@@ -31,7 +30,9 @@ import { stripSchemaKeys } from "./tool-args.js";
  * content parts.
  *
  * - text  -> { type: "text", text }
- * - image -> { type: "image_url", image_url: { url } }
+ * - image -> { type: "image_url", image_url: { url } } (also handles video
+ *             via mimeType; OpenAI-compatible providers accept video data
+ *             URIs in the image_url field)
  * - file  -> { type: "text", text: "[file: name]" }
  */
 function convertContentParts(
@@ -42,7 +43,7 @@ function convertContentParts(
     if (part.text && part.text.text != null) {
       out.push({ type: "text", text: part.text.text });
     } else if (part.image) {
-      const url = part.image.url ?? part.image.data ?? "";
+      const url = resolveMediaUrl(part.image);
       out.push({ type: "image_url", image_url: { url } });
     } else if (part.file) {
       const name = part.file.name ?? "";
@@ -50,6 +51,27 @@ function convertContentParts(
     }
   }
   return out;
+}
+
+/**
+ * Resolve an image/video part into a URL suitable for the OpenAI-compatible
+ * `image_url` content part.
+ *
+ * - If `url` is set, use it directly (http(s) URL or pre-formatted data URI).
+ * - If `data` is set and already starts with `data:`, use it as-is.
+ * - If `data` is raw base64, wrap it in a `data:<mime>;base64,...` URI,
+ *   using `mimeType` if provided (defaults to `image/png`). This handles
+ *   video parts (mimeType `video/mp4`, etc.) the same way as images —
+ *   OpenAI-compatible providers accept video data URIs in `image_url`.
+ */
+function resolveMediaUrl(
+  img: { url?: string; data?: string; mimeType?: string },
+): string {
+  if (img.url) return img.url;
+  if (!img.data) return "";
+  if (img.data.startsWith("data:")) return img.data;
+  const mime = img.mimeType ?? "image/png";
+  return `data:${mime};base64,${img.data}`;
 }
 
 /**

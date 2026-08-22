@@ -83,6 +83,10 @@ node dist/scripts/deploy.js
 Config is a single JSON file (`config/config.json`), validated by a zod schema
 at startup. String values support `${ENV_VAR}` interpolation for secrets.
 
+A `.env` file in the project root is sourced automatically at startup (before
+config loading), so the shim works standalone — no separate launcher needed.
+Already-set env vars take precedence over `.env`.
+
 ```json
 {
   "port": 8788,
@@ -94,9 +98,14 @@ at startup. String values support `${ENV_VAR}` interpolation for secrets.
     "configs": {
       "opencode-go": {
         "baseUrl": "https://opencode.ai/zen/go/v1",
-        "apiKey": "${OPENCODE_GO_API_KEY}",
+        "apiKey": "${OPENCODE_API_KEY}",
         "defaultModel": "ox-alpha-free",
         "models": { "sand-default": "ox-alpha-free", "ox alpha": "ox-alpha-free" }
+      },
+      "local": {
+        "baseUrl": "http://127.0.0.1:3003/v1",
+        "apiKey": "${LOCAL_API_KEY}",
+        "defaultModel": "glm-5-2"
       }
     }
   },
@@ -107,7 +116,20 @@ at startup. String values support `${ENV_VAR}` interpolation for secrets.
 }
 ```
 
-Env var overrides (backward compat with v1): `SHIM_PORT`, `SHIM_HOST`,
+### Credentials
+
+Two keys, defined in `.env` (see `.env.example`):
+
+| Env var | Used by | Description |
+|---|---|---|
+| `OPENCODE_API_KEY` | `opencode-go`, `opencode-zen` | Single key for both OpenCode endpoints |
+| `LOCAL_API_KEY` | `local` | Must match `API_KEY` in `WindsurfAPI/.env` |
+
+No fallback chain. Missing key = clear auth error from the provider.
+
+### Operational overrides
+
+Env var overrides for operational settings: `SHIM_PORT`, `SHIM_HOST`,
 `SHIM_LOG_DIR`, `SHIM_FAILOVER`, `SHIM_CONFIG`.
 
 ## Routing

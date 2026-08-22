@@ -40,15 +40,31 @@ export class ProviderRegistry {
   ) {
     this.strategy = strategy;
 
-    // Preserve the configured priority order; only keep names that have a
-    // matching config so the chain stays valid.
-    this.priorityOrder = priority.filter((name) => name in configs);
-
     // Construct a BaseProvider for every config entry. Providers not listed
     // in the priority array are still registered (reachable via getProvider)
     // but won't appear in routing or failover chains.
     for (const [name, config] of Object.entries(configs)) {
       this.providers.set(name, new BaseProvider(name, config));
+    }
+
+    // Filter the priority list: skip providers whose API key is empty
+    // or unresolved (env var not set → "${VAR}" literal remains) unless
+    // they are marked `keyless`. This lets users define multiple ox-alpha
+    // providers in config and only the ones with valid keys (or keyless
+    // ones) will be active in the failover chain.
+    this.priorityOrder = priority.filter((name) => {
+      const config = configs[name];
+      if (!config) return false;
+      if (config.keyless) return true;
+      const key = config.apiKey;
+      return key.length > 0 && !key.startsWith("${");
+    });
+
+    // If all providers were filtered out (no keys set), fall back to the
+    // original list so the shim still starts and produces clear auth errors
+    // rather than a "no providers configured" crash.
+    if (this.priorityOrder.length === 0) {
+      this.priorityOrder = priority.filter((name) => name in configs);
     }
   }
 

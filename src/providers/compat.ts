@@ -16,12 +16,6 @@ export type ThinkingFormat =
   | "qwen-chat-template"
   | "openrouter";
 
-export type StreamMarkupHealingPattern =
-  | "kimi"
-  | "dsml"
-  | "thinking"
-  | undefined;
-
 export interface ProviderCompat {
   supportsReasoningEffort: boolean;
   thinkingFormat: ThinkingFormat;
@@ -31,26 +25,36 @@ export interface ProviderCompat {
   maxTokensField: "max_tokens" | "max_completion_tokens";
   streamIdleTimeoutMs: number;
   stripDeepseekSpecialTokens: boolean;
-  streamMarkupHealingPattern: StreamMarkupHealingPattern;
   supportsImages: boolean;
+  /**
+   * Leaked chat-template markup healing pattern for streaming content.
+   *
+   * Hosted models sometimes leak raw template markup (Kimi `<|tool_call_begin|>`,
+   * DeepSeek DSML envelopes, generic `<think>` tags) into visible `content`
+   * instead of returning structured events. When set, the streaming loop in
+   * `server.ts` routes `delta.content` through a `StreamMarkupHealing` filter
+   * that strips the markup and reconstructs tool calls / reasoning from it.
+   *
+   * `undefined` disables healing (the default for providers that never leak).
+   */
+  streamMarkupHealingPattern?: StreamMarkupHealingPattern;
 }
+
+/**
+ * Leaked-markup healing pattern. See `StreamMarkupHealing` in
+ * `translate/markup-healing.ts` for the streaming filter implementation.
+ */
+export type StreamMarkupHealingPattern =
+  | "kimi"
+  | "dsml"
+  | "qwen"
+  | "thinking";
 
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 120_000;
 const GLM_CODING_PLAN_STREAM_IDLE_TIMEOUT_MS = 600_000;
 const KIMI_DEEPSEEK_STREAM_IDLE_TIMEOUT_MS = 300_000;
 
 const GLM_CODING_PLAN_MODEL_PATTERN = /(^|\/)glm-5(?:[.-]|$)/i;
-
-const DSML_HEALING_PROVIDERS = new Set([
-  "ollama",
-  "ollama-cloud",
-  "nvidia",
-  "deepseek",
-  "fireworks",
-  "nanogpt",
-  "opencode-go",
-  "openrouter",
-]);
 
 function hostMatches(baseUrl: string, hostname: string): boolean {
   if (!baseUrl) return false;
@@ -59,12 +63,6 @@ function hostMatches(baseUrl: string, hostname: string): boolean {
   } catch {
     return false;
   }
-}
-
-function isOfficialOpenAIEndpoint(provider: string, baseUrl: string): boolean {
-  if (provider !== "openai") return false;
-  if (!baseUrl) return true;
-  return hostMatches(baseUrl, "api.openai.com");
 }
 
 function isDeepseekModelId(modelId: string): boolean {
@@ -128,21 +126,6 @@ function isOpenRouterProvider(provider: string, baseUrl: string): boolean {
     provider === "openrouter" ||
     hostMatches(baseUrl, "openrouter.ai")
   );
-}
-
-function detectStreamMarkupHealingPattern(
-  provider: string,
-  modelId: string,
-  baseUrl: string,
-): StreamMarkupHealingPattern {
-  if (provider === "kimi-code" || provider === "moonshot" || /kimi[-/_.]?k2/i.test(modelId)) {
-    return "kimi";
-  }
-  if (isDeepseekModelId(modelId) && DSML_HEALING_PROVIDERS.has(provider)) {
-    return "dsml";
-  }
-  if (isOfficialOpenAIEndpoint(provider, baseUrl)) return undefined;
-  return "thinking";
 }
 
 function detectSupportsMultipleSystemMessages(
@@ -255,12 +238,15 @@ function detectSupportsReasoningEffort(
   return true;
 }
 
-function detectSupportsImages(
+export function detectSupportsImages(
   provider: string,
   baseUrl: string,
   modelId: string,
 ): boolean {
   const id = modelId.toLowerCase();
+  // Ox Alpha (ox-alpha-free on OpenCode, stealth/ox-alpha on OpenRouter/Kilo)
+  // is a multimodal frontier reasoning model that accepts text, image, and video.
+  if (/ox-alpha/.test(id) || /stealth\/ox-alpha/.test(id)) return true;
   if (isGlmModelId(id)) {
     return /glm-.*v\b/.test(id) || /glm-4v/.test(id);
   }
@@ -281,12 +267,55 @@ function detectSupportsImages(
 }
 
 /**
- * Resolve provider compat flags from the provider name, base URL, and model id.
+ * Providers known to serve DeepSeek models that leak DSML tool-call envelopes
+ * into visible `content`. Used by {@link detectStreamMarkupHealingPattern} to
+ * gate the DSML healer — only enable it where the leak has been observed.
+ */
+const DSML_HEALING_PROVIDERS = new Set([
+  "ollama",
+  "ollama-cloud",
+  "nvidia",
+  "deepseek",
+  "fireworks",
+  "nanogpt",
+  "opencode-go",
+  "openrouter",
+]);
+
+/**
+ * Detect the leaked-markup healing pattern for a provider + model.
  *
- * Detection mirrors oh-my-pi's `buildOpenAICompat`: provider name takes
- * precedence over URL-based heuristics, which take precedence over model-id
- * heuristics. Callers may override individual flags via the `overrides`
- * argument (wired through from `providerConfigSchema.compat`).
+ * - Kimi-K2 (any provider): `"kimi"` — strips `<|tool_call_begin|>` tokens.
+ * - DeepSeek on a DSML-leaking provider: `"dsml"` — strips fullwidth DSML envelopes.
+ * - Qwen on a leaking provider: `"qwen"` — strips `<tool_calls>` XML blocks.
+ * - Otherwise: `undefined` — no healing (the existing think-tags filter +
+ *   dialect hold-window in server.ts handle generic thinking extraction and
+ *   post-hoc dialect rescue).
+ *
+ * Only providers that have been observed to leak structured tool-call markup
+ * into `content` get a pattern; the generic thinking-tag case is already
+ * covered by `ThinkTagStreamFilter` and the dialect hold-window, so returning
+ * `undefined` here preserves the existing behavior for the majority of models.
+ */
+function detectStreamMarkupHealingPattern(
+  provider: string,
+  modelId: string,
+): StreamMarkupHealingPattern | undefined {
+  if (provider === "kimi-code" || provider === "moonshot" || /kimi[-/_.]?k2/i.test(modelId)) {
+    return "kimi";
+  }
+  if (isDeepseekModelId(modelId) && DSML_HEALING_PROVIDERS.has(provider)) {
+    return "dsml";
+  }
+  return undefined;
+}
+
+/**
+ * Resolve the full compat record for a provider. Detection mirrors oh-my-pi's
+ * `buildOpenAICompat`: provider name takes precedence over URL-based
+ * heuristics, which take precedence over model-id heuristics. Callers may
+ * override individual flags via the `overrides` argument (wired through from
+ * `providerConfigSchema.compat`).
  */
 export function resolveCompat(
   providerName: string,
@@ -312,8 +341,8 @@ export function resolveCompat(
     stripDeepseekSpecialTokens:
       isDeepseekModelId(modelIdLower) &&
       (provider === "nvidia" || provider === "deepseek"),
-    streamMarkupHealingPattern: detectStreamMarkupHealingPattern(provider, modelIdLower, base),
     supportsImages: detectSupportsImages(provider, base, modelIdLower),
+    streamMarkupHealingPattern: detectStreamMarkupHealingPattern(provider, modelIdLower),
   };
   if (overrides) {
     for (const [key, value] of Object.entries(overrides)) {
@@ -338,6 +367,9 @@ export function resolveCompat(
 export function applyCompatToRequest(
   openaiBody: OpenAIChatRequest,
   compat: ProviderCompat,
+  modelId?: string,
+  providerName?: string,
+  baseUrl?: string,
 ): OpenAIChatRequest {
   const messages = openaiBody.messages;
 
@@ -382,7 +414,13 @@ export function applyCompatToRequest(
     }
   }
 
-  if (!compat.supportsImages) {
+  // Re-check vision support with the actual model id, not just the
+  // provider-level compat (which was resolved with the default model).
+  const supportsImages = modelId && providerName && baseUrl
+    ? detectSupportsImages(providerName, baseUrl, modelId) || compat.supportsImages
+    : compat.supportsImages;
+
+  if (!supportsImages) {
     for (const msg of openaiBody.messages) {
       if (Array.isArray(msg.content)) {
         msg.content = stripImagesForNonVisionModel(msg.content, false);

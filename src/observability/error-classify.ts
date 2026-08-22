@@ -3,118 +3,11 @@
 // no I/O — so they live in a neutral lib module that any of those can import
 // without forming an import cycle (fusion ↔ proxy in particular).
 
-export function isRetryableError(err: any): boolean {
-  const msg = (err.message ?? '').toLowerCase();
-  // Trust the upstream HTTP status the provider attached to the error first
-  // (providerHttpError in providers/base.ts sets err.status on every adapter).
-  // This structured check is the robust primary signal; the message-substring
-  // rules below are the fallback for errors that carry a code in their text but
-  // no numeric status. It's the fix for #337/#339: an Ollama "410 Gone", or any
-  // upstream 5xx the substring allowlist never enumerated (502/504/507…), used to
-  // fall through to a 502 and STRAND the healthy paid routes still queued later in
-  // the chain — because the old code matched specific substrings and ignored
-  // err.status for every code except 403. 408 (request timeout), 409 (conflict),
-  // 410 (model pulled upstream), 429 (rate limit) and all 5xx are transient or
-  // fail-over-able; 400/401 stay fatal (status 0 here, handled by the absence of a
-  // matching rule) and 403 is handled by isModelAccessForbiddenError below.
-  // 422 (notably Mistral's strict validation) is a provider-side request-shape
-  // rejection: fail over to another provider, but if the whole chain rejects it
-  // exhaustedRetryError renders a client-facing 400 via isProviderBadRequestError.
-  const status = typeof err?.status === 'number' ? err.status : 0;
-  if (status === 408 || status === 409 || status === 410 || status === 422 || status === 429 || status >= 500) return true;
-  return msg.includes('429') || msg.includes('rate limit') || msg.includes('too many requests')
-    || msg.includes('quota') || msg.includes('resource_exhausted')
-    || msg.includes('aborted') || msg.includes('timeout') || msg.includes('etimedout')
-    || msg.includes('econnrefused') || msg.includes('econnreset')
-    || msg.includes('fetch failed')    // undici transport error (proxy down, DNS, TLS, etc.)
-    || msg.includes('503') || msg.includes('unavailable')
-    // Provider marks the hosted deployment itself as sick (NVIDIA NIM's
-    // "DEGRADED function cannot be invoked" arrives as a 400, #522). The
-    // 'api error 400' rule below already catches the NIM shape; this keeps
-    // degraded conditions retryable even when a provider words it differently.
-    || msg.includes('degraded')
-    || msg.includes('500') || msg.includes('internal server error')
-    // 413: this model's payload limit is too small for the request, but another
-    // provider in the fallback chain may have a larger limit. Same reasoning as 503.
-    || msg.includes('413') || msg.includes('payload too large') || msg.includes('request body too large')
-    || msg.includes('request entity too large') || msg.includes('content too large')
-    // Context/prompt-too-large in all its provider wordings (Anthropic "prompt
-    // is too long", Google "input token count ... exceeds", OpenAI "maximum
-    // context length", …): another candidate may have a larger window, so fail
-    // over; if EVERY candidate rejects it the exhaustion ladder renders an
-    // honest 413 instead of a generic failure.
-    || isContextTooLargeError(err)
-    // 404: model deprecated/removed upstream (e.g. OpenRouter's "no endpoints found"
-    // for a model that's been pulled). Rotate to the next model in the chain —
-    // setCooldown + the health checker will avoid this model on subsequent requests.
-    || msg.includes('404') || msg.includes('not found') || msg.includes('no endpoints found')
-    // 410: the model/endpoint was permanently removed upstream (e.g. Ollama Cloud
-    // "API error 410: Gone", #339). Like a 404 it won't return on this provider, so
-    // rotate to the next route; isModelNotFoundError benches the whole model. The
-    // structured status check above already catches the 410 when the provider
-    // attaches err.status — this is the text fallback for errors that don't.
-    || msg.includes('410') || msg.includes('gone')
-    // 403: the key is valid (it passed validateKey, and the health checker
-    // disables truly-forbidden keys) but this specific model is off-limits to
-    // the key's tier — e.g. gpt-4o on GitHub Models' free tier, subscription-only
-    // models on Cloudflare. Another model in the chain is reachable, so fail over
-    // instead of 502-ing the whole request. Paired with isModelAccessForbiddenError
-    // to rule the model out for this request and a day-long bench. See issue #256.
-    || isModelAccessForbiddenError(err)
-    // 400: one provider may reject parameters another accepts (e.g. max_tokens
-    // limits, unsupported params). The matching pattern is "api error 400"
-    // which comes from the OpenAI-compat provider's error formatting, not
-    // a bare "400" which is deliberately non-retryable for validation errors.
-    || msg.includes('api error 400')
-    // 422: Mistral and other strict OpenAI-compatible endpoints use
-    // Unprocessable Entity for request-shape validation. Rotate to a provider
-    // that accepts the same OpenAI payload; if every provider rejects it, render
-    // a clean invalid_request_error instead of a rate-limit exhaustion.
-    || msg.includes('api error 422') || msg.includes('unprocessable entity')
-    // 402: this provider/key is out of credits (e.g. HuggingFace Router
-    // "API error 402: Payment required"). The SAME model often lives on another
-    // provider (Kimi K2.6 is on HF + Cloudflare + NVIDIA), so fail over instead
-    // of killing the workflow. Paired with a long cooldown (isPaymentRequiredError)
-    // so we don't re-hammer the broke key every retry.
-    || isPaymentRequiredError(err)
-    // Dead-turn classes from the stream turn-integrity layer (#231 audit):
-    // all thrown before any byte reached the client, so another model can
-    // serve the request invisibly.
-    || msg.includes('empty completion')
-    // The model answered in prose despite a response_format request (and the
-    // JSON couldn't be healed out of the text) — thrown before any byte
-    // reached the client, so the next candidate can serve it invisibly.
-    || msg.includes('ignored response_format')
-    // The model DID emit JSON but ran out of max_tokens mid-value
-    // (finish_reason 'length'). A terser model may fit the same schema in the
-    // same budget, so fail over — but the thrower marks the model skipped for
-    // this request: retrying the same model would truncate identically.
-    || msg.includes('truncated json')
-    || msg.includes('in-band provider error')
-    || msg.includes('stream ended unexpectedly')
-    || msg.includes('stream stalled')
-    // First-byte timeout (#584): the grace budget expired before ANY byte
-    // reached the client, so the next candidate can serve it invisibly.
-    || msg.includes('no first byte')
-    || msg.includes('unparseable inline tool-call dialect')
-    // The model emitted a tool call whose arguments violate the schema the
-    // caller declared (opt-in check, lib/tool-validate.ts). Thrown before any
-    // byte reached the client, and a different model usually gets the same
-    // call right — the thrower marks the model skipped for this request, since
-    // a sibling key would misbehave identically.
-    || msg.includes('invalid tool arguments')
-    // A transport failure undici buried in `err.cause` rather than the
-    // top-level message (see isTransportError). Purely additive: every rule
-    // above is unchanged, and this is a second, structured signal for the
-    // errors whose real cause never reaches the text we match on.
-    || isTransportError(err);
-}
-
 // ── Transport failures hidden in the cause chain (undici) ────────────────────
-// Every rule in isRetryableError above reads the TOP-LEVEL message, and undici
-// does not always put the real failure there. The INITIAL-CONNECT case is
-// covered by luck: undici words a connection that never opened "fetch failed",
-// and the allowlist matches that string. A socket that dies MID-request does
+// The detailed classifier reads the TOP-LEVEL message, and undici does not always
+// put the real failure there. The INITIAL-CONNECT case is covered by luck:
+// undici words a connection that never opened "fetch failed", and the substring
+// rules in the classifier match that string. A socket that dies MID-request does
 // not get the same treatment — it surfaces as a generic wrapper (a bare
 // `TypeError: terminated`, or an adapter's own re-throw) whose `.cause` carries
 // the actual ECONNRESET / EPIPE / "socket hang up" / "premature close" /
@@ -207,7 +100,7 @@ export function isTransportError(err: any): boolean {
 }
 
 // A genuine provider QUOTA signal: a structured 429 or rate-limit/quota wording.
-// Distinct from the much broader isRetryableError: timeouts, 5xx, transport
+// Distinct from the much broader retry classifiers: timeouts, 5xx, transport
 // failures and dead-turn classes are retryable but say nothing about quotas.
 // The null-limits exhaustion heuristic in getCooldownDecisionForLimit (services/
 // ratelimit.ts) keys off this: only an actual quota signal may feed its
@@ -276,21 +169,7 @@ export function isClientAbortError(err: any): boolean {
   return msg.includes('client disconnected');
 }
 
-// ── Fallback time-budget hedging (fallback-v2) ──────────────────────────────
-// When the wall-clock retry budget expires MID-FLIGHT (the current attempt is
-// still waiting on a stalled upstream), the fallback loop aborts the composed
-// fetch signal with this marked error. Same rationale as the client abort: it
-// is NOT a provider-health signal, so it must never bench/cooldown/penalize
-// the model+key, and enrichAbort must pass it through untouched. The loop
-// catches it, renders timedOut exhaustion (the budget is spent — nothing left
-// to try), and stops without failure bookkeeping.
-export function newHedgeAbortError(): Error {
-  const err = new Error('fallback time budget expired — upstream request canceled');
-  (err as Error & { hedgeAbort?: boolean }).hedgeAbort = true;
-  return err;
-}
-
-/** True when an error is (or wraps) the time-budget hedge abort above. */
+/** True when an error is (or wraps) a time-budget hedge abort. */
 export function isHedgeAbortError(err: any): boolean {
   if (err?.hedgeAbort === true) return true;
   if (err?.cause && (err.cause as { hedgeAbort?: boolean }).hedgeAbort === true) return true;
@@ -313,7 +192,7 @@ export function isAbortLikeError(err: any): boolean {
 // the same request is fine on the provider's sibling key or on another provider,
 // so the fallback loop rotates past the bad key (and triggers an immediate
 // health revalidation) instead of 502-ing the whole request. Deliberately NOT
-// added to isRetryableError: a bad key must be skipped and revalidated, not
+// classified as retryable: a bad key must be skipped and revalidated, not
 // blindly re-benched like a rate limit — the loop handles it as its own class.
 //
 // Status handling: every provider adapter attaches err.status (providerHttpError
@@ -431,7 +310,7 @@ export function isContextTooLargeError(err: any): boolean {
 // it won't recover on the next window, so the caller benches the model+key with
 // PAYMENT_REQUIRED_COOLDOWN_MS (a full day) rather than the 90s transient cooldown.
 export function isPaymentRequiredError(err: any): boolean {
-  const msg = (err.message ?? '').toLowerCase();
+  const msg = (err?.message ?? '').toLowerCase();
   return msg.includes('402') || msg.includes('payment required')
     || msg.includes('insufficient_quota') || msg.includes('insufficient credit')
     || msg.includes('insufficient balance');
@@ -501,164 +380,4 @@ const CONTENT_FILTER_PATTERN = /\b(?:incomplete:\s*)?content_filter\b/i;
 
 export function isContentBlockedText(text: string): boolean {
   return CONTENT_FILTER_PATTERN.test(text);
-}
-
-const MALFORMED_FUNCTION_CALL_PATTERN = /\bmalformed.?function.?call\b/i;
-
-function isMalformedFunctionCallText(text: string): boolean {
-  return MALFORMED_FUNCTION_CALL_PATTERN.test(text);
-}
-
-// ── Embedded status extraction (oh-my-pi gateway) ────────────────────────────
-
-/** A gateway-facing classification of an arbitrary upstream/internal error. */
-export interface GatewayErrorClassification {
-  status: number;
-  type: string;
-  message: string;
-}
-
-/**
- * Classify an upstream / gateway-internal error into a status code and a
- * format-neutral type. The order is intentional:
- *
- *  1. Honour an explicit numeric `status` property on the thrown error.
- *  2. Parse a status code embedded in the message string. Provider errors
- *     virtually always carry one (`Google API error (400): …`, `HTTP 429`,
- *     `status=503`) and the embedded value is authoritative.
- *  3. Fall through to **word-boundaried** substring heuristics. The old
- *     `lower.includes("rate")` test famously matched `GenerateContentRequest`,
- *     surfacing every Google 400 as a 429 `rate_limit_error`. The patterns here
- *     all require boundaries so they don't collide with provider field names.
- */
-export function classifyGatewayError(err: unknown): GatewayErrorClassification {
-  const message = err instanceof Error ? err.message : String(err);
-
-  // 1. Custom pi-ai errors may attach a numeric `status` property.
-  const statusProp =
-    typeof err === "object" && err !== null && typeof (err as { status?: unknown }).status === "number"
-      ? (err as { status: number }).status | 0
-      : undefined;
-  if (statusProp !== undefined) return bucketStatus(statusProp, message);
-
-  if (err instanceof Error && err.name === "AbortError") return { status: 499, type: "request_aborted", message };
-
-  // 2. Status code embedded in the message. Requires a contextual keyword
-  // (`HTTP`, `API error`, `status`, …) or a leading `(NNN)` token so we
-  // don't trip on incidental three-digit numbers ("took 200ms").
-  const embedded = extractEmbeddedStatus(message);
-  if (embedded !== undefined) return bucketStatus(embedded, message);
-
-  // 3. Word-boundaried substring heuristics.
-  if (/\baborted\b|\babort signal\b/i.test(message)) {
-    return { status: 499, type: "request_aborted", message };
-  }
-  if (
-    // Match rate-limit phrasings before auth wording: some providers
-    // describe throttling as "unauthorized due to rate limit".
-    // Keep boundaries so this does not collide with
-    // `GenerateContentRequest`, `accelerate`, `iterate`, `deprecated`, etc.
-    /\brate[- _]?limit(?:s|ed|ing)?\b|\bquota(?:_exceeded| exceeded)?\b|\btoo[- _]many[- _]requests\b/i.test(
-      message,
-    ) ||
-    // Usage-limit phrasings emit no embedded status. Codex friendly text
-    // reads "You have hit your ChatGPT usage limit … Try again in ~158
-    // min."; the central usage-limit classifier already encodes every known
-    // provider variant, so reuse it instead of forking the regex. Without
-    // this branch the classifier falls through to the default
-    // 502/upstream_error, which is what callers saw when their account
-    // hit its cap.
-    isUsageLimitText(message)
-  ) {
-    return { status: 429, type: "rate_limit_error", message };
-  }
-  if (/\b(?:unauthorized|forbidden)\b/i.test(message)) {
-    return { status: 401, type: "authentication_error", message };
-  }
-  if (/\b(?:unsupported|invalid_request|invalid request|bad request|malformed)\b/i.test(message)) {
-    return { status: 400, type: "invalid_request_error", message };
-  }
-  return { status: 502, type: "upstream_error", message };
-}
-
-function bucketStatus(status: number, message: string): GatewayErrorClassification {
-  if (status === 401 || status === 403) return { status, type: "authentication_error", message };
-  if (status === 429) return { status, type: "rate_limit_error", message };
-  if (status >= 400 && status < 500) return { status, type: "invalid_request_error", message };
-  if (status >= 500) return { status, type: "upstream_error", message };
-  return { status: 502, type: "upstream_error", message };
-}
-
-/**
- * Pull a status code from common error-message shapes. Returns undefined when
- * no contextual keyword is present, so we never guess at incidental numbers.
- */
-export function extractEmbeddedStatus(message: string): number | undefined {
-  // `Google API error (400)`, `OpenAI API error (429): …`, `(503)`
-  // `HTTP 429: too many requests`
-  // `status: 503`, `status_code=429`, `status=400`
-  const re = /(?:\bHTTP\b|\bAPI error\b|\bstatus(?:[- _]?code)?\b)\s*[:=]?\s*\(?\s*(\d{3})\b|\((\d{3})\)/i;
-  const m = message.match(re);
-  if (!m) return undefined;
-  const raw = m[1] ?? m[2];
-  if (!raw) return undefined;
-  const code = Number.parseInt(raw, 10);
-  return Number.isFinite(code) && code >= 100 && code < 600 ? code : undefined;
-}
-
-// Usage-limit text matcher inlined from the central usage-limit classifier
-// (oh-my-pi packages/ai/src/error/rate-limit.ts) so this module stays
-// import-free. Encodes every known provider variant of account quota/usage-cap
-// phrasing.
-const USAGE_LIMIT_PATTERN =
-  /usage.?limit|usage_limit_reached|usage_not_included|limit_reached|quota.?(?:exceeded|reached|insufficient)|额度不足|额度耗尽|resource.?exhausted|exhausted your capacity|quota will reset|insufficient.?(?:balance|quota)|balance.?exhausted|run out of credits|out of credits|spending[- _]?limit|personal-team-blocked/i;
-
-function isUsageLimitText(message: string): boolean {
-  return USAGE_LIMIT_PATTERN.test(message);
-}
-
-// ── Combined detailed classifier ─────────────────────────────────────────────
-
-export type DetailedErrorClass =
-  | "auth"
-  | "out_of_credits"
-  | "daily_quota_exhausted"
-  | "model_not_found"
-  | "forbidden"
-  | "context_too_large"
-  | "provider_bad_request"
-  | "empty_completion"
-  | "format_ignored"
-  | "invalid_tool_arguments"
-  | "content_blocked"
-  | "malformed_function_call"
-  | "timeout"
-  | "rate_limited"
-  | "upstream_error"
-  | "transport_error"
-  | "client_abort"
-  | "error";
-
-export function classifyDetailedError(err: any): DetailedErrorClass {
-  if (isKeyAuthError(err)) return "auth";
-  if (isPaymentRequiredError(err)) return "out_of_credits";
-  if (isDailyQuotaExhaustedError(err)) return "daily_quota_exhausted";
-  if (isModelNotFoundError(err)) return "model_not_found";
-  if (isModelAccessForbiddenError(err)) return "forbidden";
-  if (isContextTooLargeError(err)) return "context_too_large";
-  if (isProviderDegradedError(err)) return "upstream_error";
-  if (isProviderBadRequestError(err)) return "provider_bad_request";
-  const msg = (err?.message ?? '').toLowerCase();
-  if (isContentBlockedText(msg)) return "content_blocked";
-  if (isMalformedFunctionCallText(msg)) return "malformed_function_call";
-  if (msg.includes('empty completion')) return "empty_completion";
-  if (msg.includes('ignored response_format')) return "format_ignored";
-  if (msg.includes('invalid tool arguments')) return "invalid_tool_arguments";
-  if (isTimeoutErrorText(msg)) return "timeout";
-  if (isRateLimitSignal(err)) return "rate_limited";
-  if (isTransportError(err)) return "transport_error";
-  if (isAbortLikeError(err)) return "client_abort";
-  const status = typeof err?.status === 'number' ? err.status : 0;
-  if (status >= 500) return "upstream_error";
-  return "error";
 }

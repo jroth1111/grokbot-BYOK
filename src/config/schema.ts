@@ -15,7 +15,6 @@ export const DEFAULT_CONFIG_PATH = "config/config.json";
 const keyInfoSchema = z.object({
   value: z.string(),
   weight: z.number().positive().optional(),
-  models: z.record(z.string(), z.string()).optional(),
   enabled: z.boolean().optional(),
 });
 
@@ -43,10 +42,10 @@ const compatOverridesSchema = z.object({
   maxTokensField: z.enum(["max_tokens", "max_completion_tokens"]).optional(),
   streamIdleTimeoutMs: z.number().positive().optional(),
   stripDeepseekSpecialTokens: z.boolean().optional(),
-  streamMarkupHealingPattern: z
-    .enum(["kimi", "dsml", "thinking"])
-    .optional(),
   supportsImages: z.boolean().optional(),
+  streamMarkupHealingPattern: z
+    .enum(["kimi", "dsml", "qwen", "thinking"])
+    .optional(),
 });
 
 /** Validation schema for a single provider entry. */
@@ -58,6 +57,7 @@ export const providerConfigSchema = z.object({
   models: z.record(z.string(), z.string()),
   network: networkConfigSchema.optional(),
   compat: compatOverridesSchema.optional(),
+  keyless: z.boolean().optional(),
 });
 
 /** Validation schema for the `providers` block. */
@@ -87,6 +87,7 @@ export const shimConfigSchema = z.object({
   requestTimeoutMs: z.number().positive().default(30000),
   routingStrategy: z.enum(["priority", "round-robin", "weighted-round-robin", "fill-first"]).default("priority"),
   sessionAffinity: sessionAffinitySchema,
+  visionFallbackModel: z.string().default(""),
   providers: providersSchema,
   hostConfig: hostConfigSchema,
 });

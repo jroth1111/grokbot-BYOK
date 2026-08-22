@@ -90,6 +90,7 @@ function safeTokenCount(n: number): number {
  * @param totalTokens      Total tokens (prompt + completion), if reported.
  * @param reasoningTokens  Reasoning tokens (chain-of-thought), if reported.
  * @param cachedTokens     Cached prompt tokens, if reported.
+ * @param cacheWriteTokens Cache-write tokens (prompt cache misses), if reported.
  */
 export function makeUsageFrame(
   promptTokens: number,
@@ -97,6 +98,7 @@ export function makeUsageFrame(
   totalTokens?: number,
   reasoningTokens?: number,
   cachedTokens?: number,
+  cacheWriteTokens?: number,
 ): InferenceStreamResponse {
   const usage: {
     promptTokens: number;
@@ -104,6 +106,7 @@ export function makeUsageFrame(
     totalTokens?: number;
     reasoningTokens?: number;
     cachedTokens?: number;
+    cacheWriteTokens?: number;
   } = {
     promptTokens: safeTokenCount(promptTokens),
     completionTokens: safeTokenCount(completionTokens),
@@ -118,6 +121,9 @@ export function makeUsageFrame(
   }
   if (cachedTokens != null && Number.isFinite(cachedTokens)) {
     usage.cachedTokens = safeTokenCount(cachedTokens);
+  }
+  if (cacheWriteTokens != null && Number.isFinite(cacheWriteTokens)) {
+    usage.cacheWriteTokens = safeTokenCount(cacheWriteTokens);
   }
   return { usage };
 }

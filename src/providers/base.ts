@@ -3,9 +3,7 @@
  *
  * Provides the shared logic that concrete provider factories build on:
  * model alias resolution, multi-key support with round-robin rotation,
- * and a normalized model-id helper. All concrete providers are thin
- * wrappers around this class (see ./opencode-go.ts, ./opencode-zen.ts,
- * and ./local.ts).
+ * and a normalized model-id helper.
  */
 import type { KeyInfo, NetworkConfig, Provider, ProviderConfig } from "../types.js";
 import { resolveCompat } from "./compat.js";
@@ -86,24 +84,13 @@ export class BaseProvider implements Provider {
       this.keys = [{ value: config.apiKey, weight: 1, enabled: true }];
     }
 
-    // Keep `apiKey` as the first key's value for backward compatibility.
+    // Convenience: the first key's value for single-key providers.
     this.apiKey = this.keys[0]?.value ?? config.apiKey;
 
-    // Build the merged models map: start from provider-level aliases,
-    // then merge each key's per-key aliases (per-key overrides
-    // provider-level for the same alias). Guard against undefined
-    // config.models so Object.entries doesn't throw at runtime.
-    const mergedModels = new Map<string, string>(
+    // Build the alias map from the provider-level models config.
+    this.models = new Map<string, string>(
       Object.entries(config.models ?? {}),
     );
-    for (const key of this.keys) {
-      if (key.models) {
-        for (const [alias, model] of Object.entries(key.models)) {
-          mergedModels.set(alias, model);
-        }
-      }
-    }
-    this.models = mergedModels;
 
     this.compat = resolveCompat(
       name,
@@ -117,7 +104,7 @@ export class BaseProvider implements Provider {
     return this.models.has(normalizedModelId);
   }
 
-  resolveModel(normalizedModelId: string, rawModelId: string): string {
+  resolveModel(normalizedModelId: string): string {
     return this.models.get(normalizedModelId) ?? this.defaultModel;
   }
 

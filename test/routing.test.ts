@@ -682,29 +682,20 @@ describe("BaseProvider config properties", () => {
     expect(provider.apiKey).toBe("legacy-key");
   });
 
-  it("merges per-key model aliases into the models map", () => {
+  it("resolves aliases and falls back to defaultModel", () => {
     const provider = new BaseProvider("p", {
       baseUrl: "https://example.com/v1",
       apiKey: "",
       defaultModel: "default-model",
-      models: { "provider-alias": "provider-model" },
-      keys: [
-        {
-          value: "k1",
-          weight: 1,
-          models: { "key-alias": "key-model", "provider-alias": "override-model" },
-        },
-      ],
+      models: { "known-alias": "canonical-model" },
     });
-    // Provider-level alias present.
-    expect(provider.models.get("provider-alias")).toBe("override-model");
-    // Per-key alias added.
-    expect(provider.models.get("key-alias")).toBe("key-model");
-    // canHandle reflects the merged map.
-    expect(provider.canHandle("provider-alias")).toBe(true);
-    expect(provider.canHandle("key-alias")).toBe(true);
-    // resolveModel uses the merged map.
-    expect(provider.resolveModel("key-alias", "key-alias")).toBe("key-model");
+    // Known alias resolves to canonical.
+    expect(provider.resolveModel("known-alias")).toBe("canonical-model");
+    // canHandle reflects the alias map.
+    expect(provider.canHandle("known-alias")).toBe(true);
+    expect(provider.canHandle("unknown-alias")).toBe(false);
+    // Unknown alias falls back to defaultModel.
+    expect(provider.resolveModel("unknown-alias")).toBe("default-model");
   });
 });
 

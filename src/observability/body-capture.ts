@@ -34,8 +34,15 @@ function getMaxBytes(): number {
 
 /** Truncate a string to maxBytes, appending a truncation marker if cut. */
 function truncate(s: string, maxBytes: number): string {
-  if (s.length <= maxBytes) return s;
-  return s.slice(0, maxBytes) + ` [...truncated, ${s.length - maxBytes} more bytes]`;
+  if (Buffer.byteLength(s, "utf8") <= maxBytes) return s;
+  const buf = Buffer.from(s, "utf8");
+  // Don't split a multi-byte UTF-8 sequence in the middle. Continuation bytes
+  // in UTF-8 have the top two bits set to 10 (0x80-0xBF); slice backward until
+  // the byte at `end` is a valid lead byte (or the start of the string).
+  let end = Math.min(buf.length, maxBytes);
+  while (end > 0 && (buf[end] ?? 0xc0) >> 6 === 0b10) end--;
+  const prefix = buf.slice(0, end).toString("utf8");
+  return `${prefix} [...truncated, ${buf.length - end} more bytes]`;
 }
 
 /**
@@ -73,17 +80,18 @@ export function captureResponseSummary(
   const maxBytes = getMaxBytes();
   const textParts: string[] = [];
   const toolCalls: string[] = [];
-  let totalLen = 0;
+  let totalBytes = 0;
   for (const f of frames) {
     const frame = f as Record<string, unknown>;
     const tp = frame.textPart as { text?: string; isFinal?: boolean } | undefined;
     if (tp?.text && !tp.isFinal) {
-      if (totalLen + tp.text.length > maxBytes) {
-        textParts.push(truncate(tp.text, maxBytes - totalLen));
+      const textBytes = Buffer.byteLength(tp.text, "utf8");
+      if (totalBytes + textBytes > maxBytes) {
+        textParts.push(truncate(tp.text, maxBytes - totalBytes));
         break;
       }
       textParts.push(tp.text);
-      totalLen += tp.text.length;
+      totalBytes += textBytes;
     }
     const tc = frame.toolCallPart as { toolName?: string } | undefined;
     if (tc?.toolName) {

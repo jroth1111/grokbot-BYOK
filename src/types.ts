@@ -214,14 +214,12 @@ export type InferenceStreamResponse =
 /** Routing strategy for selecting among providers that can handle a model. */
 export type RoutingStrategy = "priority" | "round-robin" | "weighted-round-robin" | "fill-first";
 
-/** A single API key with optional model aliases and weight. */
+/** A single API key with optional weight. */
 export interface KeyInfo {
   /** The API key value. */
   value: string;
   /** Weight for weighted-round-robin (default 1). */
   weight?: number;
-  /** Per-key model aliases that override the provider-level map. */
-  models?: Record<string, string>;
   /** Whether this key is enabled (default true). */
   enabled?: boolean;
 }
@@ -258,12 +256,12 @@ export interface Provider {
   readonly network: NetworkConfig;
   /** Per-provider compat flags (auto-detected + user overrides). */
   readonly compat: ProviderCompatFlags;
-  /** Alias -> canonical model id map (provider-level, merged with per-key maps). */
+  /** Alias -> canonical model id map. */
   readonly models: Map<string, string>;
   /** Returns true if this provider has an alias for the given model id. */
   canHandle(normalizedModelId: string): boolean;
-  /** Resolves a model id to the canonical id to send to this provider's API. */
-  resolveModel(normalizedModelId: string, rawModelId: string): string;
+  /** Resolves a normalized model id to the canonical id to send upstream. */
+  resolveModel(normalizedModelId: string): string;
   /** Select the next API key (for key rotation). */
   selectKey(): KeyInfo;
   /** Mark a key as failed (for rotation). */
@@ -284,6 +282,11 @@ export interface ProviderConfig {
   network?: NetworkConfig;
   /** Per-provider compat flag overrides. */
   compat?: Partial<ProviderCompatFlags>;
+  /**
+   * When true, the provider is included in routing even if apiKey is empty
+   * (e.g. Kilo's anonymous access for free models at 200 req/hr/IP).
+   */
+  keyless?: boolean;
 }
 
 /** Compat flag overrides a user can set per provider in config. */
@@ -296,8 +299,15 @@ export interface ProviderCompatFlags {
   maxTokensField: "max_tokens" | "max_completion_tokens";
   streamIdleTimeoutMs: number;
   stripDeepseekSpecialTokens: boolean;
-  streamMarkupHealingPattern: "kimi" | "dsml" | "thinking" | undefined;
   supportsImages: boolean;
+  /**
+   * Leaked chat-template markup healing pattern. When set, the streaming loop
+   * routes `delta.content` through a `StreamMarkupHealing` filter that strips
+   * leaked markup (Kimi tokens, DeepSeek DSML, generic thinking tags) and
+   * reconstructs tool calls / reasoning from them. `undefined` disables
+   * healing.
+   */
+  streamMarkupHealingPattern?: "kimi" | "dsml" | "qwen" | "thinking";
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +331,13 @@ export interface ShimConfig {
   routingStrategy: RoutingStrategy;
   /** Session affinity / sticky routing config. */
   sessionAffinity: SessionAffinityConfig;
+  /**
+   * Model id to route to when a request contains images but the resolved
+   * model doesn't support vision. If unset (empty string), images are
+   * stripped and the request goes to the original model. Set via
+   * VISION_FALLBACK_MODEL env.
+   */
+  visionFallbackModel?: string;
   providers: {
     priority: string[];
     configs: Record<string, ProviderConfig>;

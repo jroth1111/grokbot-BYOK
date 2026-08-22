@@ -2,5 +2,9 @@ node_modules/
 dist/
 *.log
 .env
+.env.local
+.env.*.local
 config/config.json
 inference-proxy.url
+*.pid
+windsurfapi.log

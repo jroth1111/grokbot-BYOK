@@ -55,7 +55,7 @@ function newProviderStats(): ProviderStats {
   };
 }
 
-export class MetricsCollector {
+class MetricsCollector {
   private stats = new Map<string, ProviderStats>();
 
   /** Record a completed request. */

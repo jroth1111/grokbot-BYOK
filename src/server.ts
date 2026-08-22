@@ -14,6 +14,8 @@
  * caller.
  */
 import * as http from "node:http";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import type {
   ConnectEnvelope,
   InferenceStreamRequest,
@@ -50,9 +52,11 @@ import {
 } from "./translate/response.js";
 import { ToolCallAccumulator } from "./translate/tools.js";
 import { applyCompatToRequest } from "./providers/compat.js";
+import { detectSupportsImages } from "./providers/compat.js";
+import type { ProviderCompat } from "./providers/compat.js";
 import { rescueInlineToolCalls, containsDialectMarker, startsWithDialectMarker, couldBecomeDialectMarker } from "./translate/tool-call-rescue.js";
 import { ThinkTagStreamFilter } from "./translate/think-tags.js";
-import { stripSchemaKeys } from "./translate/tool-args.js";
+import { StreamMarkupHealing, detectHealingPatternFromText } from "./translate/markup-healing.js";
 import { isToolArgumentValidationEnabled, invalidToolCallReasons } from "./translate/tool-validate.js";
 import { sanitizeProviderErrorMessage } from "./observability/error-redaction.js";
 import {
@@ -100,6 +104,77 @@ function maskKey(key: string): string {
 }
 
 /**
+ * Check if any message in the OpenAI request body contains image or video
+ * parts (both are sent as `image_url` type in the OpenAI-compatible API).
+ */
+function requestHasImages(openaiBody: OpenAIChatRequest): boolean {
+  for (const msg of openaiBody.messages) {
+    if (Array.isArray(msg.content)) {
+      for (const part of msg.content) {
+        if (part.type === "image_url") return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Check if a specific model on a specific provider supports images.
+ * Uses the compat detection logic with the actual model id, not the
+ * provider's default model.
+ */
+function detectSupportsImagesForModel(
+  provider: { name: string; baseUrl: string; compat: ProviderCompat },
+  modelId: string,
+): boolean {
+  return detectSupportsImages(provider.name, provider.baseUrl, modelId);
+}
+
+/**
+ * Fetch an OpenAI chat completion stream from a provider.
+ *
+ * Builds the auth header from the key, sets the request timeout via an
+ * AbortController, and returns the Response. Throws on network error or
+ * timeout (AbortError). The caller is responsible for checking `resp.ok`
+ * and reading the body.
+ */
+async function fetchCompletion(
+  baseUrl: string,
+  body: OpenAIChatRequest,
+  key: KeyInfo,
+  timeoutMs: number,
+): Promise<Response> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: "text/event-stream",
+  };
+  if (key.value) {
+    headers["Authorization"] = `Bearer ${key.value}`;
+  }
+  // OpenRouter attribution headers (optional, for app rankings).
+  // Only sent when the provider host is openrouter.ai.
+  if (baseUrl.includes("openrouter.ai")) {
+    headers["X-Title"] = "grokbot-BYOK-v2";
+    headers["HTTP-Referer"] = "https://github.com/jroth1111/grokbot-byok";
+  }
+  const controller = new AbortController();
+  const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutHandle);
+    return resp;
+  } catch (err) {
+    clearTimeout(timeoutHandle);
+    throw err;
+  }
+}
+
+/**
  * Write a single Connect data frame (JSON-encoded InferenceStreamResponse) to
  * the outbound response stream.
  */
@@ -115,10 +190,15 @@ function endStream(res: http.ServerResponse): void {
 }
 
 /** Begin a Connect streaming response with the given HTTP status. */
-function startConnectResponse(res: http.ServerResponse, status: number): void {
+function startConnectResponse(
+  res: http.ServerResponse,
+  status: number,
+  extraHeaders: Record<string, string> = {},
+): void {
   res.writeHead(status, {
     "Content-Type": CONTENT_TYPE,
     "Cache-Control": "no-cache",
+    ...extraHeaders,
   });
 }
 
@@ -256,12 +336,42 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
     // Capture the request body for debugging (opt-in via CAPTURE_BODIES=true).
     captureRequestBody(logger, requestId, openaiBody);
 
+    // Dump tool schemas to disk when logDir is set — useful for debugging
+    // schema mapping issues before translation.
+    if (config.logDir && (openaiBody.tools ?? []).length > 0) {
+      fs.writeFile(
+        path.join(config.logDir, `shim-tools-${Date.now()}.json`),
+        JSON.stringify(openaiBody.tools, null, 2),
+      ).catch(() => {
+        // best-effort — don't fail the request if the dump fails
+      });
+    }
+
     // ---------------------------------------------------------------------
     // 5-6. Resolve provider (honoring session affinity) and build the
     //      failover chain.
     // ---------------------------------------------------------------------
-    const { provider: resolvedPrimary, normalizedId } =
+    let { provider: resolvedPrimary, normalizedId } =
       registry.resolveProvider(rawModelId);
+
+    // Vision fallback: if the request contains images and the resolved
+    // model doesn't support vision, re-route to VISION_FALLBACK_MODEL
+    // (if configured) instead of stripping the images.
+    if (config.visionFallbackModel && requestHasImages(openaiBody)) {
+      const resolvedModel = resolvedPrimary.resolveModel(normalizedId);
+      if (!detectSupportsImagesForModel(resolvedPrimary, resolvedModel)) {
+        logger.info("vision fallback: re-routing to vision model", {
+          originalModel: rawModelId,
+          originalProvider: resolvedPrimary.name,
+          visionFallbackModel: config.visionFallbackModel,
+        });
+        const visionResolved = registry.resolveProvider(config.visionFallbackModel);
+        rawModelId = config.visionFallbackModel;
+        normalizedId = visionResolved.normalizedId;
+        resolvedPrimary = visionResolved.provider;
+      }
+    }
+
     let primary = resolvedPrimary;
 
     if (sessionAffinity.isEnabled() && sessionId) {
@@ -365,12 +475,13 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       outcome: AttemptOutcome,
       startMs: number,
       err?: unknown,
+      keyOrdinal: number = 0,
     ): void {
       trace.records.push({
         ordinal: attemptOrdinal++,
         platform: providerName,
         modelId,
-        keyOrdinal: 0,
+        keyOrdinal,
         outcome,
         startOffsetMs: startMs - requestStartTime,
         durationMs: Date.now() - startMs,
@@ -385,9 +496,10 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
           key: KeyInfo;
           network: NetworkConfig;
           baseUrl: string;
+          compat: ProviderCompat;
         }
       | undefined;
-    let requestError = false;
+    let requestErrorMessage: string | null = null;
 
     providerLoop: for (const provider of failoverChain) {
       if (!breaker.shouldTry(provider.name)) {
@@ -410,13 +522,15 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       openaiBody = JSON.parse(JSON.stringify(openaiBodySnapshot)) as typeof openaiBody;
 
       // Re-resolve the model for this specific provider.
-      const model = provider.resolveModel(normalizedId, rawModelId);
+      const model = provider.resolveModel(normalizedId);
       openaiBody.model = model;
 
       // Apply provider-specific compat flags to the request body (e.g.
       // coalescing multiple system messages, setting the right max_tokens
       // field name, adding "." for empty assistant tool-call content).
-      applyCompatToRequest(openaiBody, provider.compat);
+      // Pass the actual model id so vision support is checked per-model,
+      // not just per-provider-default-model.
+      applyCompatToRequest(openaiBody, provider.compat, model, provider.name, provider.baseUrl);
 
       const maxRetries = provider.network.maxRetries ?? 0;
       const backoffInitialMs =
@@ -429,30 +543,11 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       let authRotations = 0;
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
         const key = provider.selectKey();
-
-        const headers: Record<string, string> = {
-          "Content-Type": "application/json",
-          Accept: "text/event-stream",
-        };
-        if (key.value) {
-          headers["Authorization"] = `Bearer ${key.value}`;
-        }
-
-        const controller = new AbortController();
-        const timeoutHandle = setTimeout(
-          () => controller.abort(),
-          requestTimeoutMs,
-        );
+        const keyOrdinal = provider.keys.indexOf(key);
 
         const attemptStart = Date.now();
         try {
-          const resp = await fetch(`${provider.baseUrl}/chat/completions`, {
-            method: "POST",
-            headers,
-            body: JSON.stringify(openaiBody),
-            signal: controller.signal,
-          });
-          clearTimeout(timeoutHandle);
+          const resp = await fetchCompletion(provider.baseUrl, openaiBody, key, requestTimeoutMs);
 
           if (resp.ok && resp.body) {
             breaker.recordSuccess(provider.name);
@@ -474,8 +569,9 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
               key,
               network: provider.network,
               baseUrl: provider.baseUrl,
+              compat: provider.compat,
             };
-            recordAttempt(provider.name, model, "ok", attemptStart);
+            recordAttempt(provider.name, model, "ok", attemptStart, undefined, keyOrdinal);
             resetBreaker(consecBreaker);
             break providerLoop;
           }
@@ -515,7 +611,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
                 provider: provider.name,
                 keyCount: provider.keys.length,
               });
-              recordAttempt(provider.name, model, "auth", attemptStart, "all keys exhausted with auth errors");
+              recordAttempt(provider.name, model, "auth", attemptStart, "all keys exhausted with auth errors", keyOrdinal);
               metrics.recordRequest(provider.name, false, Date.now() - attemptStart);
               break;
             }
@@ -534,9 +630,9 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
               elapsed: Date.now() - attemptStart,
               error: errText.slice(0, 500),
             });
-            recordAttempt(provider.name, model, "provider_bad_request", attemptStart, errText);
+            recordAttempt(provider.name, model, "provider_bad_request", attemptStart, errText, keyOrdinal);
             metrics.recordRequest(provider.name, false, Date.now() - attemptStart);
-            requestError = true;
+            requestErrorMessage = "request rejected by provider";
             break providerLoop;
           }
 
@@ -567,7 +663,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
             await sleep(backoff);
             continue;
           } else if (decision === "failover") {
-            recordAttempt(provider.name, model, errorType === "rate-limit" ? "rate_limited" : "upstream_error", attemptStart, errText);
+            recordAttempt(provider.name, model, errorType === "rate-limit" ? "rate_limited" : "upstream_error", attemptStart, errText, keyOrdinal);
             metrics.recordRequest(provider.name, false, Date.now() - attemptStart);
             if (recordBreakerFailure(consecBreaker)) {
               logger.warn("consecutive failure breaker tripped", {
@@ -575,19 +671,18 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
                 consecutive: consecBreaker.consecutive,
                 limit: consecBreaker.limit,
               });
-              requestError = true;
+              requestErrorMessage = "too many consecutive failures";
               break providerLoop;
             }
             break;
           } else {
             // "stop" — should not occur for non-request errors, but handle it.
-            recordAttempt(provider.name, model, "upstream_error", attemptStart, errText);
+            recordAttempt(provider.name, model, "upstream_error", attemptStart, errText, keyOrdinal);
             metrics.recordRequest(provider.name, false, Date.now() - attemptStart);
-            requestError = true;
+            requestErrorMessage = "upstream error";
             break providerLoop;
           }
         } catch (err) {
-          clearTimeout(timeoutHandle);
           const isAbort = err instanceof Error && err.name === "AbortError";
           const errorType: ErrorType = "network-error";
           breaker.recordFailure(provider.name, errorType);
@@ -613,7 +708,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
             await sleep(backoff);
             continue;
           } else if (decision === "failover") {
-            recordAttempt(provider.name, model, isAbort ? "timeout" : "upstream_error", attemptStart, err);
+            recordAttempt(provider.name, model, isAbort ? "timeout" : "upstream_error", attemptStart, err, keyOrdinal);
             metrics.recordRequest(provider.name, false, Date.now() - attemptStart);
             if (recordBreakerFailure(consecBreaker)) {
               logger.warn("consecutive failure breaker tripped", {
@@ -621,14 +716,14 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
                 consecutive: consecBreaker.consecutive,
                 limit: consecBreaker.limit,
               });
-              requestError = true;
+              requestErrorMessage = "too many consecutive failures";
               break providerLoop;
             }
             break;
           } else {
-            recordAttempt(provider.name, model, isAbort ? "timeout" : "upstream_error", attemptStart, err);
+            recordAttempt(provider.name, model, isAbort ? "timeout" : "upstream_error", attemptStart, err, keyOrdinal);
             metrics.recordRequest(provider.name, false, Date.now() - attemptStart);
-            requestError = true;
+            requestErrorMessage = isAbort ? "request timeout" : "upstream error";
             break providerLoop;
           }
         }
@@ -636,9 +731,10 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
     }
 
     // ---------------------------------------------------------------------
-    // Request-level error: the request is malformed, emit an error and stop.
+    // Request-level error: the provider rejected the request or the
+    // consecutive-failure breaker tripped. Emit the specific error and stop.
     // ---------------------------------------------------------------------
-    if (requestError) {
+    if (requestErrorMessage) {
       // Log the attempt trail even on request errors — the consecutive
       // breaker may have tripped after multiple provider failures.
       if (trace.records.length > 0) {
@@ -654,12 +750,13 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
           })),
         });
       }
-      logger.error("request error, aborting", {
+      logger.error("request failed", {
         model: rawModelId,
+        message: requestErrorMessage,
         elapsed: Date.now() - requestStart,
       });
       startConnectResponse(res, 200);
-      writeFrame(res, makeErrorFrame("request error"));
+      writeFrame(res, makeErrorFrame(requestErrorMessage));
       endStream(res);
       return;
     }
@@ -699,7 +796,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
     //     retry. Frames are buffered per attempt; only a non-empty attempt
     //     (or the last attempt if all are empty) is flushed to the response.
     // ---------------------------------------------------------------------
-    const { resp: firstResp, providerName, model, key, network, baseUrl } =
+    const { resp: firstResp, providerName, model, key, network, baseUrl, compat } =
       connected;
     const requestTimeoutMs =
       network.requestTimeoutMs ?? config.requestTimeoutMs;
@@ -719,6 +816,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       totalTokens: number | undefined;
       reasoningTokens: number | undefined;
       cachedTokens: number | undefined;
+      cacheWriteTokens: number | undefined;
       toolCallCount: number;
     }
 
@@ -734,6 +832,23 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       toolAcc.setTools(openaiBody.tools);
       const thinkFilter = new ThinkTagStreamFilter();
       const decoder = new TextDecoder();
+
+      // Streaming markup healer for providers that leak chat-template
+      // tool-call markup (Kimi <|tool_call_begin|>, DeepSeek DSML envelopes,
+      // Qwen <tool_calls> XML) into visible `content`. When active it
+      // replaces both the think-tags filter and the dialect hold-window for
+      // content processing, because it handles thinking extraction AND
+      // tool-call reconstruction in one streaming pass. When undefined the
+      // existing thinkFilter + dialect hold-window path is used.
+      const healingPattern = compat.streamMarkupHealingPattern;
+      // Mutable: may be auto-created mid-stream when a dialect marker is
+      // detected in the content (automatic tool-call healing). When the
+      // compat flag pre-configures a pattern, the healer starts active;
+      // otherwise it starts undefined and is created on-the-fly if a
+      // marker appears.
+      let markupHealer = healingPattern
+        ? new StreamMarkupHealing({ pattern: healingPattern })
+        : undefined;
 
       // Streaming hold-window for inline tool-call dialect detection. When
       // the request declares tools, text deltas are buffered while they could
@@ -756,6 +871,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       let totalTokens: number | undefined;
       let reasoningTokens: number | undefined;
       let cachedTokens: number | undefined;
+      let cacheWriteTokens: number | undefined;
       // Set to true once the stream has ended (normally or on error) so a
       // late-firing idle-timeout callback doesn't flip streamError after the
       // finally block has already committed the success path. The stream-timeout
@@ -817,6 +933,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
           totalTokens = extracted.totalTokens ?? totalTokens;
           reasoningTokens = extracted.reasoningTokens ?? reasoningTokens;
           cachedTokens = extracted.cachedTokens ?? cachedTokens;
+          cacheWriteTokens = extracted.cacheWriteTokens ?? cacheWriteTokens;
         }
 
         // Some providers (e.g. opencode-go) send a trailing cost-annotation
@@ -853,31 +970,86 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
               }
             }
             if (delta.content) {
-              // DeepSeek-style models serialize reasoning INTO content as
-              // ​​ blocks. Split them back out into reasoning
-              // vs content via the stateful stream filter (handles tag splits
-              // across chunk boundaries without buffering the whole stream).
-              const split = thinkFilter.push(delta.content);
-              if (split.reasoning) {
-                frames.push(makeTextFrame(split.reasoning, false));
-              }
-              // Feed the content split through the dialect hold-window: if
-              // the request has tools, buffer text while it could still be
-              // an inline tool-call dialect marker. Once it diverges, flush.
-              const textToEmit = split.content;
-              if (textToEmit.length > 0) {
-                if (ttfbMs === undefined) ttfbMs = Date.now() - requestStart;
-                if (dialectMode === "passthrough") {
-                  frames.push(makeTextFrame(textToEmit, false));
-                } else {
-                  heldText += textToEmit;
-                  const probe = heldText.trimStart();
-                  if (startsWithDialectMarker(probe)) {
-                    dialectMode = "dialect";
-                  } else if (!couldBecomeDialectMarker(probe) || heldText.length > 256) {
-                    dialectMode = "passthrough";
-                    frames.push(makeTextFrame(heldText, false));
-                    heldText = "";
+              if (ttfbMs === undefined) ttfbMs = Date.now() - requestStart;
+              if (markupHealer) {
+                // Provider leaks chat-template markup into content — route
+                // through the streaming markup healer, which strips tool-call
+                // dialect (Kimi/DeepSeek/Qwen) and thinking tags in one pass,
+                // reconstructing structured tool calls from the markup.
+                const events = delta.tool_calls && delta.tool_calls.length > 0
+                  ? markupHealer.feedEventsWithoutCalls(delta.content)
+                  : markupHealer.feedEvents(delta.content);
+                for (const event of events) {
+                  if (event.type === "text") {
+                    if (event.text.length > 0) {
+                      frames.push(makeTextFrame(event.text, false));
+                    }
+                  } else if (event.type === "thinking") {
+                    if (event.thinking.length > 0) {
+                      frames.push(makeTextFrame(event.thinking, false));
+                    }
+                  } else if (event.type === "toolCall") {
+                    frames.push(
+                      makeToolCallFrame(event.call.id, event.call.name, event.call.arguments, false),
+                    );
+                  }
+                }
+              } else {
+                // DeepSeek-style models serialize reasoning INTO content as
+                // ​​ blocks. Split them back out into reasoning
+                // vs content via the stateful stream filter (handles tag splits
+                // across chunk boundaries without buffering the whole stream).
+                const split = thinkFilter.push(delta.content);
+                if (split.reasoning) {
+                  frames.push(makeTextFrame(split.reasoning, false));
+                }
+                // Feed the content split through the dialect hold-window: if
+                // the request has tools, buffer text while it could still be
+                // an inline tool-call dialect marker. Once it diverges, flush.
+                const textToEmit = split.content;
+                if (textToEmit.length > 0) {
+                  if (dialectMode === "passthrough") {
+                    frames.push(makeTextFrame(textToEmit, false));
+                  } else {
+                    heldText += textToEmit;
+                    const probe = heldText.trimStart();
+                    if (startsWithDialectMarker(probe)) {
+                      // Automatic tool-call healing: the held text starts with
+                      // a known dialect marker. If it matches a pattern the
+                      // StreamMarkupHealing supports (Kimi/DeepSeek/Qwen),
+                      // create a healer on-the-fly and feed the held text
+                      // through it. This gives streaming tool-call
+                      // reconstruction for ANY provider, not just pre-
+                      // configured ones. Llama <function=> tags (no matching
+                      // pattern) fall through to the post-hoc rescue path.
+                      const autoPattern = detectHealingPatternFromText(heldText);
+                      if (autoPattern) {
+                        markupHealer = new StreamMarkupHealing({ pattern: autoPattern });
+                        const hasStructuredToolCalls = delta.tool_calls && delta.tool_calls.length > 0;
+                        const events = hasStructuredToolCalls
+                          ? markupHealer.feedEventsWithoutCalls(heldText)
+                          : markupHealer.feedEvents(heldText);
+                        for (const event of events) {
+                          if (event.type === "text" && event.text.length > 0) {
+                            frames.push(makeTextFrame(event.text, false));
+                          } else if (event.type === "thinking" && event.thinking.length > 0) {
+                            frames.push(makeTextFrame(event.thinking, false));
+                          } else if (event.type === "toolCall") {
+                            frames.push(
+                              makeToolCallFrame(event.call.id, event.call.name, event.call.arguments, false),
+                            );
+                          }
+                        }
+                        heldText = "";
+                        dialectMode = "passthrough";
+                      } else {
+                        dialectMode = "dialect";
+                      }
+                    } else if (!couldBecomeDialectMarker(probe) || heldText.length > 256) {
+                      dialectMode = "passthrough";
+                      frames.push(makeTextFrame(heldText, false));
+                      heldText = "";
+                    }
                   }
                 }
               }
@@ -916,26 +1088,8 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
 
       let resp = existingResp;
       if (!resp) {
-        const headers: Record<string, string> = {
-          "Content-Type": "application/json",
-          Accept: "text/event-stream",
-        };
-        if (key.value) {
-          headers["Authorization"] = `Bearer ${key.value}`;
-        }
-        const controller = new AbortController();
-        const timeoutHandle = setTimeout(
-          () => controller.abort(),
-          requestTimeoutMs,
-        );
         try {
-          resp = await fetch(`${baseUrl}/chat/completions`, {
-            method: "POST",
-            headers,
-            body: JSON.stringify(openaiBody),
-            signal: controller.signal,
-          });
-          clearTimeout(timeoutHandle);
+          resp = await fetchCompletion(baseUrl, openaiBody, key, requestTimeoutMs);
           if (!resp.ok || !resp.body) {
             logger.warn("empty-completion retry fetch failed", {
               model,
@@ -955,11 +1109,11 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
               totalTokens,
               reasoningTokens,
               cachedTokens,
+              cacheWriteTokens,
               toolCallCount: toolAcc.size,
             };
           }
         } catch (err) {
-          clearTimeout(timeoutHandle);
           logger.warn("empty-completion retry fetch error", {
             model,
             provider: providerName,
@@ -978,6 +1132,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
             totalTokens,
             reasoningTokens,
             cachedTokens,
+            cacheWriteTokens,
             toolCallCount: toolAcc.size,
           };
         }
@@ -1054,65 +1209,93 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         // call cancel() on an already-closed reader.
         abortUpstream = null;
 
-        // Flush any remaining think-tags filter state (an unclosed  tag
-        // at stream end flushes the held bytes as reasoning).
-        const thinkTail = thinkFilter.flush();
-        if (thinkTail.reasoning) {
-          frames.push(makeTextFrame(thinkTail.reasoning, false));
-        }
-        // Route think-tags flush content through the dialect hold-window,
-        // not directly to frames — the held-back content could contain a
-        // dialect marker that should be rescued as tool calls.
-        if (thinkTail.content) {
-          if (dialectMode === "passthrough") {
-            frames.push(makeTextFrame(thinkTail.content, false));
-          } else {
-            heldText += thinkTail.content;
+        // Flush stream-end state from the content processing filters.
+        if (markupHealer) {
+          // Markup healer flush: emit any remaining text/thinking/tool-call
+          // events from held-back partial tag buffers.
+          const healEvents = markupHealer.flushEvents();
+          for (const event of healEvents) {
+            if (event.type === "text" && event.text.length > 0) {
+              frames.push(makeTextFrame(event.text, false));
+            } else if (event.type === "thinking" && event.thinking.length > 0) {
+              frames.push(makeTextFrame(event.thinking, false));
+            } else if (event.type === "toolCall") {
+              frames.push(
+                makeToolCallFrame(event.call.id, event.call.name, event.call.arguments, false),
+              );
+            }
           }
-        }
-
-        // Flush the dialect hold-window. If we buffered text that turned out
-        // to be an inline tool-call dialect (Kimi/DeepSeek tokens, Llama
-        // <function=>, Qwen XML), rescue it into structured tool calls.
-        // Detected-but-unparseable = dead turn (the model emitted gibberish).
-        if (heldText.length > 0) {
-          // Check for dialect markers in the held text. This covers both the
-          // case where dialectMode was set to "dialect" during streaming (the
-          // text starts with a known marker) and the case where dialectMode
-          // is still "hold" (stream ended before the hold-window could decide).
-          if (containsDialectMarker(heldText)) {
-            const toolNames = new Set(
-              (openaiBody.tools ?? []).map((t) => t.function.name),
+          // Drain any tool calls accumulated via the feed() compatibility path.
+          const healedCalls = markupHealer.drainCompleted();
+          for (const call of healedCalls) {
+            frames.push(
+              makeToolCallFrame(call.id, call.name, call.arguments, false),
             );
-            const rescue = rescueInlineToolCalls(heldText, toolNames);
-            if (rescue.detected && !rescue.calls) {
-              logger.warn("unparseable inline tool-call dialect", {
-                model,
-                provider: providerName,
-              });
-              streamError = true;
-            } else if (rescue.detected && rescue.calls && rescue.calls.length > 0) {
-              if (rescue.cleanText.length > 0) {
-                frames.push(makeTextFrame(rescue.cleanText, false));
+          }
+          if (healEvents.length > 0 || healedCalls.length > 0) {
+            hasVisibleContent = true;
+          }
+        } else {
+          // Flush any remaining think-tags filter state (an unclosed  tag
+          // at stream end flushes the held bytes as reasoning).
+          const thinkTail = thinkFilter.flush();
+          if (thinkTail.reasoning) {
+            frames.push(makeTextFrame(thinkTail.reasoning, false));
+          }
+          // Route think-tags flush content through the dialect hold-window,
+          // not directly to frames — the held-back content could contain a
+          // dialect marker that should be rescued as tool calls.
+          if (thinkTail.content) {
+            if (dialectMode === "passthrough") {
+              frames.push(makeTextFrame(thinkTail.content, false));
+            } else {
+              heldText += thinkTail.content;
+            }
+          }
+
+          // Flush the dialect hold-window. If we buffered text that turned out
+          // to be an inline tool-call dialect (Kimi/DeepSeek tokens, Llama
+          // <function=>, Qwen XML), rescue it into structured tool calls.
+          // Detected-but-unparseable = dead turn (the model emitted gibberish).
+          if (heldText.length > 0) {
+            // Check for dialect markers in the held text. This covers both the
+            // case where dialectMode was set to "dialect" during streaming (the
+            // text starts with a known marker) and the case where dialectMode
+            // is still "hold" (stream ended before the hold-window could decide).
+            if (containsDialectMarker(heldText)) {
+              const toolNames = new Set(
+                (openaiBody.tools ?? []).map((t) => t.function.name),
+              );
+              const rescue = rescueInlineToolCalls(heldText, toolNames);
+              if (rescue.detected && !rescue.calls) {
+                logger.warn("unparseable inline tool-call dialect", {
+                  model,
+                  provider: providerName,
+                });
+                streamError = true;
+              } else if (rescue.detected && rescue.calls && rescue.calls.length > 0) {
+                if (rescue.cleanText.length > 0) {
+                  frames.push(makeTextFrame(rescue.cleanText, false));
+                }
+                for (const call of rescue.calls) {
+                  frames.push(
+                    makeToolCallFrame("", call.name, call.arguments, true),
+                  );
+                }
+                hasVisibleContent = true;
+                logger.info("rescued inline tool calls", {
+                  model,
+                  provider: providerName,
+                  count: rescue.calls.length,
+                });
+              } else {
+                frames.push(makeTextFrame(heldText, false));
               }
-              for (const call of rescue.calls) {
-                frames.push(
-                  makeToolCallFrame("", call.name, call.arguments, true),
-                );
-              }
-              hasVisibleContent = true;
-              logger.info("rescued inline tool calls", {
-                model,
-                provider: providerName,
-                count: rescue.calls.length,
-              });
             } else {
               frames.push(makeTextFrame(heldText, false));
             }
-          } else {
-            frames.push(makeTextFrame(heldText, false));
+            heldText = "";
           }
-          heldText = "";
         }
 
         // Flush accumulated tool calls. When the stream errored, emit them as
@@ -1149,9 +1332,10 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         }
 
         // Emit usage totals (including extended token details if the provider
-        // reported them: total tokens, reasoning tokens, cached tokens).
+        // reported them: total tokens, reasoning tokens, cached tokens,
+        // cache-write tokens).
         frames.push(
-          makeUsageFrame(promptTokens, completionTokens, totalTokens, reasoningTokens, cachedTokens),
+          makeUsageFrame(promptTokens, completionTokens, totalTokens, reasoningTokens, cachedTokens, cacheWriteTokens),
         );
 
         // Final frame: a terminal textPart on success, or an error on failure.
@@ -1171,6 +1355,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
           totalTokens,
           reasoningTokens,
           cachedTokens,
+          cacheWriteTokens,
           toolCalls: toolAcc.size,
           streamError,
           ttfbMs,
@@ -1197,6 +1382,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         totalTokens,
         reasoningTokens,
         cachedTokens,
+        cacheWriteTokens,
         toolCallCount: toolAcc.size,
       };
     };
@@ -1233,7 +1419,15 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       }
     }
 
-    startConnectResponse(res, 200);
+    // Surface failover to the caller: if the provider that served the request
+    // differs from the primary (the one the routing strategy selected), add an
+    // x-failover header so clients that care can detect they got a fallback.
+    const failoverHeaders: Record<string, string> = {};
+    if (providerName !== primary.name) {
+      failoverHeaders["x-failover"] = `${primary.name}->${providerName}`;
+    }
+
+    startConnectResponse(res, 200, failoverHeaders);
     if (lastResult) {
       for (const frame of lastResult.frames) {
         writeFrame(res, frame);

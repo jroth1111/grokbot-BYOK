@@ -31,8 +31,6 @@ const ajv = new (Ajv2020 as unknown as typeof import('ajv').default)({
   validateFormats: false,
 });
 
-export const TOOL_ARGUMENT_VALIDATION_SETTING = 'validate_tool_arguments';
-
 export function isToolArgumentValidationEnabled(): boolean {
   const raw = process.env.VALIDATE_TOOL_ARGUMENTS;
   if (raw === undefined || raw.trim() === '') return false;
@@ -128,23 +126,6 @@ export function validateToolArguments(
     .map(e => `${e.instancePath || '/'} ${e.message ?? 'is invalid'}`)
     .join('; ');
   return { ok: false, reason: `${toolName}: ${detail || 'does not match its schema'}` };
-}
-
-/**
- * The error thrown when a tool call cannot be served. The message carries the
- * marker `invalid tool arguments`, which `isRetryableError` recognises, so the
- * loop fails over exactly as it does for a dead dialect turn.
- *
- * `skipBench` because the PROVIDER is healthy — the model misbehaved, so no
- * cooldown or score penalty. `skipModelForRequest` because a sibling key would
- * misbehave identically, so the whole model is ruled out for this request.
- */
-export function invalidToolArgumentsError(displayName: string, reasons: string[]): Error {
-  const detail = reasons.slice(0, 3).join('; ');
-  return Object.assign(
-    new Error(`invalid tool arguments from ${displayName} (${detail})`),
-    { skipBench: true, skipModelForRequest: true },
-  );
 }
 
 /**

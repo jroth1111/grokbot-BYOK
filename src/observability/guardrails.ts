@@ -26,7 +26,6 @@
 // the env var, then the default (0 = disabled).
 
 export const REQUEST_MAX_TOKENS_BUDGET_SETTING = 'request_max_tokens_budget';
-export const MAX_CONSECUTIVE_UPSTREAM_FAILS_SETTING = 'max_consecutive_upstream_fails';
 
 function readGuardrailValue(envKey: string): number {
   const raw = process.env[envKey];

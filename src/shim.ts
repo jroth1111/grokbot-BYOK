@@ -18,7 +18,6 @@ import { createLogger } from "./log.js";
 import { createServer } from "./server.js";
 import type { ShimConfig } from "./types.js";
 import { writeFileSync, readFileSync, unlinkSync, existsSync } from "node:fs";
-import { sleep } from "./providers/retry.js";
 import { installProcessSafetyNet } from "./observability/process-safety-net.js";
 import { installLogRedaction } from "./observability/log-redaction.js";
 
@@ -62,24 +61,6 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-/** Kill a process: SIGTERM, wait up to 5s, then SIGKILL if still alive. */
-async function killProcess(pid: number): Promise<void> {
-  try {
-    process.kill(pid, "SIGTERM");
-  } catch {
-    return; // already dead
-  }
-  for (let i = 0; i < 50; i++) {
-    if (!isProcessAlive(pid)) return;
-    await sleep(100);
-  }
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch {
-    // already dead
-  }
-}
-
 /** Read a PID from a file, or undefined if the file is missing/unreadable. */
 function readPidFile(file: string): number | undefined {
   if (!existsSync(file)) return undefined;
@@ -107,16 +88,24 @@ function releaseLock(): void {
   }
 }
 
-// Kill any existing shim on this port before we try to bind.
+// Check for an existing shim on this port. If one is running, refuse to
+// start rather than silently killing it — the user might have an active
+// session on the first instance and a silent kill would be destructive.
 const existingPid = readPidFile(pidFile) ?? readPidFile(legacyPidFile);
 if (existingPid !== undefined && isProcessAlive(existingPid)) {
-  logger.info("stopping existing shim instance", {
+  logger.error("another shim instance is already running", {
     pid: existingPid,
     port: config.port,
+    pidFile,
+    hint: "Stop the existing instance first (kill the process or remove the PID file), " +
+          "or use a different SHIM_PORT",
   });
-  await killProcess(existingPid);
-  // Brief pause for the OS to release the listening socket.
-  await sleep(500);
+  console.error(
+    `\n  Error: shim already running on port ${config.port} (pid ${existingPid}).\n` +
+    `  To start a second instance, set SHIM_PORT to a different value.\n` +
+    `  To replace the existing instance, kill it first: kill ${existingPid}\n`,
+  );
+  process.exit(1);
 }
 
 // Acquire the lock by writing our PID.

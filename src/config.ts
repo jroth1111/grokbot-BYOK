@@ -8,11 +8,17 @@
  * If the config file cannot be found, a built-in `DEFAULT_CONFIG` is returned
  * instead so the shim can boot with sane defaults (opencode-go as the primary
  * provider).
+ *
+ * Before loading the config file, a `.env` file is sourced from the project
+ * root (if present) so the shim works standalone — not just via the
+ * `start-shim` launcher. Already-set env vars win (caller's env takes
+ * precedence over `.env`).
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ShimConfig } from "./types.js";
 import { parseConfig, DEFAULT_CONFIG_PATH } from "./config/schema.js";
+import { sourceEnvFile } from "./utils/env.js";
 
 /** Built-in default configuration used when no config file is present. */
 export const DEFAULT_CONFIG: ShimConfig = {
@@ -23,25 +29,26 @@ export const DEFAULT_CONFIG: ShimConfig = {
   requestTimeoutMs: 30000,
   routingStrategy: "priority",
   sessionAffinity: { enabled: false },
+  visionFallbackModel: "",
   providers: {
     priority: ["opencode-go", "opencode-zen", "local"],
     configs: {
       "opencode-go": {
         baseUrl: "https://opencode.ai/zen/go/v1",
-        apiKey: "",
+        apiKey: "${OPENCODE_API_KEY}",
         defaultModel: "ox-alpha-free",
         models: {},
       },
       "opencode-zen": {
         baseUrl: "https://opencode.ai/zen/v1",
-        apiKey: "",
+        apiKey: "${OPENCODE_API_KEY}",
         defaultModel: "x-preview-f-free",
         models: {},
       },
       local: {
         baseUrl: "http://127.0.0.1:3003/v1",
-        apiKey: "",
-        defaultModel: "glm-5-2",
+        apiKey: "${LOCAL_API_KEY}",
+        defaultModel: "glm-5.2",
         models: {},
       },
     },
@@ -108,11 +115,15 @@ function interpolateDeep<T>(value: T): T {
  * returned. Otherwise the file is parsed as JSON, env references are
  * interpolated, and the result is validated via `parseConfig`.
  *
- * After loading, shim-level env vars (SHIM_PORT, SHIM_HOST, SHIM_LOG_DIR,
- * SHIM_FAILOVER) override the config file values for backward compatibility
- * with v1 scripts and deploy tooling.
+ * After loading, operational env vars (SHIM_PORT, SHIM_HOST, SHIM_LOG_DIR,
+ * SHIM_FAILOVER) override the config file. All other configuration —
+ * providers, models, routing — is config-file-only via `${VAR}` interpolation.
  */
 export function loadConfig(configPath?: string): ShimConfig {
+  // Source .env before resolving config — the config file uses ${VAR}
+  // interpolation for secrets, so env vars must be populated first.
+  sourceEnvFile();
+
   const resolved =
     nonEmpty(configPath) ??
     nonEmpty(process.env.SHIM_CONFIG) ??
@@ -141,9 +152,11 @@ export function loadConfig(configPath?: string): ShimConfig {
 }
 
 /**
- * Apply shim-level environment variable overrides on top of the loaded config.
- * This preserves backward compatibility with v1 scripts that set SHIM_PORT,
- * SHIM_HOST, etc. directly rather than editing the config file.
+ * Apply operational env-var overrides on top of the loaded config.
+ *
+ * Only truly operational settings (port, host, log dir, failover toggle)
+ * are overridable via env — everything else lives in the config file with
+ * `${VAR}` interpolation for secrets. This avoids two configuration sources.
  */
 
 /** String values (case-insensitive, trimmed) treated as boolean `false`. */
@@ -164,6 +177,9 @@ function applyEnvOverrides(config: ShimConfig): ShimConfig {
   if (process.env.SHIM_LOG_DIR !== undefined) overrides.logDir = process.env.SHIM_LOG_DIR;
   if (process.env.SHIM_FAILOVER !== undefined) {
     overrides.failover = !FALSY_ENV_VALUES.has(process.env.SHIM_FAILOVER.trim().toLowerCase());
+  }
+  if (process.env.VISION_FALLBACK_MODEL) {
+    overrides.visionFallbackModel = process.env.VISION_FALLBACK_MODEL;
   }
   return { ...config, ...overrides };
 }
