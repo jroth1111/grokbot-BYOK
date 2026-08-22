@@ -88,7 +88,7 @@ re-applies the patch automatically whenever Grokbot updates itself.
 ### Prerequisites
 
 - Node.js 18+
-- A Grokbot account (sign up at grokbot.com)
+- A Grokbot account
 - At least one LLM API key, or none at all. Kilo is keyless.
 
 ### Install
