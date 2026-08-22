@@ -47,10 +47,10 @@ the editor updates itself.
 
 ## What it does
 
-Your AI editor talks to its inference backend using Connect-RPC, a
+Grokbot talks to its inference backend using Connect-RPC, a
 gRPC-over-HTTP streaming protocol with binary-framed envelopes. The
 backends themselves are OpenAI-compatible chat completion endpoints, but
-the wire format is different. The editor sends Connect. Providers expect
+the wire format is different. Grokbot sends Connect. Providers expect
 OpenAI SSE.
 
 Grokbot sits between them:
