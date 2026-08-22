@@ -61,8 +61,8 @@ Grok Bot BYOK sits between them:
 
 ```mermaid
 graph LR
-    Grok Bot["Grok Bot<br/>(Connect-RPC, binary)"] -->|"POST /Stream"| BYOK
-    BYOK["Grok Bot BYOK<br/>(localhost:8788)"] -->|"OpenAI SSE (JSON)"| Provider1["OpenRouter"]
+    GrokBot["Grok Bot (Connect-RPC, binary)"] -->|"POST /Stream"| BYOK
+    BYOK["Grok Bot BYOK (localhost:8788)"] -->|"OpenAI SSE (JSON)"| Provider1["OpenRouter"]
     BYOK -->|"OpenAI SSE (JSON)"| Provider2["OpenCode Go"]
     BYOK -->|"OpenAI SSE (JSON)"| Provider3["Kilo"]
     BYOK -->|"OpenAI SSE (JSON)"| Provider4["Local"]
