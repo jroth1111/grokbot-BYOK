@@ -5,87 +5,102 @@ inference through a local shim that translates between Cursor's Connect-RPC
 protocol and OpenAI-compatible LLM providers.
 
 TypeScript rewrite of grokbot-BYOK with modular architecture, structured
-logging, circuit-breaker failover, and 82 unit/integration tests.
-
-## Architecture
-
-```
-src/
-  types.ts                    Shared types (Provider, ShimConfig, etc.)
-  config.ts                   Config loader (JSON file + env overrides)
-  log.ts                      Structured JSON logger
-  shim.ts                     Entry point
-  server.ts                   HTTP server with failover + timeouts
-  protocol/
-    connect.ts                Connect-RPC envelope codec
-    sse.ts                    SSE parser for OpenAI streaming
-    proto3.ts                 Proto3 JSON helpers (Struct, Value, enums)
-  translate/
-    request.ts                InferenceStreamRequest -> OpenAI ChatRequest
-    response.ts               OpenAI chunks -> InferenceStreamResponse frames
-    tools.ts                  Tool call accumulator with error recovery
-  providers/
-    base.ts                   BaseProvider + normalizeModelId
-    registry.ts               Provider registry with deterministic routing
-    failover.ts               Circuit breaker
-    opencode-go.ts            OpenCode Go adapter factory
-    opencode-zen.ts           OpenCode Zen adapter factory
-    local.ts                  Local backend adapter factory
-scripts/
-  deploy.ts                   Atomic deploy (build, stop, deploy, start, test)
-  health-check.ts             Watchdog (JSON log parsing, auto-deploy)
-  patch-host.ts               Host bundle patcher
-  watch-host.ts               Bundle watcher (auto re-patch on Cursor updates)
-test/
-  protocol.test.ts            38 tests: Connect, SSE, proto3
-  routing.test.ts             16 tests: registry, failover, circuit breaker
-  translate.test.ts           26 tests: request/response/tools translation
-  e2e.test.ts                  2 tests: full server round-trip
-config/
-  config.example.json         Example config with all providers
-```
-
-## Key improvements over v1
-
-1. **Modular architecture** — 15 focused files instead of one 737-line monolith.
-2. **Single routing rule** — providers checked in priority order, first match wins. No 5-level priority system with shared alias maps.
-3. **Circuit breaker** — providers that fail repeatedly are skipped for 30s, then probed. No blind retry of dead providers.
-4. **Request timeout** — AbortController kills hung upstream requests after 30s.
-5. **Graceful shutdown** — SIGTERM drains connections instead of killing mid-stream.
-6. **Structured logging** — JSON lines with fields, not regex-parseable text. Health check reads JSON, not grep.
-7. **Type safety** — TypeScript strict mode, 82 tests, no untyped object access.
-8. **Config validation** — zod schema validates config at startup. No cascading env var fallback chains.
-9. **Tool call recovery** — partial tool calls emitted with `isComplete=false` on stream errors.
-10. **Single source of truth** — `deploy.ts` symlinks the built shim, no copy drift.
+logging, circuit-breaker failover, vision fallback routing, and 342 tests.
 
 ## Quick start
 
 ```bash
-# Install dependencies
-npm install
+# 1. Clone
+git clone https://github.com/jroth1111/grokbot-BYOK.git
+cd grokbot-BYOK
 
-# Copy config and add your API keys
-cp config/config.example.json config/config.json
-# Edit config/config.json — set apiKey fields
-
-# Build
-npm run build:all
-
-# Run the shim
-node dist/shim.js
-
-# Or use the deploy script (builds, deploys, patches host, runs tests)
-node dist/scripts/deploy.js
+# 2. One-command setup (installs deps, creates config, builds, starts daemons)
+npm run setup
 ```
+
+That's it. The setup script:
+- Installs npm dependencies
+- Creates `config/config.json` and `.env` from examples
+- Prints a provider table showing where to put API keys
+- Builds the shim + scripts
+- Starts three background daemons (shim, host watcher, health watchdog)
+- Runs a smoke test
+
+After setup, add your API keys to `.env` and re-run `npm run setup` to restart.
+
+## Managing daemons
+
+```bash
+npm run setup          # Start/restart everything (builds, stops old, starts new)
+npm run setup -- --status   # Check daemon status
+npm run setup -- --stop     # Stop all daemons
+npm run setup -- --no-build # Restart without rebuilding
+npm run setup -- --no-watch # Start without host watcher
+npm start              # Start shim only (foreground)
+npm stop               # Stop all daemons
+npm status             # Check daemon status
+```
+
+### Daemon processes
+
+| Daemon | PID file | Log file | Purpose |
+|--------|----------|----------|---------|
+| Shim | `/tmp/inference-shim.pid` | `/tmp/inference-shim.log` | The inference proxy itself |
+| Host watcher | `/tmp/grokbot-watch-host.pid` | `/tmp/grokbot-watch-host.log` | Re-patches Cursor's host bundle when it updates |
+| Health watchdog | `/tmp/grokbot-health-check.pid` | `/tmp/grokbot-health-check.log` | Monitors shim health, auto-redeploys on failure |
+
+The host watcher is the key to robust re-attachment: when Cursor's supervisor
+updates or reinstalls `host-main.cjs`, the watcher detects the change,
+re-applies the routing-client patch, and restarts the host process. This
+happens automatically — no manual intervention needed after Cursor updates.
+
+## Providers
+
+The shim routes requests through providers in priority order with automatic
+failover. Providers with missing API keys are skipped automatically (except
+keyless ones).
+
+### Provider list
+
+| Provider | Env var | Required | Models | Description |
+|----------|---------|----------|--------|-------------|
+| `opencode-go` | `OPENCODE_API_KEY` | yes | ox-alpha-free, qwen3.8-max (vision) | Primary. Frontier reasoning, free tier |
+| `kilo` | `KILO_API_KEY` | no (keyless) | stealth/ox-alpha | Keyless: 200 req/hr/IP without a key |
+| `openrouter` | `OPENROUTER_API_KEY` | no | stealth/ox-alpha | OpenRouter gateway |
+| `opencode-zen` | `OPENCODE_API_KEY` | no | x-preview-f-free | Secondary OpenCode endpoint (shared key) |
+| `local` | `LOCAL_API_KEY` | no | glm-5.2, glm-5.1, swe-1-7 | WindsurfAPI on localhost |
+
+**Failover order:** `opencode-go` → `kilo` → `openrouter` → `opencode-zen` → `local`
+
+### Where to get API keys
+
+| Provider | URL | Notes |
+|----------|-----|-------|
+| OpenCode | https://opencode.ai | One key works for both `opencode-go` and `opencode-zen` |
+| Kilo | https://kilo.ai | Optional — anonymous access works without a key |
+| OpenRouter | https://openrouter.ai/keys | Get a key at the keys page |
+| WindsurfAPI | Local | `LOCAL_API_KEY` must match `API_KEY` in WindsurfAPI/.env |
+
+### Where to put API keys
+
+All keys go in **`.env`** in the project root. The shim sources `.env`
+automatically at startup. See `.env.example` for the full template.
+
+```bash
+# .env
+OPENCODE_API_KEY=sk-your-opencode-key
+KILO_API_KEY=your-kilo-key          # optional (keyless works without this)
+OPENROUTER_API_KEY=sk-or-v1-your-key
+LOCAL_API_KEY=sk-local-test         # must match WindsurfAPI's API_KEY
+```
+
+String values in `config/config.json` support `${ENV_VAR}` interpolation, so
+the config references keys by env var name — no secrets in the config file.
 
 ## Configuration
 
 Config is a single JSON file (`config/config.json`), validated by a zod schema
-at startup. String values support `${ENV_VAR}` interpolation for secrets.
-
-A `.env` file in the project root is sourced automatically at startup (before
-config loading), so the shim works standalone — no separate launcher needed.
-Already-set env vars take precedence over `.env`.
+at startup. Copy `config/config.example.json` to get started.
 
 ```json
 {
@@ -94,20 +109,8 @@ Already-set env vars take precedence over `.env`.
   "failover": true,
   "requestTimeoutMs": 30000,
   "providers": {
-    "priority": ["opencode-go", "opencode-zen", "local"],
-    "configs": {
-      "opencode-go": {
-        "baseUrl": "https://opencode.ai/zen/go/v1",
-        "apiKey": "${OPENCODE_API_KEY}",
-        "defaultModel": "ox-alpha-free",
-        "models": { "sand-default": "ox-alpha-free", "ox alpha": "ox-alpha-free" }
-      },
-      "local": {
-        "baseUrl": "http://127.0.0.1:3003/v1",
-        "apiKey": "${LOCAL_API_KEY}",
-        "defaultModel": "glm-5-2"
-      }
-    }
+    "priority": ["opencode-go", "kilo", "openrouter", "opencode-zen", "local"],
+    "configs": { ... }
   },
   "hostConfig": {
     "sandHostDir": "${SAND_HOST_DIR}",
@@ -116,21 +119,67 @@ Already-set env vars take precedence over `.env`.
 }
 ```
 
-### Credentials
+### Environment variables
 
-Two keys, defined in `.env` (see `.env.example`):
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPENCODE_API_KEY` | — | OpenCode Go + Zen API key |
+| `KILO_API_KEY` | — | Kilo gateway key (optional, keyless works without it) |
+| `OPENROUTER_API_KEY` | — | OpenRouter API key |
+| `LOCAL_API_KEY` | `sk-local-test` | Must match WindsurfAPI's `API_KEY` |
+| `WINDSURF_API_KEY` | — | Override Devin session token (auto-read from credentials.toml if unset) |
+| `DROUGHT_RESTRICT_PREMIUM` | `0` | Disable WindsurfAPI's stale premium gate |
+| `VISION_FALLBACK_MODEL` | `qwen3.8-max` | Re-route image requests to this vision-capable model |
+| `SHIM_PORT` | `8788` | Override listen port |
+| `SHIM_HOST` | `127.0.0.1` | Override listen host |
+| `SHIM_FAILOVER` | `true` | Set to `0` to disable provider failover |
+| `SHIM_LOG_DIR` | — | Directory for tool-schema dumps (empty = disabled) |
 
-| Env var | Used by | Description |
-|---|---|---|
-| `OPENCODE_API_KEY` | `opencode-go`, `opencode-zen` | Single key for both OpenCode endpoints |
-| `LOCAL_API_KEY` | `local` | Must match `API_KEY` in `WindsurfAPI/.env` |
+## Architecture
 
-No fallback chain. Missing key = clear auth error from the provider.
-
-### Operational overrides
-
-Env var overrides for operational settings: `SHIM_PORT`, `SHIM_HOST`,
-`SHIM_LOG_DIR`, `SHIM_FAILOVER`, `SHIM_CONFIG`.
+```
+src/
+  types.ts                    Shared types (Provider, ShimConfig, etc.)
+  config.ts                   Config loader (JSON file + env overrides)
+  config/schema.ts            Zod validation schema
+  log.ts                      Structured JSON logger
+  shim.ts                     Entry point (PID lock, startup, shutdown)
+  server.ts                   HTTP server with failover + vision fallback
+  protocol/
+    connect.ts                Connect-RPC envelope codec
+    sse.ts                    SSE parser for OpenAI streaming
+    proto3.ts                 Proto3 JSON helpers (Struct, Value, enums)
+  translate/
+    request.ts                InferenceStreamRequest -> OpenAI ChatRequest
+    response.ts               OpenAI chunks -> InferenceStreamResponse frames
+    tools.ts                  Tool call accumulator with error recovery
+    vision-guard.ts           Image detection and vision fallback routing
+  providers/
+    base.ts                   BaseProvider + normalizeModelId
+    registry.ts               Provider registry with deterministic routing
+    failover.ts               Circuit breaker
+    compat.ts                 Provider compatibility detection (vision, etc.)
+  observability/
+    log-redaction.ts          Console credential redaction
+    process-safety-net.ts     Unhandled error/rejection catcher
+    metrics.ts                Request counters
+    guardrails.ts             Runtime-tunable safety settings
+    error-classify.ts         Error classification for failover decisions
+scripts/
+  setup.ts                    One-command setup (build, start all daemons)
+  start-shim.ts               Shim launcher (WindsurfAPI auto-start + seeding)
+  deploy.ts                   Atomic deploy (build, stop, deploy, start, test)
+  health-check.ts             Watchdog (JSON log parsing, auto-deploy)
+  patch-host.ts               Host bundle patcher
+  watch-host.ts               Bundle watcher (auto re-patch on Cursor updates)
+  live-test.js                Live request test against the shim
+  image-test.js               Image/vision request test
+  windsurf-probe.js           WindsurfAPI connectivity probe
+config/
+  config.example.json         Example config with all providers
+test/
+  12 test files, 342 tests
+```
 
 ## Routing
 
@@ -138,8 +187,11 @@ Providers are checked in priority order. The first provider whose model map
 contains the normalized model id wins. If none match, the first provider in
 the priority list is used (default fallback).
 
-This is deterministic — no shared alias maps, no "default adapter's map first"
-ambiguity. Each provider owns its model catalog independently.
+### Vision fallback
+
+When a request contains images but the resolved model doesn't support vision,
+the shim re-routes to `VISION_FALLBACK_MODEL` (default: `qwen3.8-max`) instead
+of silently stripping the images.
 
 ## Failover
 
@@ -153,6 +205,8 @@ until one succeeds. A circuit breaker tracks failures per provider:
 
 ## Deploy
 
+For advanced deployment (host patching, symlink deploy):
+
 ```bash
 # Full deploy: typecheck, build, stop old, symlink, start, patch host, test
 node dist/scripts/deploy.js
@@ -164,40 +218,19 @@ node dist/scripts/deploy.js --copy
 node dist/scripts/deploy.js --no-restart
 ```
 
-## Health monitoring
-
-```bash
-# One-shot check
-node dist/scripts/health-check.js
-
-# Continuous (60s interval)
-node dist/scripts/health-check.js --watch
-
-# Auto-deploy on critical
-node dist/scripts/health-check.js --deploy
-```
-
 ## Tests
 
 ```bash
-# Run all tests
-npm test
-
-# Watch mode
-npm run test:watch
-
-# Type check only
-npm run typecheck
+npm test              # Run all 342 tests
+npm run test:watch    # Watch mode
+npm run typecheck     # Type check only
 ```
 
 ## Build
 
 ```bash
-# Build shim only
-npm run build
-
-# Build shim + scripts
-npm run build:all
+npm run build         # Build shim only
+npm run build:all     # Build shim + scripts
 ```
 
 The build uses esbuild to produce standalone bundled `.js` files with no
