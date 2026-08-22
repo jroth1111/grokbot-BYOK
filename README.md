@@ -88,7 +88,7 @@ re-applies the patch automatically whenever Grokbot updates itself.
 ### Prerequisites
 
 - Node.js 18+
-- Grokbot installed
+- A Grokbot account (sign up at grokbot.com)
 - At least one LLM API key, or none at all. Kilo is keyless.
 
 ### Install
@@ -105,7 +105,7 @@ npm run setup -- --openrouter-key sk-or-xxx --opencode-key sk-xxx
 npm run setup
 ```
 
-Grokbot's AI features now route through your providers.
+Grokbot's inference now routes through your providers.
 
 ### Verifying it works
 
@@ -218,8 +218,8 @@ the request, so failover between providers is transparent to Grokbot.
 > [!WARNING]
 > The setup script modifies Grokbot's `host-main.cjs` in place. A backup
 > is saved as `host-main.cjs.bak` so `npm run uninstall` can restore it. If
-> you manually delete the backup, you'll need to reinstall Grokbot to
-> restore the original file.
+> you manually delete the backup, you'll need to re-download Grokbot's
+> `host-main.cjs` to restore the original file.
 
 Grokbot's inference client lives in a bundled file called `host-main.cjs`
 (in the `sand-host` directory). Grokbot BYOK patches this file to:
@@ -731,10 +731,10 @@ Check the setup output for the specific error. Common causes:
 - **Port 8788 in use.** Another process is holding the port. Stop it or set
   `SHIM_PORT` to a different value in `.env`.
 - **Grokbot not found.** The setup script looks for `host-main.cjs` in
-  `$HOME/sand-host`. If your Grokbot installation uses a different location,
-  set `SAND_HOST_DIR` in `.env`.
+  `$HOME/sand-host`. If your Grokbot `host-main.cjs` is in a different
+  location, set `SAND_HOST_DIR` in `.env`.
 
-### Grokbot's AI features stopped working
+### Grokbot's inference stopped working
 
 ```bash
 npm status                                    # Are the daemons running?
