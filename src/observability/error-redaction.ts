@@ -32,20 +32,3 @@ export function sanitizeProviderErrorMessage(message: unknown): string {
 
   return sanitized;
 }
-
-// Cap for the per-hop `request_attempts.error_summary` column: one short line
-// per failover attempt, tighter than the parent row's error text.
-const MAX_ATTEMPT_ERROR_SUMMARY_LENGTH = 200;
-
-/**
- * The short per-attempt error summary the failover ladder stores per hop:
- * the same secret/URL redactions as sanitizeProviderErrorMessage, re-capped
- * at 200 chars so the drill-down stays one line per attempt.
- */
-export function summarizeAttemptError(message: unknown): string {
-  let summary = sanitizeProviderErrorMessage(message);
-  if (summary.length > MAX_ATTEMPT_ERROR_SUMMARY_LENGTH) {
-    summary = `${summary.slice(0, MAX_ATTEMPT_ERROR_SUMMARY_LENGTH - 3).trimEnd()}...`;
-  }
-  return summary;
-}

@@ -312,6 +312,16 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       openaiBody.max_tokens = budgetResult.maxTokens;
     }
 
+    // Snapshot the request body AFTER the token budget cap but BEFORE the
+    // provider loop. applyCompatToRequest mutates openaiBody in place
+    // (coalescing system messages, converting max_tokens ↔ max_completion_tokens,
+    // stripping images for non-vision providers). Without a snapshot, the
+    // mutations from one provider bleed into the next on failover — e.g.
+    // images stripped for a non-vision provider 1 are lost forever even if
+    // provider 2 supports vision. The snapshot is restored at the top of
+    // each provider iteration so every provider sees the same clean request.
+    const openaiBodySnapshot = JSON.parse(JSON.stringify(openaiBody)) as typeof openaiBody;
+
     // Per-request consecutive-failure breaker: bounds the total wasted
     // attempts across the whole chain (env: MAX_CONSECUTIVE_UPSTREAM_FAILS,
     // 0 = disabled). When the Nth consecutive fail happens, stop with 503
@@ -370,6 +380,13 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       // Reset per-request key-failure state so a 401 on a key in a
       // previous request doesn't permanently remove it from rotation.
       provider.resetKeyFailures();
+
+      // Restore the request body snapshot so compat mutations from the
+      // previous provider (image stripping, system message coalescing,
+      // max_tokens field conversion) don't bleed into this provider.
+      // Deep-clone the snapshot so the snapshot itself stays pristine for
+      // the next failover iteration.
+      openaiBody = JSON.parse(JSON.stringify(openaiBodySnapshot)) as typeof openaiBody;
 
       // Re-resolve the model for this specific provider.
       const model = provider.resolveModel(normalizedId, rawModelId);
@@ -477,6 +494,8 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
                 provider: provider.name,
                 keyCount: provider.keys.length,
               });
+              recordAttempt(provider.name, model, "auth", attemptStart, "all keys exhausted with auth errors");
+              metrics.recordRequest(provider.name, false, Date.now() - attemptStart);
               break;
             }
             // Don't consume a retry attempt for key rotation.
@@ -541,6 +560,8 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
             break;
           } else {
             // "stop" — should not occur for non-request errors, but handle it.
+            recordAttempt(provider.name, model, "upstream_error", attemptStart, errText);
+            metrics.recordRequest(provider.name, false, Date.now() - attemptStart);
             requestError = true;
             break providerLoop;
           }
@@ -584,6 +605,8 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
             }
             break;
           } else {
+            recordAttempt(provider.name, model, isAbort ? "timeout" : "upstream_error", attemptStart, err);
+            metrics.recordRequest(provider.name, false, Date.now() - attemptStart);
             requestError = true;
             break providerLoop;
           }
