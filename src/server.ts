@@ -180,6 +180,27 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
     const requestId = generateRequestId();
     const logger = createRequestScopedLogger(baseLogger, requestId);
 
+    // Track client disconnects so the upstream stream can be aborted early
+    // (instead of continuing to fetch and process chunks that will never be
+    // delivered). `res.on('close')` fires when the response connection is
+    // closed — including mid-stream client disconnects. The flag is checked
+    // in the SSE read loop and the abort function is called to cancel the
+    // upstream reader, freeing provider quota that would otherwise be wasted.
+    let clientDisconnected = false;
+    let abortUpstream: (() => void) | null = null;
+    res.on("close", () => {
+      if (!res.writableEnded) {
+        clientDisconnected = true;
+        if (abortUpstream) {
+          try { abortUpstream(); } catch { /* already closed */ }
+        }
+        logger.info("client disconnected", {
+          requestId,
+          elapsed: Date.now() - requestStart,
+        });
+      }
+    });
+
     // ---------------------------------------------------------------------
     // 1. Read the full request body.
     // ---------------------------------------------------------------------
@@ -791,10 +812,10 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         // lose those token counts.
         const extracted = extractUsage(chunk);
         if (extracted) {
-          promptTokens = extracted.promptTokens || promptTokens;
-          completionTokens = extracted.completionTokens || completionTokens;
-          totalTokens = extracted.totalTokens || totalTokens;
-          reasoningTokens = extracted.reasoningTokens || reasoningTokens;
+          promptTokens = extracted.promptTokens ?? promptTokens;
+          completionTokens = extracted.completionTokens ?? completionTokens;
+          totalTokens = extracted.totalTokens ?? totalTokens;
+          reasoningTokens = extracted.reasoningTokens ?? reasoningTokens;
           cachedTokens = extracted.cachedTokens ?? cachedTokens;
         }
 
@@ -968,9 +989,21 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         }
         const r = resp.body.getReader();
         reader = r;
+        // Wire up the client-disconnect abort: cancel the upstream reader
+        // so the provider stream is closed and provider quota is freed.
+        abortUpstream = () => {
+          try { r.cancel(); } catch { /* already closed */ }
+        };
+        // If the client already disconnected before we got here, abort now.
+        if (clientDisconnected) {
+          try { r.cancel(); } catch { /* already closed */ }
+        }
         streamTimeout.reset();
         // eslint-disable-next-line no-constant-condition
         while (true) {
+          if (clientDisconnected) {
+            break;
+          }
           const { done, value } = await r.read();
           if (done) {
             break;
@@ -1017,6 +1050,9 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         // late-firing idle-timeout callback is ignored (see streamClosed).
         streamClosed = true;
         streamTimeout.clear();
+        // Clear the abort handler so the client-disconnect listener can't
+        // call cancel() on an already-closed reader.
+        abortUpstream = null;
 
         // Flush any remaining think-tags filter state (an unclosed  tag
         // at stream end flushes the held bytes as reasoning).
