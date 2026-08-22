@@ -77,7 +77,7 @@ Grokbot:
 6. **Streams** the response back to the editor
 
 The editor doesn't know the proxy is there. It thinks it's talking to its
-normal backend. Grokbot patches the editor's host bundle (`host-main.cjs`)
+normal backend. Grokbot patches the host bundle (`host-main.cjs`)
 to redirect inference calls to `localhost:8788`, and a background watcher
 re-applies the patch automatically whenever the editor updates itself.
 
