@@ -79,7 +79,11 @@ function restoreHost(keepHost: boolean): void {
   } else if (existsSync(backup)) {
     try {
       const backupContent = readFileSync(backup, "utf8");
-      execSync(`node --check ${JSON.stringify(backup)}`, { stdio: "pipe" });
+      // node --check doesn't recognize .bak extension, so use a temp .cjs file.
+      const tmpCheck = `${hostMain}.check.${process.pid}.cjs`;
+      writeFileSync(tmpCheck, backupContent, "utf8");
+      execSync(`node --check ${JSON.stringify(tmpCheck)}`, { stdio: "pipe" });
+      try { unlinkSync(tmpCheck); } catch { /* ignore */ }
       writeFileSync(hostMain, backupContent, "utf8");
       ok("Host: restored host-main.cjs from backup");
       removeFile(backup);

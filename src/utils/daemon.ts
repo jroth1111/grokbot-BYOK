@@ -5,6 +5,7 @@
  * port-probing logic across scripts.
  */
 import { existsSync, readFileSync, unlinkSync, openSync, writeFileSync, rmSync } from "node:fs";
+import * as path from "node:path";
 import * as net from "node:net";
 import { spawn } from "node:child_process";
 
@@ -174,4 +175,21 @@ export function findAlivePid(pidFiles: string[]): number | undefined {
     if (pid !== undefined && isProcessAlive(pid)) return pid;
   }
   return undefined;
+}
+
+/**
+ * Resolve the sand-host directory. Precedence:
+ *   1. SAND_HOST_DIR env var
+ *   2. config hostConfig.sandHostDir — with ${VAR} patterns resolved.
+ *      A literal "${SAND_HOST_DIR}" with no env var set is skipped.
+ *   3. $HOME/sand-host fallback
+ */
+export function resolveSandHostDir(config?: { hostConfig?: { sandHostDir?: string } } | null): string {
+  if (process.env.SAND_HOST_DIR) return process.env.SAND_HOST_DIR;
+  const raw = config?.hostConfig?.sandHostDir;
+  if (raw) {
+    const resolved = raw.replace(/\$\{(\w+)\}/g, (_, name) => process.env[name] ?? "");
+    if (resolved && !resolved.includes("${")) return resolved;
+  }
+  return path.join(process.env.HOME ?? "/root", "sand-host");
 }

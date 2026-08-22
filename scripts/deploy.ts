@@ -26,6 +26,7 @@ import * as path from "node:path";
 import * as net from "node:net";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "../src/config.js";
+import { resolveSandHostDir } from "../src/utils/daemon.js";
 import { createLogger } from "../src/log.js";
 
 const log = createLogger();
@@ -123,7 +124,7 @@ async function main(): Promise<void> {
   const scriptDir = path.dirname(fileURLToPath(import.meta.url));
   const distDir = path.resolve(scriptDir, "..");
   const projectRoot = path.resolve(distDir, "..");
-  const sandHostDir = process.env.SAND_HOST_DIR || config.hostConfig.sandHostDir || path.join(process.env.HOME ?? "/root", "sand-host");
+  const sandHostDir = resolveSandHostDir(config);
   const shimPort = parseInt(process.env.SHIM_PORT ?? String(config.port), 10);
   if (Number.isNaN(shimPort) || shimPort <= 0 || shimPort > 65535) {
     log.error("deploy: invalid shim port", { port: process.env.SHIM_PORT ?? config.port });

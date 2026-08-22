@@ -40,7 +40,7 @@ import * as path from "node:path";
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
-  PID_FILES, LOG_FILES, DAEMON_STATUS_LIST, findAlivePid,
+  PID_FILES, LOG_FILES, DAEMON_STATUS_LIST, findAlivePid, resolveSandHostDir,
   stopAllDaemons, startDaemon, portIsListening, sleep,
 } from "../src/utils/daemon.js";
 
@@ -471,7 +471,7 @@ async function main(): Promise<void> {
   if (args.noPatch) {
     info("Host patch: skipped (--no-patch)");
   } else {
-    const sandHostDir = process.env.SAND_HOST_DIR || config?.hostConfig?.sandHostDir || path.join(process.env.HOME ?? "/root", "sand-host");
+    const sandHostDir = resolveSandHostDir(config);
     const hostMain = path.join(sandHostDir, "host-main.cjs");
     if (existsSync(hostMain)) {
       const patchScript = path.join(distDir, "scripts", "patch-host.js");
@@ -495,7 +495,7 @@ async function main(): Promise<void> {
   if (args.noWatch) {
     info("Host watcher: skipped (--no-watch)");
   } else {
-    const sandHostDir = process.env.SAND_HOST_DIR || config?.hostConfig?.sandHostDir || path.join(process.env.HOME ?? "/root", "sand-host");
+    const sandHostDir = resolveSandHostDir(config);
     const hostMain = path.join(sandHostDir, "host-main.cjs");
     if (existsSync(hostMain)) {
       const watchScript = path.join(distDir, "scripts", "watch-host.js");

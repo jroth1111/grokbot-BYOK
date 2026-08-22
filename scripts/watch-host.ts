@@ -20,6 +20,7 @@ import * as path from "node:path";
 import { execSync } from "node:child_process";
 import { loadConfig } from "../src/config.js";
 import { createLogger } from "../src/log.js";
+import { resolveSandHostDir } from "../src/utils/daemon.js";
 
 const log = createLogger();
 
@@ -173,8 +174,7 @@ function safeMtime(filePath: string): number | null {
 
 function main(): void {
   const config = loadConfig();
-  const sandHostDir =
-    process.env.SAND_HOST_DIR || config.hostConfig.sandHostDir || path.join(process.env.HOME ?? "/root", "sand-host");
+  const sandHostDir = resolveSandHostDir(config);
   const projectRoot = process.cwd();
   const hostMainPath = path.join(sandHostDir, "host-main.cjs");
 
