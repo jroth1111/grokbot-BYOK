@@ -107,7 +107,7 @@ function tallyLog(
     if (Number.isNaN(ts) || ts < cutoff || ts > now + 60_000) continue;
     total++;
     const msg = rec.msg ?? "";
-    if (msg.includes("connected") || msg.includes("HTTP")) {
+    if (msg === "upstream connected" || msg.includes("HTTP")) {
       responses++;
     }
     if (rec.level === "error" || msg.includes("HTTP 4") || msg.includes("HTTP 5")) {
