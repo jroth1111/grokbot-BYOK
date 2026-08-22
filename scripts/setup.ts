@@ -34,11 +34,14 @@
  *   --stop                 Stop all daemons and exit.
  *   --status               Print daemon status and exit.
  */
-import { existsSync, readFileSync, writeFileSync, unlinkSync, copyFileSync, openSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, unlinkSync, copyFileSync } from "node:fs";
 import * as path from "node:path";
-import * as net from "node:net";
-import { spawn, execSync } from "node:child_process";
+import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import {
+  PID_FILES, LOG_FILES, DAEMON_STATUS_LIST, findAlivePid,
+  stopAllDaemons, startDaemon, portIsListening, sleep,
+} from "../src/utils/daemon.js";
 
 // ─── Paths ────────────────────────────────────────────────────────────────
 
@@ -46,22 +49,6 @@ const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const distDir = path.resolve(scriptDir, "..");
 const projectRoot = path.resolve(distDir, "..");
 const configDir = path.join(projectRoot, "config");
-
-const PID_DIR = "/tmp";
-const LOG_DIR = "/tmp";
-
-const PIDS = {
-  shim: path.join(PID_DIR, "inference-shim.pid"),
-  shimPort: path.join(PID_DIR, "inference-shim-8788.pid"),
-  watch: path.join(PID_DIR, "grokbot-watch-host.pid"),
-  health: path.join(PID_DIR, "grokbot-health-check.pid"),
-};
-
-const LOGS = {
-  shim: path.join(LOG_DIR, "inference-shim.log"),
-  watch: path.join(LOG_DIR, "grokbot-watch-host.log"),
-  health: path.join(LOG_DIR, "grokbot-health-check.log"),
-};
 
 // ─── Provider definitions ─────────────────────────────────────────────────
 
@@ -155,83 +142,6 @@ function err(msg: string): void {
   console.error(`${RED}[setup] ERROR${RESET} ${msg}`);
 }
 
-// ─── Utilities ────────────────────────────────────────────────────────────
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function portIsListening(host: string, port: number, timeoutMs = 1000): Promise<boolean> {
-  return new Promise((resolve) => {
-    const sock = net.connect({ host, port });
-    const cleanup = (v: boolean) => { sock.removeAllListeners(); sock.destroy(); resolve(v); };
-    sock.setTimeout(timeoutMs);
-    sock.once("connect", () => cleanup(true));
-    sock.once("timeout", () => cleanup(false));
-    sock.once("error", () => cleanup(false));
-  });
-}
-
-function readPid(file: string): number | undefined {
-  if (!existsSync(file)) return undefined;
-  try {
-    const pid = parseInt(readFileSync(file, "utf8").trim(), 10);
-    return Number.isNaN(pid) ? undefined : pid;
-  } catch {
-    return undefined;
-  }
-}
-
-function isProcessAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch { return false; }
-}
-
-function killPid(pid: number): void {
-  try { process.kill(pid, "SIGTERM"); } catch { /* dead */ }
-}
-
-function stopDaemon(name: string, ...pidFiles: string[]): void {
-  let stopped = false;
-  for (const pidFile of pidFiles) {
-    const pid = readPid(pidFile);
-    if (pid === undefined) continue;
-    if (!isProcessAlive(pid)) {
-      try { unlinkSync(pidFile); } catch { /* ignore */ }
-      continue;
-    }
-    info(`${name}: stopping pid ${pid}`);
-    killPid(pid);
-    for (let i = 0; i < 30; i++) {
-      if (!isProcessAlive(pid)) break;
-      try { process.kill(pid, 0); } catch { break; }
-    }
-    try { process.kill(pid, "SIGKILL"); } catch { /* dead */ }
-    try { unlinkSync(pidFile); } catch { /* ignore */ }
-    ok(`${name}: stopped`);
-    stopped = true;
-  }
-  if (!stopped) info(`${name}: no running process found`);
-}
-
-function startDaemon(name: string, cmd: string, args: string[], pidFile: string, logFile: string): number | undefined {
-  const outFd = openSync(logFile, "a");
-  const errFd = openSync(logFile, "a");
-  const child = spawn(cmd, args, {
-    stdio: ["ignore", outFd, errFd],
-    detached: true,
-    cwd: projectRoot,
-    env: process.env,
-  });
-  child.unref();
-  if (child.pid) {
-    writeFileSync(pidFile, String(child.pid));
-    ok(`${name}: started (pid ${child.pid}, log ${logFile})`);
-    return child.pid;
-  }
-  err(`${name}: failed to start`);
-  return undefined;
-}
-
 // ─── Arg parsing ──────────────────────────────────────────────────────────
 
 interface SetupArgs {
@@ -252,7 +162,6 @@ function parseArgs(argv: string[]): SetupArgs {
       if (arg.startsWith(flagEq)) {
         keys[p.envVar] = arg.slice(flagEq.length);
       } else if (arg === p.cliFlag) {
-        // --opencode-key sk-xxx (space-separated)
         const idx = argv.indexOf(arg);
         if (idx + 1 < argv.length && !argv[idx + 1].startsWith("--")) {
           keys[p.envVar] = argv[idx + 1];
@@ -273,15 +182,10 @@ function parseArgs(argv: string[]): SetupArgs {
 
 // ─── .env management ──────────────────────────────────────────────────────
 
-/**
- * Set or update an env var in the .env file. If the var already exists,
- * replace its value. If not, append it. Preserves comments and other lines.
- */
+/** Set or update an env var in the .env file. Preserves comments and other lines. */
 function setEnvVar(envPath: string, varName: string, value: string): void {
   let content = "";
-  if (existsSync(envPath)) {
-    content = readFileSync(envPath, "utf8");
-  }
+  if (existsSync(envPath)) content = readFileSync(envPath, "utf8");
   const re = new RegExp(`^#?\\s*${varName}=.*$`, "m");
   const newLine = `${varName}=${value}`;
   if (re.test(content)) {
@@ -292,9 +196,7 @@ function setEnvVar(envPath: string, varName: string, value: string): void {
   writeFileSync(envPath, content, "utf8");
 }
 
-/**
- * Read a var from the .env file. Returns undefined if not set or is a placeholder.
- */
+/** Read a var from .env. Returns undefined if not set or is a placeholder. */
 function readEnvVar(envPath: string, varName: string): string | undefined {
   if (!existsSync(envPath)) return undefined;
   const content = readFileSync(envPath, "utf8");
@@ -305,15 +207,13 @@ function readEnvVar(envPath: string, varName: string): string | undefined {
   return val;
 }
 
-/**
- * Write CLI-provided keys into .env. Also picks up keys from the current
- * process env (e.g. OPENCODE_API_KEY=sk-xxx npm run setup).
- */
-function writeKeysToEnv(envPath: string, cliKeys: Record<string, string>): string[] {
-  const written: string[] = [];
+/** Write CLI/env-provided keys into .env. Returns unique env var names written. */
+function writeKeysToEnv(envPath: string, cliKeys: Record<string, string>): Set<string> {
+  const written = new Set<string>();
+  const seen = new Set<string>();
   for (const p of PROVIDERS) {
-    if (p.keyless) continue;
-    // CLI flag takes precedence, then process env, then existing .env value.
+    if (seen.has(p.envVar)) continue;
+    seen.add(p.envVar);
     const cliVal = cliKeys[p.envVar];
     const envVal = process.env[p.envVar];
     const existingVal = readEnvVar(envPath, p.envVar);
@@ -325,23 +225,26 @@ function writeKeysToEnv(envPath: string, cliKeys: Record<string, string>): strin
       } else {
         info(`${p.envVar} already set in .env`);
       }
-      written.push(p.envVar);
+      written.add(p.envVar);
     }
   }
   return written;
 }
 
-/** Check which required keys are missing and return their env var names. */
+/** Check which required keys are missing. */
 function getMissingRequiredKeys(envPath: string): string[] {
   const missing: string[] = [];
+  const seen = new Set<string>();
   for (const p of PROVIDERS) {
+    if (seen.has(p.envVar)) continue;
+    seen.add(p.envVar);
     if (p.keyless || !p.required) continue;
     if (!readEnvVar(envPath, p.envVar)) missing.push(p.envVar);
   }
   return missing;
 }
 
-// ─── Provider table (human-readable, suppressed by --quiet) ───────────────
+// ─── Provider table (suppressed by --quiet) ───────────────────────────────
 
 function printProviderTable(): void {
   console.log();
@@ -382,11 +285,7 @@ function loadConfigSafe(): { port: number; host: string; hostConfig?: { sandHost
     if (!existsSync(configPath)) return null;
     const raw = readFileSync(configPath, "utf8");
     const cfg = JSON.parse(raw);
-    return {
-      port: cfg.port ?? 8788,
-      host: cfg.host ?? "127.0.0.1",
-      hostConfig: cfg.hostConfig,
-    };
+    return { port: cfg.port ?? 8788, host: cfg.host ?? "127.0.0.1", hostConfig: cfg.hostConfig };
   } catch {
     return null;
   }
@@ -405,18 +304,9 @@ async function main(): Promise<void> {
       console.log(`${BOLD}grokbot-BYOK v2 — daemon status${RESET}`);
       console.log();
     }
-    const daemons: Array<{ name: string; pidFiles: string[]; logFile: string }> = [
-      { name: "Shim", pidFiles: [PIDS.shim, PIDS.shimPort], logFile: LOGS.shim },
-      { name: "Host watcher", pidFiles: [PIDS.watch], logFile: LOGS.watch },
-      { name: "Health watchdog", pidFiles: [PIDS.health], logFile: LOGS.health },
-    ];
     let allRunning = true;
-    for (const d of daemons) {
-      let alivePid: number | undefined;
-      for (const pf of d.pidFiles) {
-        const pid = readPid(pf);
-        if (pid !== undefined && isProcessAlive(pid)) { alivePid = pid; break; }
-      }
+    for (const d of DAEMON_STATUS_LIST) {
+      const alivePid = findAlivePid(d.pidFiles);
       const running = alivePid !== undefined;
       if (!running) allRunning = false;
       if (quiet) {
@@ -445,9 +335,7 @@ async function main(): Promise<void> {
   if (args.stop) {
     if (!quiet) console.log();
     info("Stopping all daemons...");
-    stopDaemon("Shim", PIDS.shim, PIDS.shimPort);
-    stopDaemon("Host watcher", PIDS.watch);
-    stopDaemon("Health watchdog", PIDS.health);
+    await stopAllDaemons();
     ok("All daemons stopped");
     process.exit(0);
   }
@@ -462,20 +350,13 @@ async function main(): Promise<void> {
   info("Step 1/7: Checking prerequisites...");
   const nodeVersion = process.version;
   const major = parseInt(nodeVersion.slice(1).split(".")[0], 10);
-  if (major < 18) {
-    err(`Node 18+ required, found ${nodeVersion}`);
-    process.exit(1);
-  }
+  if (major < 18) { err(`Node 18+ required, found ${nodeVersion}`); process.exit(1); }
   ok(`Node ${nodeVersion}`);
 
   if (!existsSync(path.join(projectRoot, "node_modules"))) {
     info("Installing dependencies (npm install)...");
-    try {
-      execSync("npm install", { stdio: quiet ? "pipe" : "inherit", cwd: projectRoot });
-    } catch {
-      err("npm install failed");
-      process.exit(1);
-    }
+    try { execSync("npm install", { stdio: quiet ? "pipe" : "inherit", cwd: projectRoot }); }
+    catch { err("npm install failed"); process.exit(1); }
   }
   ok("Dependencies installed");
 
@@ -484,46 +365,29 @@ async function main(): Promise<void> {
   const configExample = path.join(configDir, "config.example.json");
   const configJson = path.join(configDir, "config.json");
   if (!existsSync(configJson)) {
-    if (existsSync(configExample)) {
-      copyFileSync(configExample, configJson);
-      ok("Created config/config.json from example");
-    } else {
-      err("config/config.example.json not found");
-      process.exit(1);
-    }
-  } else {
-    ok("config/config.json exists");
-  }
+    if (existsSync(configExample)) { copyFileSync(configExample, configJson); ok("Created config/config.json from example"); }
+    else { err("config/config.example.json not found"); process.exit(1); }
+  } else { ok("config/config.json exists"); }
 
   // ── Step 3: .env file ──
   info("Step 3/7: Checking .env file...");
   const envExample = path.join(projectRoot, ".env.example");
   const envFile = path.join(projectRoot, ".env");
   if (!existsSync(envFile)) {
-    if (existsSync(envExample)) {
-      copyFileSync(envExample, envFile);
-      ok("Created .env from .env.example");
-    } else {
-      warn(".env.example not found, creating empty .env");
-      writeFileSync(envFile, "", "utf8");
-    }
-  } else {
-    ok(".env exists");
-  }
+    if (existsSync(envExample)) { copyFileSync(envExample, envFile); ok("Created .env from .env.example"); }
+    else { warn(".env.example not found, creating empty .env"); writeFileSync(envFile, "", "utf8"); }
+  } else { ok(".env exists"); }
 
   // ── Step 4: Write keys + print provider info ──
   info("Step 4/7: Configuring API keys...");
   const writtenKeys = writeKeysToEnv(envFile, args.keys);
-  if (writtenKeys.length > 0) {
-    ok(`Wrote ${writtenKeys.length} key(s) to .env: ${writtenKeys.join(", ")}`);
-  }
+  if (writtenKeys.size > 0) ok(`Wrote ${writtenKeys.size} key(s) to .env: ${[...writtenKeys].join(", ")}`);
 
   if (!quiet) printProviderTable();
 
   const missing = getMissingRequiredKeys(envFile);
   if (missing.length > 0) {
     warn(`Missing required API keys: ${missing.join(", ")}`);
-    warn("Provide them via CLI flags or env vars, or edit .env manually:");
     const flags = missing.map((v) => {
       const p = PROVIDERS.find((pp) => pp.envVar === v);
       return p ? `${p.cliFlag} <key>` : `${v}=<key>`;
@@ -540,12 +404,8 @@ async function main(): Promise<void> {
     info("Step 5/7: Build (skipped via --no-build)");
   } else {
     info("Step 5/7: Building shim + scripts...");
-    try {
-      execSync("npm run build:all", { stdio: quiet ? "pipe" : "inherit", cwd: projectRoot });
-    } catch {
-      err("Build failed");
-      process.exit(1);
-    }
+    try { execSync("npm run build:all", { stdio: quiet ? "pipe" : "inherit", cwd: projectRoot }); }
+    catch { err("Build failed"); process.exit(1); }
     ok("Build complete");
   }
 
@@ -556,29 +416,23 @@ async function main(): Promise<void> {
 
   // ── Step 6: Stop existing daemons ──
   info("Step 6/7: Stopping existing daemons (if any)...");
-  stopDaemon("Shim", PIDS.shim, PIDS.shimPort);
-  stopDaemon("Host watcher", PIDS.watch);
-  stopDaemon("Health watchdog", PIDS.health);
+  await stopAllDaemons();
   await sleep(500);
 
   // ── Step 7: Start daemons ──
   info("Step 7/7: Starting daemons...");
 
-  // 7a: Shim
+  // 7a: Shim (use start-shim.js which handles WindsurfAPI auto-start + seeding)
   const startShimPath = path.join(distDir, "scripts", "start-shim.js");
   const shimPath = path.join(distDir, "shim.js");
   const shimEntry = existsSync(startShimPath) ? startShimPath : shimPath;
-  try { unlinkSync(PIDS.shim); } catch { /* not present */ }
-  const shimOutFd = openSync(LOGS.shim, "a");
-  const shimErrFd = openSync(LOGS.shim, "a");
-  const shimChild = spawn("node", [shimEntry], {
-    stdio: ["ignore", shimOutFd, shimErrFd],
-    detached: true,
-    cwd: projectRoot,
-    env: process.env,
-  });
-  shimChild.unref();
-  if (shimChild.pid) ok(`Shim: starting (pid ${shimChild.pid})`);
+  // Don't pre-write the PID file — the shim writes its own PID on startup.
+  // Using startDaemon would write start-shim.js's PID, which shim.js would
+  // then see as "already running" and refuse to start.
+  try { unlinkSync(PID_FILES.shim); } catch { /* not present */ }
+  try { unlinkSync(PID_FILES.shimPort); } catch { /* not present */ }
+  const shimPid = startDaemon("Shim", "node", [shimEntry], "", LOG_FILES.shim, projectRoot);
+  if (shimPid) ok(`Shim: starting (pid ${shimPid})`);
 
   // Wait for shim to listen.
   const config = loadConfigSafe();
@@ -589,14 +443,10 @@ async function main(): Promise<void> {
     if (await portIsListening(shimHost, shimPort)) { listening = true; break; }
     await sleep(1000);
   }
-  if (listening) {
-    ok(`Shim listening on ${shimHost}:${shimPort}`);
-  } else {
-    err(`Shim did not start listening on ${shimHost}:${shimPort} within 15s`);
-    warn(`Check log: ${LOGS.shim}`);
-  }
+  if (listening) ok(`Shim listening on ${shimHost}:${shimPort}`);
+  else { err(`Shim did not start listening on ${shimHost}:${shimPort} within 15s`); warn(`Check log: ${LOG_FILES.shim}`); }
 
-  // 7b: Host watcher
+  // 7b: Host watcher (only if host-main.cjs exists)
   if (args.noWatch) {
     info("Host watcher: skipped (--no-watch)");
   } else {
@@ -605,10 +455,9 @@ async function main(): Promise<void> {
     if (existsSync(hostMain)) {
       const watchScript = path.join(distDir, "scripts", "watch-host.js");
       if (existsSync(watchScript)) {
-        startDaemon("Host watcher", "node", [watchScript], PIDS.watch, LOGS.watch);
-      } else {
-        warn("Host watcher: dist/scripts/watch-host.js not found");
-      }
+        const pid = startDaemon("Host watcher", "node", [watchScript], PID_FILES.watch, LOG_FILES.watch, projectRoot);
+        if (pid) ok(`Host watcher: started (pid ${pid})`);
+      } else { warn("Host watcher: dist/scripts/watch-host.js not found"); }
     } else {
       info(`Host watcher: host-main.cjs not found at ${hostMain}, skipping`);
       if (!quiet) info(`${DIM}Re-run setup after Cursor is installed to enable auto re-patching.${RESET}`);
@@ -621,17 +470,16 @@ async function main(): Promise<void> {
   } else {
     const healthScript = path.join(distDir, "scripts", "health-check.js");
     if (existsSync(healthScript)) {
-      startDaemon("Health watchdog", "node", [healthScript, "--watch", "--deploy"], PIDS.health, LOGS.health);
-    } else {
-      warn("Health watchdog: dist/scripts/health-check.js not found");
-    }
+      const pid = startDaemon("Health watchdog", "node", [healthScript, "--watch", "--deploy"], PID_FILES.health, LOG_FILES.health, projectRoot);
+      if (pid) ok(`Health watchdog: started (pid ${pid})`);
+    } else { warn("Health watchdog: dist/scripts/health-check.js not found"); }
   }
 
   // ── Summary ──
   if (quiet) {
     console.log(`shim: ${listening ? "running" : "failed"}`);
-    const watchRunning = readPid(PIDS.watch) !== undefined && isProcessAlive(readPid(PIDS.watch)!);
-    const healthRunning = readPid(PIDS.health) !== undefined && isProcessAlive(readPid(PIDS.health)!);
+    const watchRunning = findAlivePid([PID_FILES.watch]) !== undefined;
+    const healthRunning = findAlivePid([PID_FILES.health]) !== undefined;
     console.log(`host_watcher: ${watchRunning ? "running" : "stopped"}`);
     console.log(`health_watchdog: ${healthRunning ? "running" : "stopped"}`);
   } else {
@@ -639,14 +487,14 @@ async function main(): Promise<void> {
     console.log(`${BOLD}Setup complete${RESET}`);
     console.log();
     console.log(`  Shim:             ${listening ? GREEN + "running" + RESET : RED + "not listening" + RESET} (${shimHost}:${shimPort})`);
-    const watchRunning = readPid(PIDS.watch) !== undefined && isProcessAlive(readPid(PIDS.watch)!);
-    const healthRunning = readPid(PIDS.health) !== undefined && isProcessAlive(readPid(PIDS.health)!);
+    const watchRunning = findAlivePid([PID_FILES.watch]) !== undefined;
+    const healthRunning = findAlivePid([PID_FILES.health]) !== undefined;
     console.log(`  Host watcher:     ${watchRunning ? GREEN + "running" + RESET : DIM + "stopped" + RESET}`);
     console.log(`  Health watchdog:  ${healthRunning ? GREEN + "running" + RESET : DIM + "stopped" + RESET}`);
     console.log();
-    console.log(`  Logs: ${DIM}/tmp/inference-shim.log${RESET}`);
-    console.log(`        ${DIM}/tmp/grokbot-watch-host.log${RESET}`);
-    console.log(`        ${DIM}/tmp/grokbot-health-check.log${RESET}`);
+    console.log(`  Logs: ${DIM}${LOG_FILES.shim}${RESET}`);
+    console.log(`        ${DIM}${LOG_FILES.watch}${RESET}`);
+    console.log(`        ${DIM}${LOG_FILES.health}${RESET}`);
     console.log();
     console.log(`  ${CYAN}npm run setup -- --status${RESET}  check status`);
     console.log(`  ${CYAN}npm run setup -- --stop${RESET}     stop all`);
