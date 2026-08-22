@@ -46,6 +46,18 @@ const ERROR_PENALTY = 0.2;
  *  Default: 5 minutes. */
 const STALE_THRESHOLD_MS = 5 * 60 * 1000;
 
+/** Sentinel value for "no prefill data yet" — distinguishes "we haven't
+ *  measured TTFB yet" from "TTFB is actually 0 ms". When set, the score()
+ *  function uses a neutral default instead of 0 (which would make the
+ *  provider look infinitely fast on prefill). */
+const NO_PREFILL_DATA = -1;
+
+/** Default prefill rate (ms/prompt token) used when no data is available.
+ *  0.1 ms/token is a reasonable mid-range value (~10s TTFB for a 100K
+ *  token prompt). Using this instead of 0 prevents new providers from
+ *  looking artificially fast before real data accumulates. */
+const DEFAULT_PREFILL_MS_PER_TOKEN = 0.1;
+
 /** Exploration rate (epsilon) for epsilon-greedy routing. With this
  *  probability, a random eligible provider is selected instead of the
  *  best-scoring one, ensuring all providers accumulate fresh data.
@@ -89,6 +101,11 @@ class PerformanceTracker {
    *
    * Both TTFB and throughput are normalized before the EWMA update so
    * the tracker stores per-unit-work rates, not raw latencies.
+   *
+   * @param updateWorkload When false, skips updating the global workload
+   *   average. Used by shadow probes which have truncated completionTokens
+   *   (~20 tokens) — including them would contaminate the reference
+   *   workload and make the generation term in the score meaningless.
    */
   record(
     provider: string,
@@ -97,10 +114,13 @@ class PerformanceTracker {
     promptTokens: number,
     completionTokens: number,
     streamDurationMs: number,
+    updateWorkload: boolean = true,
   ): void {
     // Update the global workload average (across all providers) so the
     // reference workload reflects the actual request-size distribution.
-    if (promptTokens > 0 || completionTokens > 0) {
+    // Shadow probes skip this (updateWorkload=false) because their
+    // completionTokens is truncated (~20) and would contaminate the avg.
+    if (updateWorkload && (promptTokens > 0 || completionTokens > 0)) {
       if (this.workload.samples === 0) {
         this.workload.avgPromptTokens = promptTokens;
         this.workload.avgCompletionTokens = completionTokens;
@@ -116,7 +136,7 @@ class PerformanceTracker {
     let p = this.perf.get(provider);
     if (!p) {
       p = {
-        prefillMsPerPromptToken: 0,
+        prefillMsPerPromptToken: NO_PREFILL_DATA,
         tokensPerSec: 0,
         errorRate: 0,
         samples: 0,
@@ -144,15 +164,28 @@ class PerformanceTracker {
 
     // EWMA update: blend the new sample with the running average.
     if (p.samples === 0) {
-      p.prefillMsPerPromptToken = reqPrefillMsPerToken ?? 0;
-      p.tokensPerSec = reqTokensPerSec;
+      // First sample: initialize directly. If no TTFB data, use the
+      // sentinel (not 0) so the provider doesn't look artificially fast.
+      p.prefillMsPerPromptToken = reqPrefillMsPerToken ?? NO_PREFILL_DATA;
+      // Don't initialize tokensPerSec to 0 for failed requests (no
+      // completion tokens) — that would make the provider look infinitely
+      // slow. The error rate already penalizes failures; throughput
+      // should only be updated from successful generation data.
+      p.tokensPerSec = completionTokens > 0 ? reqTokensPerSec : 0;
       p.errorRate = success ? 0 : 1;
     } else {
       if (reqPrefillMsPerToken !== undefined) {
         p.prefillMsPerPromptToken =
           ALPHA * reqPrefillMsPerToken + (1 - ALPHA) * p.prefillMsPerPromptToken;
       }
-      p.tokensPerSec = ALPHA * reqTokensPerSec + (1 - ALPHA) * p.tokensPerSec;
+      // Only update throughput EWMA from requests that actually produced
+      // tokens. A failed request (completionTokens=0) yields tokensPerSec=0,
+      // which would double-penalize the provider alongside the errorRate
+      // penalty. Skip the throughput update for failures — the errorRate
+      // already captures the failure signal.
+      if (completionTokens > 0) {
+        p.tokensPerSec = ALPHA * reqTokensPerSec + (1 - ALPHA) * p.tokensPerSec;
+      }
       const errVal = success ? 0 : 1;
       p.errorRate = ALPHA * errVal + (1 - ALPHA) * p.errorRate;
     }
@@ -191,7 +224,12 @@ class PerformanceTracker {
       : 500;
 
     // Prefill term: ms per prompt token × reference prompt size.
-    const prefillMs = p.prefillMsPerPromptToken * refPrompt;
+    // If no prefill data has been recorded yet (sentinel value), use a
+    // neutral default so the provider doesn't look artificially fast.
+    const prefillRate = p.prefillMsPerPromptToken === NO_PREFILL_DATA
+      ? DEFAULT_PREFILL_MS_PER_TOKEN
+      : p.prefillMsPerPromptToken;
+    const prefillMs = prefillRate * refPrompt;
 
     // Generation term: ms per token × reference completion size.
     // Cap msPerToken at 10s to avoid division-by-near-zero.
@@ -248,7 +286,9 @@ class PerformanceTracker {
     for (const [provider, p] of this.perf) {
       result[provider] = {
         samples: p.samples,
-        avgPrefillMsPerPromptToken: Math.round(p.prefillMsPerPromptToken * 1000) / 1000,
+        avgPrefillMsPerPromptToken: p.prefillMsPerPromptToken === NO_PREFILL_DATA
+          ? -1
+          : Math.round(p.prefillMsPerPromptToken * 1000) / 1000,
         avgTokensPerSec: Math.round(p.tokensPerSec * 10) / 10,
         errorRate: Math.round(p.errorRate * 100) / 100,
         score: Math.round(this.score(provider) / 10) / 100,

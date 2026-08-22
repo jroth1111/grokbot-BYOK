@@ -284,7 +284,7 @@ async function shadowProbe(
         elapsed: Date.now() - probeStart,
       });
       performanceTracker.record(
-        provider.name, false, undefined, 0, 0, Date.now() - probeStart,
+        provider.name, false, undefined, 0, 0, Date.now() - probeStart, false,
       );
       return;
     }
@@ -376,7 +376,7 @@ async function shadowProbe(
     });
 
     performanceTracker.record(
-      provider.name, success, ttfbMs, promptTokens, completionTokens, elapsed,
+      provider.name, success, ttfbMs, promptTokens, completionTokens, elapsed, false,
     );
   } catch (err) {
     const elapsed = Date.now() - probeStart;
@@ -387,7 +387,7 @@ async function shadowProbe(
       elapsed,
     });
     performanceTracker.record(
-      provider.name, false, undefined, 0, 0, elapsed,
+      provider.name, false, undefined, 0, 0, elapsed, false,
     );
   }
 }
