@@ -25,6 +25,7 @@ import type {
   NetworkConfig,
   OpenAIChatRequest,
   OpenAISSEChunk,
+  Provider,
   ShimConfig,
 } from "./types.js";
 import {
@@ -93,6 +94,15 @@ const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 120_000;
 /** Default TTFB timeout (ms): if no first token arrives within this window,
  *  abort the stream and failover to the next provider. Set to 0 to disable. */
 const DEFAULT_TTFB_TIMEOUT_MS = 15_000;
+
+/** Shadow probe frequency: every Nth request, send a concurrent probe to
+ *  the second-best provider to calibrate performance scores with true
+ *  apples-to-apples data (same request, same prompt, direct comparison).
+ *  0 disables. Default: every 50th request (~2% cost overhead). */
+const SHADOW_PROBE_INTERVAL = 50;
+
+/** Module-level request counter for shadow probe triggering. */
+let requestCounter = 0;
 
 /** Default retry backoff settings when a provider doesn't specify them. */
 const DEFAULT_RETRY_BACKOFF_INITIAL_MS = 500;
@@ -205,6 +215,152 @@ function startConnectResponse(
     "Cache-Control": "no-cache",
     ...extraHeaders,
   });
+}
+
+/**
+ * Shadow probe: fire a concurrent fetch to a second provider and measure
+ * its TTFB + token throughput on the SAME request, then abort the stream.
+ *
+ * This gives true apples-to-apples performance data (same prompt, same
+ * completion) to calibrate the latency router's scores. The probe runs
+ * in the background — it does NOT affect the client's response, which is
+ * served from the primary provider.
+ *
+ * The probe reads just enough of the stream to measure TTFB (first token)
+ * and a few tokens of throughput, then cancels the connection to avoid
+ * wasting provider quota on a full generation.
+ */
+async function shadowProbe(
+  provider: Provider,
+  model: string,
+  body: OpenAIChatRequest,
+  logger: Logger,
+  requestId: string,
+): Promise<void> {
+  const key = provider.selectKey();
+  const probeTimeoutMs = provider.network.requestTimeoutMs ?? 30000;
+  const ttfbTimeoutMs = provider.network.ttfbTimeoutMs ?? DEFAULT_TTFB_TIMEOUT_MS;
+
+  // Deep-clone the body and apply compat for the shadow provider.
+  const probeBody = JSON.parse(JSON.stringify(body)) as OpenAIChatRequest;
+  probeBody.model = model;
+  applyCompatToRequest(probeBody, provider.compat, model, provider.name, provider.baseUrl);
+
+  const probeStart = Date.now();
+  let ttfbMs: number | undefined;
+  let completionTokens = 0;
+  let promptTokens = 0;
+  let success = false;
+
+  try {
+    const resp = await fetchCompletion(provider.baseUrl, probeBody, key, probeTimeoutMs);
+    if (!resp.ok || !resp.body) {
+      logger.warn("shadow probe: upstream non-2xx", {
+        requestId,
+        provider: provider.name,
+        status: resp.status,
+        elapsed: Date.now() - probeStart,
+      });
+      performanceTracker.record(
+        provider.name, false, undefined, 0, 0, Date.now() - probeStart,
+      );
+      return;
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    const sseParser = new SseParser();
+    let tokenCount = 0;
+    const MAX_PROBE_TOKENS = 20; // Read ~20 tokens then abort
+
+    // TTFB timer: abort if no first token within timeout.
+    const ttfbTimer = setTimeout(() => {
+      void reader.cancel().catch(() => { /* ignore */ });
+    }, ttfbTimeoutMs);
+
+    try {
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const text = decoder.decode(value, { stream: true });
+        sseParser.feed(text);
+        for (const data of sseParser.drain()) {
+          if (data === "[DONE]") {
+            success = true;
+            break;
+          }
+          try {
+            const chunk = JSON.parse(data) as OpenAISSEChunk;
+            // Extract usage (prompt tokens).
+            const extracted = extractUsage(chunk);
+          if (extracted?.promptTokens) promptTokens = extracted.promptTokens;
+          if (extracted?.completionTokens) completionTokens = extracted.completionTokens;
+            // Check for first content token (TTFB).
+            for (const choice of chunk.choices ?? []) {
+              const delta = choice.delta;
+              if (delta?.content || delta?.reasoning_content || delta?.reasoning || delta?.reasoning_text) {
+                if (ttfbMs === undefined) {
+                  ttfbMs = Date.now() - probeStart;
+                  clearTimeout(ttfbTimer);
+                }
+                tokenCount++;
+              }
+              if (choice.finish_reason) {
+                success = true;
+              }
+            }
+          } catch {
+            // Skip malformed JSON.
+          }
+          if (success) break;
+        }
+        if (success) break;
+        // Abort after enough tokens to measure throughput.
+        if (tokenCount >= MAX_PROBE_TOKENS) {
+          break;
+        }
+      }
+    } finally {
+      clearTimeout(ttfbTimer);
+      try { reader.cancel(); } catch { /* already closed */ }
+    }
+
+    // If we got TTFB but no usage, estimate completion tokens from what we read.
+    if (completionTokens === 0 && tokenCount > 0) {
+      completionTokens = tokenCount;
+    }
+
+    const elapsed = Date.now() - probeStart;
+    success = success || (ttfbMs !== undefined && tokenCount > 0);
+
+    logger.info("shadow probe complete", {
+      requestId,
+      provider: provider.name,
+      model,
+      ttfbMs,
+      tokensRead: tokenCount,
+      promptTokens,
+      completionTokens,
+      elapsed,
+      success,
+    });
+
+    performanceTracker.record(
+      provider.name, success, ttfbMs, promptTokens, completionTokens, elapsed,
+    );
+  } catch (err) {
+    const elapsed = Date.now() - probeStart;
+    logger.warn("shadow probe failed", {
+      requestId,
+      provider: provider.name,
+      error: err instanceof Error ? err.message : String(err),
+      elapsed,
+    });
+    performanceTracker.record(
+      provider.name, false, undefined, 0, 0, elapsed,
+    );
+  }
 }
 
 /**
@@ -812,6 +968,30 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       connected;
     const requestTimeoutMs =
       network.requestTimeoutMs ?? config.requestTimeoutMs;
+
+    // -----------------------------------------------------------------
+    // 10a. Shadow probe: every Nth request, fire a concurrent fetch to
+    //      the second-best provider to calibrate performance scores with
+    //      true apples-to-apples data (same request, same prompt). The
+    //      probe runs in the background and does NOT affect the client's
+    //      response. It reads ~20 tokens then aborts to minimize wasted
+    //      provider quota.
+    // -----------------------------------------------------------------
+    if (SHADOW_PROBE_INTERVAL > 0 && (++requestCounter % SHADOW_PROBE_INTERVAL === 0)) {
+      // Find the second-best provider (next in failover chain that isn't
+      // the primary and hasn't been tried yet in the connection phase).
+      const shadowProvider = failoverChain.find(
+        (p) => p.name !== providerName && breaker.shouldTry(p.name),
+      );
+      if (shadowProvider) {
+        const shadowModel = shadowProvider.resolveModel(normalizedId);
+        // Fire-and-forget: the probe runs concurrently with the primary
+        // stream. Errors are logged but never affect the client response.
+        shadowProbe(shadowProvider, shadowModel, openaiBodySnapshot, logger, requestId).catch(
+          (err) => logger.warn("shadow probe unhandled rejection", { requestId, error: err }),
+        );
+      }
+    }
 
     const MAX_EMPTY_COMPLETION_RETRIES = 2;
     const EMPTY_COMPLETION_BASE_DELAY_MS = 500;
