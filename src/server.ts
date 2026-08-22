@@ -691,6 +691,11 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
     let attemptOrdinal = 0;
     const requestStartTime = Date.now();
 
+    // Track every provider that was tried during the connection phase so
+    // the empty-completion failover loop (section 10b) doesn't re-try
+    // providers that already failed with auth/rate-limit/server errors.
+    const connectionTriedProviders = new Set<string>();
+
     function recordAttempt(
       providerName: string,
       modelId: string,
@@ -724,6 +729,16 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
     let requestErrorMessage: string | null = null;
 
     providerLoop: for (const provider of failoverChain) {
+      // If the client disconnected during a previous provider's attempt
+      // (or while reading the request body), stop immediately — there's
+      // no point trying more providers since no one is listening.
+      if (clientDisconnected) {
+        logger.info("client disconnected before provider attempt, stopping", {
+          provider: provider.name,
+          elapsed: Date.now() - requestStart,
+        });
+        break;
+      }
       if (!breaker.shouldTry(provider.name)) {
         logger.warn("provider circuit open, skipping", {
           provider: provider.name,
@@ -731,6 +746,10 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         });
         continue;
       }
+
+      // Record this provider as tried in the connection phase so the
+      // empty-completion failover loop doesn't re-try it.
+      connectionTriedProviders.add(provider.name);
 
       // Reset per-request key-failure state so a 401 on a key in a
       // previous request doesn't permanently remove it from rotation.
@@ -1658,7 +1677,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         metrics.recordRequest(
           providerName,
           !streamError,
-          Date.now() - requestStart,
+          Date.now() - streamStartMs,
           ttfbMs,
         );
         // Record performance data for latency-based routing. Both TTFB
@@ -1726,6 +1745,9 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
     // then the remaining providers in the failover chain (excluding the
     // ones already tried during the connection phase).
     const triedProviderNames = new Set<string>([providerName]);
+    for (const name of connectionTriedProviders) {
+      triedProviderNames.add(name);
+    }
     const remainingProviders = failoverChain.filter(
       (p) => !triedProviderNames.has(p.name),
     );
