@@ -8,6 +8,10 @@
  */
 
 import type { ErrorType } from "./failover.js";
+import {
+  classifyRateLimitReason,
+  backoffForRateLimitReason,
+} from "../observability/rate-limit.js";
 
 /** What the request layer should do after a failed attempt. */
 export type RetryDecision = "retry" | "failover" | "stop";
@@ -45,6 +49,8 @@ export function sleep(ms: number): Promise<void> {
  * - "rate-limit" (429):        "retry" while attempts remain, else "failover".
  * - "server-error" (5xx):      "retry" while attempts remain, else "failover".
  * - "network-error":           "retry" while attempts remain, else "failover".
+ * - "empty-completion":        "failover" — provider is healthy, model returned nothing.
+ * - "invalid-tool-arguments":  "failover" — provider is healthy, model misbehaved.
  *
  * `attempt` is the number of retries already performed (zero-based), so a
  * value of 0 means "no retries have happened yet".
@@ -62,6 +68,8 @@ export function shouldRetry(
     case "request-error":
       return "stop";
     case "auth-error":
+    case "empty-completion":
+    case "invalid-tool-arguments":
       return "failover";
     case "rate-limit":
     case "server-error":
@@ -70,4 +78,24 @@ export function shouldRetry(
     default:
       return "failover";
   }
+}
+
+/**
+ * Compute a backoff for a rate-limit error using the rate-limit reason
+ * classifier. Instead of a flat exponential backoff, this classifies the
+ * 429 message into one of: quota exhausted (30 min), rate limit exceeded
+ * (30s), concurrent limit (5s), model capacity exhausted (45s ± jitter),
+ * server error (20s), or unknown (fall through to exponential).
+ *
+ * Returns `null` when the error is not a rate limit or when the caller
+ * should use the default exponential backoff instead.
+ */
+export function computeRateLimitBackoff(
+  errorType: ErrorType,
+  errorMessage: string,
+): number | null {
+  if (errorType !== "rate-limit") return null;
+  const reason = classifyRateLimitReason(errorMessage);
+  if (reason === "UNKNOWN") return null;
+  return backoffForRateLimitReason(reason);
 }

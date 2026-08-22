@@ -18,6 +18,15 @@
  */
 
 import type { NetworkConfig } from "../types.js";
+import {
+  isContextTooLargeError,
+  isModelNotFoundError,
+  isModelAccessForbiddenError,
+  isPaymentRequiredError,
+  isProviderDegradedError,
+  isProviderBadRequestError,
+  isContentBlockedText,
+} from "../observability/error-classify.js";
 
 /** Classification of an HTTP error by how the failover layer should react. */
 export type ErrorType =
@@ -25,7 +34,9 @@ export type ErrorType =
   | "server-error"
   | "network-error"
   | "auth-error"
-  | "request-error";
+  | "request-error"
+  | "empty-completion"
+  | "invalid-tool-arguments";
 
 /** Default cooldowns when a provider has no explicit NetworkConfig. */
 const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 10000;
@@ -120,6 +131,42 @@ export class CircuitBreaker {
     return "network-error";
   }
 
+  /**
+   * Classify an HTTP error using both the status code AND the response body
+   * text. This is a superset of {@link classifyError} that can distinguish
+   * sub-categories that share a status code:
+   *
+   * - 400 + "context too large" wording → context-too-large (retryable —
+   *   another provider may have a larger window)
+   * - 400 + "content filter" → content-blocked (non-retryable — safety filter)
+   * - 400 + "degraded" → server-error (provider health, not request shape)
+   * - 400 + "api error 400/422" → request-error (provider strict validation)
+   * - 402 → auth-error (payment required, rotate key)
+   * - 403 + model-access wording → auth-error (model off-limits to key tier)
+   * - 404/410 + "not found" wording → request-error (model deprecated)
+   *
+   * Falls back to {@link classifyError} when the body doesn't match any
+   * sub-category pattern.
+   */
+  classifyErrorFromResponse(status: number, bodyText: string): ErrorType {
+    const errObj = { status, message: bodyText } as Record<string, unknown>;
+    // Content-blocked: non-retryable safety filter — don't waste failover.
+    if (isContentBlockedText(bodyText)) return "request-error";
+    // Context too large: retryable — another provider may accept it.
+    if (isContextTooLargeError(errObj)) return "network-error";
+    // Provider degraded (NVIDIA NIM "DEGRADED function"): provider health.
+    if (isProviderDegradedError(errObj)) return "server-error";
+    // Provider bad request (Mistral strict validation): failover to lenient.
+    if (isProviderBadRequestError(errObj)) return "request-error";
+    // Model not found / gone: model deprecated, don't retry this provider.
+    if (isModelNotFoundError(errObj)) return "request-error";
+    // Model access forbidden: 403 with valid key, model off-limits to tier.
+    if (isModelAccessForbiddenError(errObj)) return "auth-error";
+    // Payment required: 402, rotate to a key with credits.
+    if (isPaymentRequiredError(errObj)) return "auth-error";
+    return this.classifyError(status);
+  }
+
   /** Lazily create (or fetch) the state record for a provider. */
   private getOrCreate(providerName: string): CircuitState {
     let state = this.states.get(providerName);
@@ -192,8 +239,15 @@ export class CircuitBreaker {
    * circuit never opens — giving 0 a distinct meaning from 1.
    */
   recordFailure(providerName: string, errorType: ErrorType): void {
-    // Request-level and auth errors don't affect the provider circuit.
-    if (errorType === "request-error" || errorType === "auth-error") {
+    // Request-level, auth, empty-completion, and invalid-tool-arguments errors
+    // don't affect the provider circuit: the provider is healthy, the model
+    // misbehaved. Fail over to the next provider without benching this one.
+    if (
+      errorType === "request-error" ||
+      errorType === "auth-error" ||
+      errorType === "empty-completion" ||
+      errorType === "invalid-tool-arguments"
+    ) {
       return;
     }
 

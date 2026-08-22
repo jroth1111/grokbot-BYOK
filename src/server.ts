@@ -36,7 +36,7 @@ import { SseParser } from "./protocol/sse.js";
 import { ProviderRegistry } from "./providers/registry.js";
 import { CircuitBreaker } from "./providers/failover.js";
 import type { ErrorType } from "./providers/failover.js";
-import { computeBackoff, sleep, shouldRetry } from "./providers/retry.js";
+import { computeBackoff, computeRateLimitBackoff, sleep, shouldRetry } from "./providers/retry.js";
 import { createStreamTimeout } from "./providers/stream-timeout.js";
 import { SessionAffinity } from "./providers/session-affinity.js";
 import { convertRequest } from "./translate/request.js";
@@ -50,9 +50,28 @@ import {
 } from "./translate/response.js";
 import { ToolCallAccumulator } from "./translate/tools.js";
 import { applyCompatToRequest } from "./providers/compat.js";
-import { rescueInlineToolCalls, containsDialectMarker } from "./translate/tool-call-rescue.js";
+import { rescueInlineToolCalls, containsDialectMarker, startsWithDialectMarker, couldBecomeDialectMarker } from "./translate/tool-call-rescue.js";
 import { ThinkTagStreamFilter } from "./translate/think-tags.js";
 import { stripSchemaKeys } from "./translate/tool-args.js";
+import { isToolArgumentValidationEnabled, invalidToolCallReasons } from "./translate/tool-validate.js";
+import { sanitizeProviderErrorMessage } from "./observability/error-redaction.js";
+import {
+  type AttemptOutcome,
+  newRequestTrace,
+} from "./observability/attempt-trace.js";
+import {
+  applyTokenBudget,
+  tokenBudgetMessage,
+  newBreaker,
+  recordBreakerFailure,
+  resetBreaker,
+} from "./observability/guardrails.js";
+import {
+  generateRequestId,
+  createRequestScopedLogger,
+} from "./observability/request-id.js";
+import { metrics } from "./observability/metrics.js";
+import { captureRequestBody, captureResponseSummary } from "./observability/body-capture.js";
 
 /** Connect streaming path served by the shim. */
 const STREAM_PATH = "/aiserver.v1.InferenceService/Stream";
@@ -111,7 +130,7 @@ function startConnectResponse(res: http.ServerResponse, status: number): void {
  * so provider routing state, circuit state, and session bindings persist for
  * the lifetime of the server.
  */
-export function createServer(config: ShimConfig, logger: Logger): http.Server {
+export function createServer(config: ShimConfig, baseLogger: Logger): http.Server {
   const registry = new ProviderRegistry(
     config.providers.configs,
     config.providers.priority,
@@ -137,6 +156,14 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
   );
   cleanupHandle.unref();
 
+  // Periodically log per-provider metrics (requests, error rate, latency
+  // histogram, TTFB). Uses the same interval as session cleanup.
+  const metricsHandle = setInterval(
+    () => metrics.logSummary(baseLogger),
+    SESSION_CLEANUP_INTERVAL_MS,
+  );
+  metricsHandle.unref();
+
   const server = http.createServer(async (req, res) => {
     // Only the streaming inference path is supported.
     if (req.method !== "POST" || req.url !== STREAM_PATH) {
@@ -146,6 +173,12 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
     }
 
     const requestStart = Date.now();
+
+    // Generate a request ID and create a scoped logger that injects it into
+    // every log line. Shadowing the outer `logger` means all existing call
+    // sites automatically include the request ID without any changes.
+    const requestId = generateRequestId();
+    const logger = createRequestScopedLogger(baseLogger, requestId);
 
     // ---------------------------------------------------------------------
     // 1. Read the full request body.
@@ -192,12 +225,15 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
 
       openaiBody = convertRequest(reqJson);
     } catch (err) {
-      logger.error("failed to parse request", { error: err });
+      logger.error("failed to parse request", { error: err, requestBody: body.toString().slice(0, 500) });
       startConnectResponse(res, 200);
       writeFrame(res, makeErrorFrame("failed to parse request"));
       endStream(res);
       return;
     }
+
+    // Capture the request body for debugging (opt-in via CAPTURE_BODIES=true).
+    captureRequestBody(logger, requestId, openaiBody);
 
     // ---------------------------------------------------------------------
     // 5-6. Resolve provider (honoring session affinity) and build the
@@ -252,9 +288,64 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
     });
 
     // ---------------------------------------------------------------------
+    // 6b. Token budget guardrail: pre-flight check that estimated input +
+    //     requested output fits within REQUEST_MAX_TOKENS_BUDGET (env, 0=off).
+    //     Rejects oversized requests before any provider is tried, and caps
+    //     max_tokens when the client didn't specify one.
+    // ---------------------------------------------------------------------
+    const estimatedInputTokens = Math.ceil(
+      JSON.stringify(openaiBody.messages ?? []).length / 4,
+    );
+    const budgetResult = applyTokenBudget(estimatedInputTokens, openaiBody.max_tokens);
+    if (budgetResult.rejection) {
+      logger.warn("token budget exceeded", {
+        model: rawModelId,
+        budget: budgetResult.rejection.budget,
+        estimatedTotal: budgetResult.rejection.estimatedTotal,
+      });
+      startConnectResponse(res, 200);
+      writeFrame(res, makeErrorFrame(tokenBudgetMessage(budgetResult.rejection)));
+      endStream(res);
+      return;
+    }
+    if (budgetResult.maxTokens !== openaiBody.max_tokens) {
+      openaiBody.max_tokens = budgetResult.maxTokens;
+    }
+
+    // Per-request consecutive-failure breaker: bounds the total wasted
+    // attempts across the whole chain (env: MAX_CONSECUTIVE_UPSTREAM_FAILS,
+    // 0 = disabled). When the Nth consecutive fail happens, stop with 503
+    // instead of grinding through every remaining provider.
+    const consecBreaker = newBreaker();
+
+    // ---------------------------------------------------------------------
     // 7-8. Try each provider in the failover chain until one accepts,
     //      retrying within a provider with backoff and key rotation.
+    //      Each attempt is traced for observability (provider, model, outcome,
+    //      duration, error summary) so the failover trail is durable.
     // ---------------------------------------------------------------------
+    const trace = newRequestTrace();
+    let attemptOrdinal = 0;
+    const requestStartTime = Date.now();
+
+    function recordAttempt(
+      providerName: string,
+      modelId: string,
+      outcome: AttemptOutcome,
+      startMs: number,
+      err?: unknown,
+    ): void {
+      trace.records.push({
+        ordinal: attemptOrdinal++,
+        platform: providerName,
+        modelId,
+        keyOrdinal: 0,
+        outcome,
+        startOffsetMs: startMs - requestStartTime,
+        durationMs: Date.now() - startMs,
+        errorSummary: err ? sanitizeProviderErrorMessage(err) : null,
+      });
+    }
     let connected:
       | {
           resp: Response;
@@ -346,17 +437,21 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
               network: provider.network,
               baseUrl: provider.baseUrl,
             };
+            recordAttempt(provider.name, model, "ok", attemptStart);
+            resetBreaker(consecBreaker);
             break providerLoop;
           }
 
-          // Non-2xx: classify the error and react accordingly.
-          const errorType = breaker.classifyError(resp.status);
+          // Non-2xx: read the body first, then classify using both the
+          // status code AND the body text for richer sub-category detection
+          // (context-too-large, content-blocked, model-not-found, etc.).
           let errText = "";
           try {
             errText = await resp.text();
           } catch {
             // ignore body read failure
           }
+          const errorType = breaker.classifyErrorFromResponse(resp.status, errText);
 
           // Auth error: rotate to the next key and retry within this provider.
           // Key rotation does NOT consume a retry attempt — retries are for
@@ -399,6 +494,7 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
               elapsed: Date.now() - attemptStart,
               error: errText.slice(0, 500),
             });
+            recordAttempt(provider.name, model, "provider_bad_request", attemptStart, errText);
             requestError = true;
             break providerLoop;
           }
@@ -418,7 +514,8 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
 
           const decision = shouldRetry(errorType, attempt, maxRetries);
           if (decision === "retry") {
-            const backoff = computeBackoff(attempt, backoffInitialMs, backoffMaxMs);
+            const backoff = computeRateLimitBackoff(errorType, errText) ??
+              computeBackoff(attempt, backoffInitialMs, backoffMaxMs);
             logger.info("retrying after backoff", {
               model,
               provider: provider.name,
@@ -429,6 +526,16 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
             await sleep(backoff);
             continue;
           } else if (decision === "failover") {
+            recordAttempt(provider.name, model, errorType === "rate-limit" ? "rate_limited" : "upstream_error", attemptStart, errText);
+            if (recordBreakerFailure(consecBreaker)) {
+              logger.warn("consecutive failure breaker tripped", {
+                model: rawModelId,
+                consecutive: consecBreaker.consecutive,
+                limit: consecBreaker.limit,
+              });
+              requestError = true;
+              break providerLoop;
+            }
             break;
           } else {
             // "stop" — should not occur for non-request errors, but handle it.
@@ -449,7 +556,8 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
 
           const decision = shouldRetry(errorType, attempt, maxRetries);
           if (decision === "retry") {
-            const backoff = computeBackoff(attempt, backoffInitialMs, backoffMaxMs);
+            const backoff = computeRateLimitBackoff(errorType, err instanceof Error ? err.message : String(err)) ??
+              computeBackoff(attempt, backoffInitialMs, backoffMaxMs);
             logger.info("retrying after backoff", {
               model,
               provider: provider.name,
@@ -460,6 +568,16 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
             await sleep(backoff);
             continue;
           } else if (decision === "failover") {
+            recordAttempt(provider.name, model, "timeout", attemptStart, err);
+            if (recordBreakerFailure(consecBreaker)) {
+              logger.warn("consecutive failure breaker tripped", {
+                model: rawModelId,
+                consecutive: consecBreaker.consecutive,
+                limit: consecBreaker.limit,
+              });
+              requestError = true;
+              break providerLoop;
+            }
             break;
           } else {
             requestError = true;
@@ -487,6 +605,21 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
     // 9. All providers failed: emit an error and end the stream.
     // ---------------------------------------------------------------------
     if (!connected) {
+      // Log the attempt trail for observability: which providers were tried,
+      // what errors they returned, and how long each took.
+      if (trace.records.length > 0) {
+        logger.warn("failover trail", {
+          model: rawModelId,
+          trail: trace.records.map((r) => ({
+            ordinal: r.ordinal,
+            provider: r.platform,
+            model: r.modelId,
+            outcome: r.outcome,
+            durationMs: r.durationMs,
+            error: r.errorSummary,
+          })),
+        });
+      }
       logger.error("all providers failed", {
         model: rawModelId,
         failoverChain: failoverChain.map((p) => p.name),
@@ -539,11 +672,24 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
       const thinkFilter = new ThinkTagStreamFilter();
       const decoder = new TextDecoder();
 
+      // Streaming hold-window for inline tool-call dialect detection. When
+      // the request declares tools, text deltas are buffered while they could
+      // still be a dialect marker (Kimi/DeepSeek tokens, Llama <function=>,
+      // Qwen XML). Once the buffer diverges from all markers (or exceeds 256
+      // bytes), it's flushed as content. At stream end, a dialect buffer is
+      // rescued into structured tool calls.
+      const wantsTools = (openaiBody.tools ?? []).length > 0;
+      let heldText = "";
+      let dialectMode: "hold" | "dialect" | "passthrough" = wantsTools ? "hold" : "passthrough";
+
       let sawFinish = false;
       let streamError = false;
       let hasVisibleContent = false;
       let promptTokens = 0;
       let completionTokens = 0;
+      // Time to first token (TTFB): timestamp of the first content/reasoning
+      // delta. Key latency metric — measures provider prefill + network.
+      let ttfbMs: number | undefined;
       let totalTokens: number | undefined;
       let reasoningTokens: number | undefined;
       let cachedTokens: number | undefined;
@@ -637,6 +783,7 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
               delta.reasoning_text ||
               "";
             if (reasoningText) {
+              if (ttfbMs === undefined) ttfbMs = Date.now() - requestStart;
               frames.push(makeTextFrame(reasoningText, false));
               if (reasoningText.length > 0) {
                 hasVisibleContent = true;
@@ -644,15 +791,32 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
             }
             if (delta.content) {
               // DeepSeek-style models serialize reasoning INTO content as
-              // <think>…</think> blocks. Split them back out into reasoning
+              // ​​ blocks. Split them back out into reasoning
               // vs content via the stateful stream filter (handles tag splits
               // across chunk boundaries without buffering the whole stream).
               const split = thinkFilter.push(delta.content);
               if (split.reasoning) {
                 frames.push(makeTextFrame(split.reasoning, false));
               }
-              if (split.content) {
-                frames.push(makeTextFrame(split.content, false));
+              // Feed the content split through the dialect hold-window: if
+              // the request has tools, buffer text while it could still be
+              // an inline tool-call dialect marker. Once it diverges, flush.
+              const textToEmit = split.content;
+              if (textToEmit.length > 0) {
+                if (ttfbMs === undefined) ttfbMs = Date.now() - requestStart;
+                if (dialectMode === "passthrough") {
+                  frames.push(makeTextFrame(textToEmit, false));
+                } else {
+                  heldText += textToEmit;
+                  const probe = heldText.trimStart();
+                  if (startsWithDialectMarker(probe)) {
+                    dialectMode = "dialect";
+                  } else if (!couldBecomeDialectMarker(probe) || heldText.length > 256) {
+                    dialectMode = "passthrough";
+                    frames.push(makeTextFrame(heldText, false));
+                    heldText = "";
+                  }
+                }
               }
               if (delta.content.length > 0) {
                 hasVisibleContent = true;
@@ -822,34 +986,23 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
           frames.push(makeTextFrame(thinkTail.content, false));
         }
 
-        // Inline tool-call dialect rescue: when a model emits tool calls as
-        // TEXT in a private training dialect (Kimi/DeepSeek tokens, Llama
-        // <function=>, Qwen XML) instead of a structured tool_calls array,
-        // re-parse them. This happens most often after failover switches
-        // models mid-task. Collect all text content, check for dialect
-        // markers, and inject rescued calls as toolCallPart frames.
-        if (toolAcc.size === 0 && !streamError) {
-          const textContent = frames
-            .map((f) => (f as { textPart?: { text: string; isFinal: boolean } }).textPart)
-            .filter((tp): tp is { text: string; isFinal: boolean } =>
-              tp !== undefined && !tp.isFinal,
-            )
-            .map((tp) => tp.text)
-            .join("");
-          if (containsDialectMarker(textContent)) {
+        // Flush the dialect hold-window. If we buffered text that turned out
+        // to be an inline tool-call dialect (Kimi/DeepSeek tokens, Llama
+        // <function=>, Qwen XML), rescue it into structured tool calls.
+        // Detected-but-unparseable = dead turn (the model emitted gibberish).
+        if (heldText.length > 0) {
+          if ((dialectMode as string) === "dialect" || containsDialectMarker(heldText)) {
             const toolNames = new Set(
               (openaiBody.tools ?? []).map((t) => t.function.name),
             );
-            const rescue = rescueInlineToolCalls(textContent, toolNames);
-            if (rescue.calls && rescue.calls.length > 0) {
-              // Remove the text frames that carried the dialect (they're
-              // now tool calls, not prose) and inject tool-call frames.
-              for (let i = frames.length - 1; i >= 0; i--) {
-                const tp = (frames[i] as { textPart?: { isFinal: boolean } }).textPart;
-                if (tp !== undefined && !tp.isFinal) {
-                  frames.splice(i, 1);
-                }
-              }
+            const rescue = rescueInlineToolCalls(heldText, toolNames);
+            if (rescue.detected && !rescue.calls) {
+              logger.warn("unparseable inline tool-call dialect", {
+                model,
+                provider: providerName,
+              });
+              streamError = true;
+            } else if (rescue.detected && rescue.calls && rescue.calls.length > 0) {
               if (rescue.cleanText.length > 0) {
                 frames.push(makeTextFrame(rescue.cleanText, false));
               }
@@ -863,10 +1016,14 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
                 model,
                 provider: providerName,
                 count: rescue.calls.length,
-                dialect: "inline",
               });
+            } else {
+              frames.push(makeTextFrame(heldText, false));
             }
+          } else {
+            frames.push(makeTextFrame(heldText, false));
           }
+          heldText = "";
         }
 
         // Flush accumulated tool calls. When the stream errored, emit them as
@@ -874,6 +1031,29 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
         const toolFrames = toolAcc.flush(!streamError);
         for (const frame of toolFrames) {
           frames.push(frame);
+        }
+
+        // Tool argument validation (OFF by default, env: VALIDATE_TOOL_ARGUMENTS).
+        // When enabled, validate flushed tool calls against their schemas. A
+        // definite schema violation marks the turn as errored so the failover
+        // loop can try the next provider — the provider is healthy, the model
+        // misbehaved. Fails open: no schema, unparseable args, or un-compilable
+        // schema all pass through untouched.
+        if (!streamError && isToolArgumentValidationEnabled() && toolAcc.size > 0) {
+          const schemas = toolAcc.getSchemaMap();
+          const calls = toolFrames.map((f) => {
+            const tc = (f as { toolCallPart?: { toolCallId?: string; toolCall?: { name?: string; arguments?: string } } }).toolCallPart;
+            return tc?.toolCall ? { function: tc.toolCall } : undefined;
+          }).filter((c): c is { function: { name?: string; arguments?: string } } => c !== undefined);
+          const reasons = invalidToolCallReasons(calls, schemas);
+          if (reasons.length > 0) {
+            logger.warn("invalid tool arguments", {
+              model,
+              provider: providerName,
+              reasons,
+            });
+            streamError = true;
+          }
         }
 
         // Emit usage totals (including extended token details if the provider
@@ -901,8 +1081,18 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
           cachedTokens,
           toolCalls: toolAcc.size,
           streamError,
+          ttfbMs,
           elapsed: Date.now() - requestStart,
         });
+        metrics.recordRequest(
+          providerName,
+          !streamError,
+          Date.now() - requestStart,
+          ttfbMs,
+        );
+        // Capture the response summary for debugging (opt-in via
+        // CAPTURE_BODIES=true). Logs first N text frames + tool call names.
+        captureResponseSummary(logger, requestId, frames);
       }
 
       return {
@@ -964,7 +1154,8 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
     }
     shuttingDown = true;
     clearInterval(cleanupHandle);
-    logger.info("server shutting down", {});
+    clearInterval(metricsHandle);
+    baseLogger.info("server shutting down", {});
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(1), SHUTDOWN_GRACE_MS).unref();
   };

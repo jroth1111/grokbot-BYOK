@@ -38,6 +38,11 @@ export class ToolCallAccumulator {
     this.schemaMap = toolSchemaMap(tools);
   }
 
+  /** Expose the schema map for tool-argument validation. */
+  getSchemaMap(): Map<string, JsonSchemaish> {
+    return this.schemaMap;
+  }
+
   /**
    * Feed an OpenAI SSE chunk's tool_calls deltas into the accumulator.
    *

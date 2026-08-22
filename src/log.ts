@@ -11,6 +11,7 @@
  * bigint never throws inside `JSON.stringify`.
  */
 import type { Logger, LogLevel } from "./types.js";
+import { sanitizeProviderErrorMessage } from "./observability/error-redaction.js";
 
 /**
  * Build a JSON.stringify replacer that handles `BigInt`, `Error`, and
@@ -53,7 +54,7 @@ function makeReplacer(): (this: Record<string, unknown>, key: string, value: unk
       return original.toString();
     }
     if (original instanceof Error) {
-      return { message: original.message, stack: original.stack };
+      return { message: sanitizeProviderErrorMessage(original.message), stack: original.stack };
     }
     if (Buffer.isBuffer(original)) {
       return original.toString("utf8");

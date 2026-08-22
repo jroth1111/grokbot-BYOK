@@ -19,6 +19,15 @@ import { createServer } from "./server.js";
 import type { ShimConfig } from "./types.js";
 import { writeFileSync, readFileSync, unlinkSync, existsSync } from "node:fs";
 import { sleep } from "./providers/retry.js";
+import { installProcessSafetyNet } from "./observability/process-safety-net.js";
+import { installLogRedaction } from "./observability/log-redaction.js";
+
+// Console-level credential redaction must be installed before anything else
+// logs — provider keys reach stdout through undici error stacks, debug lines,
+// and URL logging. This wraps console.log/info/warn/error/debug/trace so no
+// credential (sk-*, gsk_*, AIza*, Bearer tokens, JWTs, etc.) ever reaches
+// stdout, even from code that hasn't been written yet.
+installLogRedaction();
 
 // The logger is created before config loading so that a config error can be
 // emitted as a structured log line rather than crashing with a raw stack
@@ -178,14 +187,10 @@ server.on("error", (err: NodeJS.ErrnoException) => {
 // owns the HTTP server and clears its session-affinity cleanup interval. When
 // it calls process.exit(0), the 'exit' handler above releases the PID lock.
 
-// Never let an unexpected error slip by silently. Once a handler is registered
-// for uncaughtException / unhandledRejection, Node no longer exits on its own,
-// so we must exit explicitly — continuing in an unknown state is unsafe.
-process.on("uncaughtException", (err) => {
-  logger.error("uncaughtException", { error: err });
-  process.exit(1);
-});
-process.on("unhandledRejection", (err) => {
-  logger.error("unhandledRejection", { error: err });
-  process.exit(1);
+// Process-level safety net: swallow transient transport errors (ECONNRESET,
+// UND_ERR_SOCKET, etc.) that fire after a fetch() has already resolved — a
+// CDN edge resetting a socket must never take the process down. Everything
+// else (programming bugs) stays fatal (exit 1) to surface loudly.
+installProcessSafetyNet({
+  log: (...args) => logger.error("process-safety-net", { detail: args }),
 });
