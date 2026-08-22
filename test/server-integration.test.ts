@@ -1199,3 +1199,82 @@ describe("server integration: per-provider request timeout", () => {
     5000,
   );
 });
+
+describe("server integration: client disconnect stops failover", () => {
+  let shim: { server: http.Server; port: number };
+  let primary: MockUpstream;
+  let secondary: MockUpstream;
+
+  beforeAll(async () => {
+    // Primary stalls (accepts connection, sends 200 head, never sends body).
+    // This causes the shim to wait for TTFB/content. When the client
+    // disconnects during this wait, the failover loop must NOT try the
+    // secondary — there's no one listening.
+    primary = await startMockUpstream({ stall: true });
+    secondary = await startMockUpstream({ sseChunks: textSseChunks() });
+    const network: NetworkConfig = { streamIdleTimeoutMs: 30000 };
+    const config = makeConfig(
+      { primary: primary.url, secondary: secondary.url },
+      { failover: true, providerOverrides: { primary: { network }, secondary: { network } } },
+    );
+    shim = await startShim(config);
+  });
+
+  afterAll(() => cleanup(shim.server, primary.server, secondary.server));
+
+  it(
+    "does not failover to the secondary when the client disconnects mid-stream",
+    async () => {
+      // Send a request but abort it immediately after the request body is
+      // written — simulating a client that disconnects while the primary
+      // is still producing its first token (stall).
+      const framed = encodeEnvelope(DATA_FLAGS, Buffer.from(JSON.stringify(basicRequest()), "utf8"));
+      const req = http.request({
+        hostname: "127.0.0.1",
+        port: shim.port,
+        path: STREAM_PATH,
+        method: "POST",
+        headers: {
+          "Content-Type": CONTENT_TYPE,
+          "Content-Length": String(framed.length),
+        },
+      });
+
+      // Abort the request as soon as it's sent.
+      const abortPromise = new Promise<void>((resolve) => {
+        req.on("error", () => {
+          // ECONNRESET expected when we abort — resolve silently.
+          resolve();
+        });
+        req.write(framed);
+        req.end();
+        // Give the shim a moment to receive the request and start the
+        // upstream connection, then abort the client side.
+        setTimeout(() => req.destroy(), 50);
+      });
+
+      // Wait for the abort to complete (or timeout after 5s).
+      await Promise.race([
+        abortPromise,
+        new Promise<void>((_, reject) => setTimeout(() => reject(new Error("abort timeout")), 5000)),
+      ]).catch(() => {
+        // If the abort promise times out, that's fine — the key assertion
+        // is on the call counts below.
+      });
+
+      // Give the shim a moment to process the disconnect and potentially
+      // (incorrectly) failover. The stall timeout is 30s, so without the
+      // fix the shim would still be waiting on the primary at this point.
+      // Wait long enough for the disconnect to be detected and the
+      // failover loop to (not) run.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      // The primary was contacted (the stall connection was made).
+      expect(primary.callCount.value).toBe(1);
+      // The secondary must NOT have been contacted — the client
+      // disconnected, so there's no point failing over.
+      expect(secondary.callCount.value).toBe(0);
+    },
+    10000,
+  );
+});

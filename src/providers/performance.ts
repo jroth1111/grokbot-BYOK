@@ -175,8 +175,20 @@ class PerformanceTracker {
       p.errorRate = success ? 0 : 1;
     } else {
       if (reqPrefillMsPerToken !== undefined) {
-        p.prefillMsPerPromptToken =
-          ALPHA * reqPrefillMsPerToken + (1 - ALPHA) * p.prefillMsPerPromptToken;
+        // If the stored value is still the sentinel (no prefill data was
+        // recorded in prior samples — e.g. the first sample(s) were
+        // failures with no TTFB), initialize directly from this sample
+        // instead of blending the sentinel (-1) into the EWMA. Blending
+        // -1 with a real rate (e.g. 0.1) produces a negative value that
+        // bypasses the sentinel check in score() and makes the provider
+        // look artificially fast (negative prefill → negative score →
+        // always wins routing).
+        if (p.prefillMsPerPromptToken === NO_PREFILL_DATA) {
+          p.prefillMsPerPromptToken = reqPrefillMsPerToken;
+        } else {
+          p.prefillMsPerPromptToken =
+            ALPHA * reqPrefillMsPerToken + (1 - ALPHA) * p.prefillMsPerPromptToken;
+        }
       }
       // Only update throughput EWMA from requests that actually produced
       // tokens. A failed request (completionTokens=0) yields tokensPerSec=0,
@@ -239,8 +251,12 @@ class PerformanceTracker {
     const generationMs = msPerToken * refCompletion;
 
     // Combined: estimated total time for the reference workload,
-    // penalized by error rate.
-    const errorPenalty = 1 + p.errorRate * ERROR_PENALTY * 10;
+    // penalized by error rate. Each unit of error rate (0..1) increases
+    // the score by ERROR_PENALTY (20%), so a fully failing provider
+    // (errorRate=1) gets a 1.2x penalty — enough to deprioritize it
+    // without making the score explode (which would prevent re-exploration
+    // once the provider recovers).
+    const errorPenalty = 1 + p.errorRate * ERROR_PENALTY;
     const baseScore = (prefillMs + generationMs) * errorPenalty;
 
     // Staleness decay: reduce the score for providers with stale data
@@ -291,7 +307,7 @@ class PerformanceTracker {
           : Math.round(p.prefillMsPerPromptToken * 1000) / 1000,
         avgTokensPerSec: Math.round(p.tokensPerSec * 10) / 10,
         errorRate: Math.round(p.errorRate * 100) / 100,
-        score: Math.round(this.score(provider) / 10) / 100,
+        score: Math.round(this.score(provider) * 100) / 100,
         ageMs: this.ageMs(provider),
         refPromptTokens: refPrompt,
         refCompletionTokens: refCompletion,
@@ -331,3 +347,7 @@ class PerformanceTracker {
 
 /** Singleton performance tracker shared across all requests. */
 export const performanceTracker = new PerformanceTracker();
+
+// Exported for testing so tests can create isolated instances without
+// contaminating (or being contaminated by) the shared singleton.
+export { PerformanceTracker };

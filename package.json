@@ -1,7 +1,7 @@
 {
   "name": "grokbot-byok",
   "version": "2.0.0",
-  "description": "Connect-RPC to OpenAI translation shim for Cursor sand-host BYOK inference",
+  "description": "GrokBot BYOK (Bring Your Own Key) inference adapter",
   "type": "module",
   "main": "dist/shim.js",
   "scripts": {

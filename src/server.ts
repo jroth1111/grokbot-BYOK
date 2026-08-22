@@ -496,7 +496,11 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       }
       body = Buffer.concat(chunks);
     } catch (err) {
-      logger.error("failed to read request body", { error: err });
+      // Client-side issue (network error reading the request body) — not a
+      // provider health problem. Logged at warn (not error) so the health
+      // check doesn't count it as a provider failure and trigger a false
+      // CRITICAL / auto-deploy.
+      logger.warn("failed to read request body", { error: err });
       startConnectResponse(res, 200);
       writeFrame(res, makeErrorFrame("failed to read request body"));
       endStream(res);
@@ -530,7 +534,21 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
 
       openaiBody = convertRequest(reqJson);
     } catch (err) {
-      logger.error("failed to parse request", { error: err, requestBody: body.toString().slice(0, 500) });
+      // Client-side issue (malformed Connect envelope, wrong content type
+      // like protobuf, or invalid JSON) — not a provider health problem.
+      // Logged at warn (not error) so the health check doesn't count it as
+      // a provider failure and trigger a false CRITICAL / auto-deploy.
+      //
+      // Log a hex preview of the first 32 bytes instead of the raw body:
+      // the raw body may contain the full system prompt / user message
+      // (privacy concern), and for binary payloads (e.g. protobuf) the
+      // UTF-8 dump is garbled and unhelpful. The hex preview is enough to
+      // diagnose content-type mismatches (e.g. protobuf vs JSON).
+      logger.warn("failed to parse request", {
+        error: err,
+        bodyLength: body.length,
+        bodyPreview: body.subarray(0, 32).toString("hex"),
+      });
       startConnectResponse(res, 200);
       writeFrame(res, makeErrorFrame("failed to parse request"));
       endStream(res);
@@ -1653,14 +1671,25 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         // loop will fail over. Recording it as success would hide the
         // failure from the error rate, making the provider look more
         // reliable than it really is.
-        performanceTracker.record(
-          providerName,
-          hasVisibleContent && !streamError,
-          ttfbMs,
-          promptTokens,
-          completionTokens,
-          Date.now() - streamStartMs,
-        );
+        //
+        // Skip recording when the client disconnected: a client-side abort
+        // is not a provider failure. The provider may have been responding
+        // fine (just slowly), and recording the empty completion as a
+        // failure would inflate the error rate with non-provider errors,
+        // contaminating latency routing. This was the root cause of the
+        // sentinel-blending bug: client disconnects → 0 tokens → recorded
+        // as failure → sentinel stored → next real request blends with
+        // sentinel → negative prefill rate → provider always wins routing.
+        if (!clientDisconnected) {
+          performanceTracker.record(
+            providerName,
+            hasVisibleContent && !streamError,
+            ttfbMs,
+            promptTokens,
+            completionTokens,
+            Date.now() - streamStartMs,
+          );
+        }
         // Capture the response summary for debugging (opt-in via
         // CAPTURE_BODIES=true). Logs first N text frames + tool call names.
         captureResponseSummary(logger, requestId, frames);
@@ -1706,6 +1735,20 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       emptyAttempt <= MAX_EMPTY_COMPLETION_RETRIES;
       emptyAttempt++
     ) {
+      // If the client disconnected (closed the response connection before
+      // the stream completed), stop immediately — there's no point retrying
+      // with the next provider since no one is listening. Without this
+      // check, a client that disconnects during the first attempt's TTFB
+      // wait would cause the shim to burn through every provider in the
+      // failover chain, wasting upstream quota on a response that will
+      // never be delivered.
+      if (clientDisconnected) {
+        logger.info("client disconnected before failover attempt, stopping", {
+          attempt: emptyAttempt,
+          elapsed: Date.now() - requestStart,
+        });
+        break;
+      }
       if (emptyAttempt > 0) {
         await sleep(EMPTY_COMPLETION_BASE_DELAY_MS * 2 ** (emptyAttempt - 1));
       }
