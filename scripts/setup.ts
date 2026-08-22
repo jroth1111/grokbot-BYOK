@@ -477,12 +477,23 @@ async function main(): Promise<void> {
       const patchScript = path.join(distDir, "scripts", "patch-host.js");
       if (existsSync(patchScript)) {
         info("Patching Cursor host to route through shim...");
+        let patched = false;
         try {
           execSync(`node ${JSON.stringify(patchScript)}`, { stdio: quiet ? "pipe" : "inherit", cwd: projectRoot });
           ok("Host patched — Cursor inference now routes through the shim");
+          patched = true;
         } catch {
           warn("Host patch failed — shim is running but Cursor is not hooked in.");
           warn("Run manually: node dist/scripts/patch-host.js");
+        }
+        // Kill the running host process so the supervisor restarts it
+        // with the patched code. Without this, the old process keeps
+        // running the unpatched code in memory.
+        if (patched) {
+          try {
+            execSync('pkill -f "host-main.cjs"', { stdio: "ignore" });
+            ok("Host process killed — supervisor will restart it with the patched code");
+          } catch { /* no running host process */ }
         }
       } else { warn("Host patch: dist/scripts/patch-host.js not found"); }
     } else {
