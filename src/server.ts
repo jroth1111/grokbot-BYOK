@@ -75,6 +75,7 @@ import {
   createRequestScopedLogger,
 } from "./observability/request-id.js";
 import { metrics } from "./observability/metrics.js";
+import { performanceTracker } from "./providers/performance.js";
 import { captureRequestBody, captureResponseSummary } from "./observability/body-capture.js";
 
 /** Connect streaming path served by the shim. */
@@ -243,7 +244,14 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
   // Periodically log per-provider metrics (requests, error rate, latency
   // histogram, TTFB). Uses the same interval as session cleanup.
   const metricsHandle = setInterval(
-    () => metrics.logSummary(baseLogger),
+    () => {
+      metrics.logSummary(baseLogger);
+      // Log performance scores for latency-based routing.
+      const perf = performanceTracker.snapshot();
+      for (const [provider, p] of Object.entries(perf)) {
+        baseLogger.info("provider performance", { provider, ...p });
+      }
+    },
     SESSION_CLEANUP_INTERVAL_MS,
   );
   metricsHandle.unref();
@@ -1406,6 +1414,14 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
           !streamError,
           Date.now() - requestStart,
           ttfbMs,
+        );
+        // Record performance data for latency-based routing.
+        performanceTracker.record(
+          providerName,
+          !streamError,
+          ttfbMs,
+          completionTokens,
+          Date.now() - requestStart,
         );
         // Capture the response summary for debugging (opt-in via
         // CAPTURE_BODIES=true). Logs first N text frames + tool call names.

@@ -21,6 +21,7 @@
  */
 import type { Provider, ProviderConfig, RoutingStrategy } from "../types.js";
 import { BaseProvider, normalizeModelId } from "./base.js";
+import { performanceTracker } from "./performance.js";
 
 export class ProviderRegistry {
   private providers: Map<string, Provider> = new Map();
@@ -90,6 +91,11 @@ export class ProviderRegistry {
       }
     } else if (this.strategy === "weighted-round-robin") {
       const selected = this.selectWeighted(normalizedId);
+      if (selected) {
+        return { provider: selected, normalizedId };
+      }
+    } else if (this.strategy === "latency") {
+      const selected = this.selectByLatency(normalizedId);
       if (selected) {
         return { provider: selected, normalizedId };
       }
@@ -195,6 +201,48 @@ export class ProviderRegistry {
   }
 
   /**
+   * Latency-based selection: among providers that canHandle the model,
+   * pick the one with the best combined TTFB + tokens/sec score.
+   *
+   * Providers with insufficient data (< MIN_SAMPLES) are ordered by
+   * priority position as a tiebreaker — this ensures new providers get
+   * tried and accumulate samples before being ranked by performance.
+   *
+   * The failover chain (built by getFailoverChain) follows the same
+   * performance ordering so failover goes to the next-best provider.
+   */
+  private selectByLatency(normalizedId: string): Provider | undefined {
+    const eligible = this.eligibleProviders(normalizedId);
+    if (eligible.length === 0) {
+      return undefined;
+    }
+    if (eligible.length === 1) {
+      return eligible[0];
+    }
+
+    // Sort by performance score (lower is better). Providers with no
+    // data (score = Infinity) are ordered by their priority position
+    // so they get tried before poor-performing providers but after
+    // good-performing ones.
+    const ranked = eligible
+      .map((p, idx) => ({ provider: p, score: performanceTracker.score(p.name), priorityIdx: idx }))
+      .sort((a, b) => {
+        // Both have data: compare scores directly.
+        if (a.score !== Infinity && b.score !== Infinity) {
+          return a.score - b.score;
+        }
+        // Both have no data: use priority order.
+        if (a.score === Infinity && b.score === Infinity) {
+          return a.priorityIdx - b.priorityIdx;
+        }
+        // One has data, one doesn't: prefer the one with data.
+        return a.score === Infinity ? 1 : -1;
+      });
+
+    return ranked[0].provider;
+  }
+
+  /**
    * Providers (in priority order) that canHandle the given normalized model
    * id. Only providers listed in the priority order are considered.
    */
@@ -246,7 +294,8 @@ export class ProviderRegistry {
     if (
       normalizedModelId !== undefined &&
       (this.strategy === "round-robin" ||
-        this.strategy === "weighted-round-robin")
+        this.strategy === "weighted-round-robin" ||
+        this.strategy === "latency")
     ) {
       return this.strategyAwareChain(primaryProvider, normalizedModelId);
     }
@@ -302,6 +351,20 @@ export class ProviderRegistry {
       for (let i = 0; i < eligible.length; i++) {
         orderedEligible.push(eligible[(start + i) % eligible.length]);
       }
+    } else if (this.strategy === "latency") {
+      // Latency: remaining eligible providers by ascending performance score
+      // (best first). Providers with no data use priority order as tiebreaker.
+      orderedEligible = [...eligible].sort((a, b) => {
+        const sa = performanceTracker.score(a.name);
+        const sb = performanceTracker.score(b.name);
+        if (sa !== Infinity && sb !== Infinity) return sa - sb;
+        if (sa === Infinity && sb === Infinity) {
+          const ia = this.priorityOrder.indexOf(a.name);
+          const ib = this.priorityOrder.indexOf(b.name);
+          return ia - ib;
+        }
+        return sa === Infinity ? 1 : -1;
+      });
     } else {
       // weighted-round-robin: remaining eligible providers by descending weight.
       orderedEligible = [...eligible].sort(

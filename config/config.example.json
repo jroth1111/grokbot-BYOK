@@ -4,7 +4,7 @@
   "logDir": "",
   "failover": true,
   "requestTimeoutMs": 30000,
-  "routingStrategy": "priority",
+  "routingStrategy": "latency",
   "sessionAffinity": {
     "enabled": false,
     "ttlMs": 3600000

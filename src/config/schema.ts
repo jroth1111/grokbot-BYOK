@@ -86,7 +86,7 @@ export const shimConfigSchema = z.object({
   logDir: z.string().default(""),
   failover: z.boolean().default(true),
   requestTimeoutMs: z.number().positive().default(30000),
-  routingStrategy: z.enum(["priority", "round-robin", "weighted-round-robin", "fill-first"]).default("priority"),
+  routingStrategy: z.enum(["priority", "round-robin", "weighted-round-robin", "fill-first", "latency"]).default("priority"),
   sessionAffinity: sessionAffinitySchema,
   visionFallbackModel: z.string().default(""),
   providers: providersSchema,

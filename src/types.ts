@@ -212,7 +212,7 @@ export type InferenceStreamResponse =
 // ---------------------------------------------------------------------------
 
 /** Routing strategy for selecting among providers that can handle a model. */
-export type RoutingStrategy = "priority" | "round-robin" | "weighted-round-robin" | "fill-first";
+export type RoutingStrategy = "priority" | "round-robin" | "weighted-round-robin" | "fill-first" | "latency";
 
 /** A single API key with optional weight. */
 export interface KeyInfo {
