@@ -85,9 +85,9 @@ export function captureResponseSummary(
       textParts.push(tp.text);
       totalLen += tp.text.length;
     }
-    const tc = frame.toolCallPart as { toolCall?: { name?: string } } | undefined;
-    if (tc?.toolCall?.name) {
-      toolCalls.push(tc.toolCall.name);
+    const tc = frame.toolCallPart as { toolName?: string } | undefined;
+    if (tc?.toolName) {
+      toolCalls.push(tc.toolName);
     }
   }
   logger.info("captured response summary", {

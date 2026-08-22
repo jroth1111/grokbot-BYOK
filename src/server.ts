@@ -495,6 +495,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
               error: errText.slice(0, 500),
             });
             recordAttempt(provider.name, model, "provider_bad_request", attemptStart, errText);
+            metrics.recordRequest(provider.name, false, Date.now() - attemptStart);
             requestError = true;
             break providerLoop;
           }
@@ -527,6 +528,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
             continue;
           } else if (decision === "failover") {
             recordAttempt(provider.name, model, errorType === "rate-limit" ? "rate_limited" : "upstream_error", attemptStart, errText);
+            metrics.recordRequest(provider.name, false, Date.now() - attemptStart);
             if (recordBreakerFailure(consecBreaker)) {
               logger.warn("consecutive failure breaker tripped", {
                 model: rawModelId,
@@ -544,6 +546,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
           }
         } catch (err) {
           clearTimeout(timeoutHandle);
+          const isAbort = err instanceof Error && err.name === "AbortError";
           const errorType: ErrorType = "network-error";
           breaker.recordFailure(provider.name, errorType);
           logger.warn("upstream fetch failed", {
@@ -568,7 +571,8 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
             await sleep(backoff);
             continue;
           } else if (decision === "failover") {
-            recordAttempt(provider.name, model, "timeout", attemptStart, err);
+            recordAttempt(provider.name, model, isAbort ? "timeout" : "upstream_error", attemptStart, err);
+            metrics.recordRequest(provider.name, false, Date.now() - attemptStart);
             if (recordBreakerFailure(consecBreaker)) {
               logger.warn("consecutive failure breaker tripped", {
                 model: rawModelId,
@@ -1147,6 +1151,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       if (emptyAttempt > 0) {
         await sleep(EMPTY_COMPLETION_BASE_DELAY_MS * 2 ** (emptyAttempt - 1));
       }
+      const emptyAttemptStart = Date.now();
       const result = await attemptStream(
         emptyAttempt === 0 ? firstResp : undefined,
       );
@@ -1154,6 +1159,9 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       if (result.hasVisibleContent || result.streamError) {
         break;
       }
+      // Record the empty-completion attempt in the trace so the failover
+      // trail shows the retries (not just the final outcome).
+      recordAttempt(providerName, model, "empty_completion", emptyAttemptStart, "empty completion");
       if (emptyAttempt < MAX_EMPTY_COMPLETION_RETRIES) {
         logger.info("empty completion, retrying", {
           model,
