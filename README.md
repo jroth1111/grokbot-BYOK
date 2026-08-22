@@ -5,17 +5,17 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.3-blue.svg)](https://www.typescriptlang.org/)
 [![Tests: 359](https://img.shields.io/badge/Tests-359%20passed-brightgreen.svg)](#tests)
 
-**Route your AI editor's inference through your own LLM API keys.**
+**Route Grokbot's AI inference through your own LLM API keys.**
 
-Grokbot is a local proxy that intercepts your AI editor's inference calls
+Grokbot BYOK is a local proxy that intercepts Grokbot's inference calls
 (chat, tab-completion, agent mode) and routes them to any OpenAI-compatible
 LLM provider you choose: OpenRouter, OpenCode, Kilo, a local model server,
 or all of the above with automatic failover. No more paying for the
-editor's hosted backend.
+hosted backend.
 
-You bring the keys (BYOK = Bring Your Own Key). Grokbot handles the rest:
-protocol translation, routing, failover, and automatic re-patching when
-the editor updates itself.
+You bring the keys (BYOK = Bring Your Own Key). Grokbot BYOK handles the
+rest: protocol translation, routing, failover, and automatic re-patching
+when Grokbot updates itself.
 
 ---
 
@@ -47,39 +47,39 @@ the editor updates itself.
 
 ## What it does
 
-Grokbot talks to its inference backend using Connect-RPC, a
+Grokbot talks to Grokbot BYOK (this project) using Connect-RPC, a
 gRPC-over-HTTP streaming protocol with binary-framed envelopes. The
 backends themselves are OpenAI-compatible chat completion endpoints, but
 the wire format is different. Grokbot sends Connect. Providers expect
 OpenAI SSE.
 
-Grokbot sits between them:
+Grokbot BYOK sits between them:
 
 ```mermaid
 graph LR
-    Editor["AI editor<br/>(Connect-RPC, binary)"] -->|"POST /Stream"| Grokbot
-    Grokbot["Grokbot<br/>(localhost:8788)"] -->|"OpenAI SSE (JSON)"| Provider1["OpenRouter"]
-    Grokbot -->|"OpenAI SSE (JSON)"| Provider2["OpenCode Go"]
-    Grokbot -->|"OpenAI SSE (JSON)"| Provider3["Kilo"]
-    Grokbot -->|"OpenAI SSE (JSON)"| Provider4["Local"]
+    Grokbot["Grokbot<br/>(Connect-RPC, binary)"] -->|"POST /Stream"| BYOK
+    BYOK["Grokbot BYOK<br/>(localhost:8788)"] -->|"OpenAI SSE (JSON)"| Provider1["OpenRouter"]
+    BYOK -->|"OpenAI SSE (JSON)"| Provider2["OpenCode Go"]
+    BYOK -->|"OpenAI SSE (JSON)"| Provider3["Kilo"]
+    BYOK -->|"OpenAI SSE (JSON)"| Provider4["Local"]
     Provider1 -->|"your keys"| Keys1["sk-or-xxx"]
     Provider2 -->|"your keys"| Keys2["sk-xxx"]
     Provider3 -->|"keyless"| Keys3["200 req/hr"]
     Provider4 -->|"your keys"| Keys4["sk-local"]
 ```
 
-Grokbot:
-1. **Receives** Connect-RPC streaming requests from the editor
+Grokbot BYOK:
+1. **Receives** Connect-RPC streaming requests from Grokbot
 2. **Translates** them to OpenAI chat completion format
 3. **Routes** to the best available provider (priority, latency, or round-robin)
 4. **Fails over** automatically if a provider errors, rate-limits, or stalls
 5. **Translates** the OpenAI SSE response back to Connect frames
-6. **Streams** the response back to the editor
+6. **Streams** the response back to Grokbot
 
-The editor doesn't know the proxy is there. It thinks it's talking to its
-normal backend. Grokbot patches the host bundle (`host-main.cjs`)
+Grokbot doesn't know the proxy is there. It thinks it's talking to its
+normal backend. Grokbot BYOK patches the host bundle (`host-main.cjs`)
 to redirect inference calls to `localhost:8788`, and a background watcher
-re-applies the patch automatically whenever the editor updates itself.
+re-applies the patch automatically whenever Grokbot updates itself.
 
 ---
 
@@ -88,7 +88,7 @@ re-applies the patch automatically whenever the editor updates itself.
 ### Prerequisites
 
 - Node.js 18+
-- A Cursor-based AI editor installed
+- Grokbot installed
 - At least one LLM API key, or none at all. Kilo is keyless.
 
 ### Install
@@ -98,25 +98,25 @@ re-applies the patch automatically whenever the editor updates itself.
 git clone https://github.com/jroth1111/grokbot-BYOK.git
 cd grokbot-BYOK
 
-# 2. One-command setup (installs deps, builds, patches editor, starts daemons)
+# 2. One-command setup (installs deps, builds, patches Grokbot, starts daemons)
 npm run setup -- --openrouter-key sk-or-xxx --opencode-key sk-xxx
 
 # Or with zero API keys (Kilo is keyless, works out of the box):
 npm run setup
 ```
 
-Your editor's AI features now route through your providers.
+Grokbot's AI features now route through your providers.
 
 ### Verifying it works
 
 ```bash
 npm status                 # Check daemon status (all three should be "running")
-tail -20 /tmp/inference-shim.log  # Check the Grokbot log for errors
-node dist/scripts/live-test.js    # Send a test request through Grokbot
+tail -20 /tmp/inference-shim.log  # Check the Grokbot BYOK log for errors
+node dist/scripts/live-test.js    # Send a test request through Grokbot BYOK
 ```
 
 If `npm status` shows all daemons running and the live test returns text,
-Grokbot is working. If something failed, check
+Grokbot BYOK is working. If something failed, check
 [Troubleshooting](#troubleshooting).
 
 ### API keys
@@ -142,9 +142,9 @@ The setup script is fully non-interactive and does everything in one step:
 2. Copies `config/config.example.json` to `config/config.json` (if not present)
 3. Copies `.env.example` to `.env` (if not present)
 4. Writes API keys from CLI flags / env vars into `.env`
-5. Builds Grokbot + scripts (esbuild to standalone bundles)
+5. Builds Grokbot BYOK + scripts (esbuild to standalone bundles)
 6. Starts three background daemons (see [Managing daemons](#managing-daemons))
-7. Patches the editor's `host-main.cjs` to redirect inference to Grokbot
+7. Patches Grokbot's `host-main.cjs` to redirect inference to Grokbot BYOK
 8. Runs a smoke test
 9. Exits 0 on success, 1 on failure
 
@@ -157,12 +157,12 @@ restarts. It acts as a restart command too.
 
 ### The request lifecycle
 
-Every inference request from the editor follows this path through Grokbot:
+Every inference request from Grokbot follows this path through Grokbot BYOK:
 
 ```mermaid
 sequenceDiagram
-    participant C as Editor
-    participant S as Grokbot
+    participant C as Grokbot
+    participant S as Grokbot BYOK
     participant P as Provider
 
     C->>S: POST /Stream (Connect-RPC, binary)
@@ -185,7 +185,7 @@ sequenceDiagram
 <summary>Detailed step-by-step lifecycle (click to expand)</summary>
 
 ```
- 1. HTTP receive    The editor POSTs a Connect-RPC streaming request to
+ 1. HTTP receive    Grokbot POSTs a Connect-RPC streaming request to
                     /aiserver.v1.InferenceService/Stream
  2. Parse           Connect envelopes are decoded; the data frame is
                     extracted as proto3 JSON (InferenceStreamRequest)
@@ -205,45 +205,45 @@ sequenceDiagram
                     to Connect frames (text, tool calls, usage, thinking)
 10. Retry           If the stream produces no content (empty completion),
                     failover to the next provider
-11. Respond         Write Connect frames back to the editor
+11. Respond         Write Connect frames back to Grokbot
 ```
 
 </details>
 
-Grokbot writes nothing to the outbound response until a provider accepts
-the request, so failover between providers is transparent to the editor.
+Grokbot BYOK writes nothing to the outbound response until a provider accepts
+the request, so failover between providers is transparent to Grokbot.
 
 ### The host patch
 
 > [!WARNING]
-> The setup script modifies the editor's `host-main.cjs` in place. A backup
+> The setup script modifies Grokbot's `host-main.cjs` in place. A backup
 > is saved as `host-main.cjs.bak` so `npm run uninstall` can restore it. If
-> you manually delete the backup, you'll need to reinstall the editor to
+> you manually delete the backup, you'll need to reinstall Grokbot to
 > restore the original file.
 
-The editor's inference client lives in a bundled file called `host-main.cjs`
-(in the `sand-host` directory). Grokbot patches this file to:
+Grokbot's inference client lives in a bundled file called `host-main.cjs`
+(in the `sand-host` directory). Grokbot BYOK patches this file to:
 
 - Set the default model to your configured model
 - Replace the `createCursorInferencePromptSession` function with a
   "routing client" that proxies all `.stream()` calls through the local
-  Grokbot instance (reading the proxy URL from `inference-proxy.url`)
+  Grokbot BYOK instance (reading the proxy URL from `inference-proxy.url`)
 
 A backup of the original file is saved as `host-main.cjs.bak` so the
 uninstall script can restore it.
 
 ### The host watcher
 
-The editor updates its own `host-main.cjs` periodically (on restart or
+Grokbot updates its own `host-main.cjs` periodically (on restart or
 update). A background watcher daemon monitors the file and re-applies the
-patch automatically when it changes. Grokbot keeps working across editor
-updates without manual intervention.
+patch automatically when it changes. Grokbot BYOK keeps working across
+Grokbot updates without manual intervention.
 
 ---
 
 ## Providers
 
-Grokbot routes requests through providers in priority order with automatic
+Grokbot BYOK routes requests through providers in priority order with automatic
 failover. The registry skips providers with missing API keys automatically
 (except keyless ones).
 
@@ -270,7 +270,7 @@ failover. The registry skips providers with missing API keys automatically
 
 ### Where to put API keys
 
-All keys go in `.env` in the project root. Grokbot sources `.env`
+All keys go in `.env` in the project root. Grokbot BYOK sources `.env`
 automatically at startup. See `.env.example` for the full template.
 
 ```bash
@@ -384,7 +384,7 @@ another chance.
 | `SHIM_HOST` | `127.0.0.1` | Override listen host |
 | `SHIM_FAILOVER` | `true` | Set to `0` to disable provider failover |
 | `SHIM_LOG_DIR` | none | Directory for tool-schema dumps (empty = disabled) |
-| `SAND_HOST_DIR` | `$HOME/sand-host` | Editor sand-host directory (where host-main.cjs lives) |
+| `SAND_HOST_DIR` | `$HOME/sand-host` | Grokbot sand-host directory (where host-main.cjs lives) |
 | `CAPTURE_BODIES` | `false` | Log request/response bodies for debugging |
 | `REQUEST_MAX_TOKENS_BUDGET` | `0` (off) | Per-request token cost ceiling |
 | `MAX_CONSECUTIVE_UPSTREAM_FAILS` | `0` (off) | Stop failover after N consecutive failures |
@@ -396,7 +396,7 @@ another chance.
 > **WindsurfAPI** is a local LLM server that runs on `127.0.0.1:3003`. It
 > serves GLM and SWE models using the Devin CLI's session token for auth.
 > The `local` provider in the default config points at it. If you don't
-> have WindsurfAPI installed, Grokbot still works with the other
+> have WindsurfAPI installed, Grokbot BYOK still works with the other
 > providers. The `start-shim` launcher tries to auto-start WindsurfAPI
 > from `../WindsurfAPI` if the local provider is configured and nothing
 > is listening on port 3003.
@@ -421,17 +421,17 @@ npm status                 # Check daemon status
 
 | Daemon | PID file | Log file | Purpose |
 |--------|----------|----------|---------|
-| Grokbot | `/tmp/inference-shim.pid` | `/tmp/inference-shim.log` | The inference proxy itself (port 8788) |
-| Host watcher | `/tmp/grokbot-watch-host.pid` | `/tmp/grokbot-watch-host.log` | Re-patches the editor's host bundle when it updates |
-| Health watchdog | `/tmp/grokbot-health-check.pid` | `/tmp/grokbot-health-check.log` | Monitors Grokbot health, auto-redeploys on failure |
+| Grokbot BYOK | `/tmp/inference-shim.pid` | `/tmp/inference-shim.log` | The inference proxy itself (port 8788) |
+| Host watcher | `/tmp/grokbot-watch-host.pid` | `/tmp/grokbot-watch-host.log` | Re-patches Grokbot's host bundle when it updates |
+| Health watchdog | `/tmp/grokbot-health-check.pid` | `/tmp/grokbot-health-check.log` | Monitors Grokbot BYOK health, auto-redeploys on failure |
 
-The host watcher is what makes re-attachment robust. When the editor's
+The host watcher is what makes re-attachment robust. When Grokbot's
 supervisor updates or reinstalls `host-main.cjs`, the watcher detects the
 change, re-applies the routing-client patch, and restarts the host process.
-This happens automatically. No manual intervention needed after the editor
+This happens automatically. No manual intervention needed after Grokbot
 updates.
 
-The health watchdog parses Grokbot's log to compute an error rate over a
+The health watchdog parses Grokbot BYOK's log to compute an error rate over a
 rolling 5-minute window. If the error rate exceeds 50%, it runs the deploy
 script to rebuild and restart. A deploy cooldown (5 minutes) prevents
 deploy storms.
@@ -455,7 +455,7 @@ tail -100 /tmp/inference-shim.log | jq 'select(.level=="error")'
 ## Uninstall
 
 ```bash
-# Stop daemons, remove PID/log files, restore the editor's host-main.cjs
+# Stop daemons, remove PID/log files, restore Grokbot's host-main.cjs
 npm run uninstall
 
 # Full removal: also delete .env, config.json, dist/, node_modules/
@@ -469,10 +469,10 @@ npm run uninstall -- --keep-host
 ```
 
 The uninstall script:
-- Stops all three daemons (Grokbot, host watcher, health watchdog)
+- Stops all three daemons (Grokbot BYOK, host watcher, health watchdog)
 - Removes all PID files and log files from `/tmp/`
-- Restores the editor's `host-main.cjs` from the `.bak` backup (if one exists)
-- Removes the `inference-proxy.url` file and deployed Grokbot symlink
+- Restores Grokbot's `host-main.cjs` from the `.bak` backup (if one exists)
+- Removes the `inference-proxy.url` file and deployed Grokbot BYOK symlink
 - With `--purge`: also removes `.env`, `config/config.json`, `dist/`, `node_modules/`
 - The git repository itself is preserved. Delete the directory manually if needed.
 
@@ -497,7 +497,7 @@ is used as the default fallback.
 
 ## Failover and circuit breaking
 
-When `failover: true` (default), Grokbot tries providers in priority order
+When `failover: true` (default), Grokbot BYOK tries providers in priority order
 until one succeeds. Each provider has an independent circuit breaker:
 
 ```mermaid
@@ -534,7 +534,7 @@ Error classification determines whether to retry, failover, or stop:
 ### Cross-provider failover on empty completion
 
 If a provider returns a 200 response but produces no content (empty
-completion), Grokbot fails over to the next provider instead of returning
+completion), Grokbot BYOK fails over to the next provider instead of returning
 an empty response. This handles providers that accept the request but
 silently produce nothing, a common failure mode for free-tier endpoints.
 
@@ -546,7 +546,7 @@ will receive.
 
 ## Latency-based routing
 
-When `routingStrategy: "latency"`, Grokbot maintains per-provider
+When `routingStrategy: "latency"`, Grokbot BYOK maintains per-provider
 performance scores using exponentially-weighted moving averages (EWMA) of
 three signals:
 
@@ -580,7 +580,7 @@ Lower is better. Four things keep the scores honest:
 
 ## Session affinity
 
-When `sessionAffinity.enabled: true`, Grokbot binds a session ID (derived
+When `sessionAffinity.enabled: true`, Grokbot BYOK binds a session ID (derived
 from the request's `invocationId`) to a provider so subsequent requests from
 the same conversation go to the same provider. This preserves server-side
 prompt caching and conversation continuity.
@@ -593,9 +593,9 @@ every 5 minutes.
 ## Vision fallback
 
 When a request contains images but the resolved model doesn't support
-vision, Grokbot re-routes to `VISION_FALLBACK_MODEL` (default:
+vision, Grokbot BYOK re-routes to `VISION_FALLBACK_MODEL` (default:
 `qwen3.8-max`) instead of silently stripping the images. If no fallback
-model is configured, Grokbot replaces images with a placeholder text and
+model is configured, Grokbot BYOK replaces images with a placeholder text and
 sends the request to the original model.
 
 Vision support is auto-detected per model based on the model id and provider
@@ -605,7 +605,7 @@ Vision support is auto-detected per model based on the model id and provider
 
 ## Tool call handling
 
-Grokbot handles tool calls across the Connect to OpenAI translation
+Grokbot BYOK handles tool calls across the Connect to OpenAI translation
 boundary:
 
 - **Tool call accumulation.** OpenAI streams tool calls as deltas spread
@@ -615,7 +615,7 @@ boundary:
   repaired using a streaming JSON parser.
 - **Inline tool-call rescue.** When a model emits tool calls as text in a
   non-standard dialect (Kimi `<|tool_call_begin|>`, DeepSeek DSML, Qwen
-  `<tool_calls>` XML), Grokbot detects and re-parses them into structured
+  `<tool_calls>` XML), Grokbot BYOK detects and re-parses them into structured
   tool calls.
 - **Markup healing.** A streaming filter strips leaked chat-template markup
   from visible content and reconstructs tool calls and reasoning from it.
@@ -642,7 +642,7 @@ from code that hasn't been written yet.
 
 ### Metrics
 
-Grokbot logs per-provider metrics every 5 minutes:
+Grokbot BYOK logs per-provider metrics every 5 minutes:
 
 ```json
 {"msg":"provider metrics","provider":"openrouter","requests":16,
@@ -696,7 +696,7 @@ Two optional hard limits, both off by default:
 
 > [!IMPORTANT]
 > You rarely need to run deploy manually. Use `npm run setup` for normal
-> restarts. The health watchdog calls deploy automatically when Grokbot's
+> restarts. The health watchdog calls deploy automatically when Grokbot BYOK's
 > error rate exceeds 50%.
 
 For advanced deployment (atomic rebuild with symlink swap and host restart):
@@ -712,7 +712,7 @@ node dist/scripts/deploy.js --copy
 node dist/scripts/deploy.js --no-restart
 ```
 
-The health watchdog calls this script automatically when Grokbot's error
+The health watchdog calls this script automatically when Grokbot BYOK's error
 rate exceeds 50%. You rarely need to run it manually. Use `npm run setup`
 for normal restarts instead.
 
@@ -730,21 +730,21 @@ Check the setup output for the specific error. Common causes:
 - **Node version too old.** Requires Node 18+. Check with `node --version`.
 - **Port 8788 in use.** Another process is holding the port. Stop it or set
   `SHIM_PORT` to a different value in `.env`.
-- **Editor not found.** The setup script looks for `host-main.cjs` in
-  `$HOME/sand-host`. If your editor installation uses a different location,
+- **Grokbot not found.** The setup script looks for `host-main.cjs` in
+  `$HOME/sand-host`. If your Grokbot installation uses a different location,
   set `SAND_HOST_DIR` in `.env`.
 
-### The editor's AI features stopped working
+### Grokbot's AI features stopped working
 
 ```bash
 npm status                                    # Are the daemons running?
 tail -50 /tmp/inference-shim.log | jq 'select(.level=="error")'  # Any errors?
 ```
 
-If Grokbot crashed, the health watchdog should auto-redeploy within 5
+If Grokbot BYOK crashed, the health watchdog should auto-redeploy within 5
 minutes. If it didn't, run `npm run setup` to restart everything.
 
-If the host patch was lost (the editor updated and the watcher didn't catch
+If the host patch was lost (Grokbot updated and the watcher didn't catch
 it), run `npm run setup` to re-patch.
 
 ### All providers failing
@@ -764,7 +764,7 @@ The registry skips providers whose API key is empty or unresolved (the
 `${VAR}` literal remains because the env var isn't set). Check that the
 key exists in `.env` and that the env var name in `config.json` matches.
 
-### Grokbot is running but the editor doesn't use it
+### Grokbot BYOK is running but Grokbot doesn't use it
 
 The host patch may have been lost. Verify:
 
@@ -798,7 +798,7 @@ The test suite covers:
 - Stream timeout handling
 - Performance tracker scoring (EWMA, sentinel handling, staleness)
 - Server integration (full HTTP lifecycle with mock upstreams)
-- End-to-end (real Grokbot server, real HTTP requests)
+- End-to-end (real Grokbot BYOK server, real HTTP requests)
 - Client-disconnect failover behavior
 - Config validation
 
@@ -807,14 +807,14 @@ The test suite covers:
 ## Build
 
 ```bash
-npm run build         # Build Grokbot only (dist/shim.js)
-npm run build:all     # Build Grokbot + scripts (dist/shim.js + dist/scripts/*.js)
+npm run build         # Build Grokbot BYOK only (dist/shim.js)
+npm run build:all     # Build Grokbot BYOK + scripts (dist/shim.js + dist/scripts/*.js)
 npm run clean         # Remove dist/
 ```
 
 The build uses esbuild to produce standalone bundled `.js` files with no
 runtime dependencies (except `ajv` and `zod`, which are bundled in).
-Grokbot is a single `dist/shim.js` file that can run anywhere Node 18+ is
+Grokbot BYOK is a single `dist/shim.js` file that can run anywhere Node 18+ is
 available.
 
 ---
@@ -841,7 +841,7 @@ src/
   utils/                        Daemon management, .env loader, JSON repair
 scripts/
   setup.ts                      One-command setup
-  start-shim.ts                 Grokbot launcher (WindsurfAPI auto-start)
+  start-shim.ts                 Grokbot BYOK launcher (WindsurfAPI auto-start)
   deploy.ts                     Atomic deploy (build, symlink, restart)
   patch-host.ts                 Host bundle patcher
   watch-host.ts                 Bundle watcher (auto re-patch)
