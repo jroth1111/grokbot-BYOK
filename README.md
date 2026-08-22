@@ -1,5 +1,9 @@
 # grokbot-BYOK
 
+<p align="center">
+  <img src="https://i.ibb.co/TqqGHGHp/Chat-GPT-Image-Aug-22-2026-07-14-39-PM.png" width="300" alt="grokbot-BYOK">
+</p>
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node: 18+](https://img.shields.io/badge/Node.js-18%2B-green.svg)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.3-blue.svg)](https://www.typescriptlang.org/)
