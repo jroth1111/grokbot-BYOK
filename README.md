@@ -15,30 +15,54 @@ git clone https://github.com/jroth1111/grokbot-BYOK.git
 cd grokbot-BYOK
 
 # 2. One-command setup (installs deps, creates config, builds, starts daemons)
+#    Pass API keys via CLI flags — fully non-interactive:
+npm run setup -- --opencode-key sk-xxx --openrouter-key sk-or-xxx
+
+# Or via env vars:
+OPENCODE_API_KEY=sk-xxx OPENROUTER_API_KEY=sk-or-xxx npm run setup
+
+# Or without any keys (kilo is keyless — works with zero configuration):
 npm run setup
 ```
 
-That's it. The setup script:
+The setup script is fully non-interactive. It:
 - Installs npm dependencies
 - Creates `config/config.json` and `.env` from examples
-- Prints a provider table showing where to put API keys
+- Writes API keys from CLI flags or env vars into `.env`
 - Builds the shim + scripts
 - Starts three background daemons (shim, host watcher, health watchdog)
 - Runs a smoke test
+- Exits 0 on success, 1 on failure (agent-friendly)
 
-After setup, add your API keys to `.env` and re-run `npm run setup` to restart.
+If required keys are missing, it exits with an error showing exactly which
+keys are needed and how to provide them.
 
 ## Managing daemons
 
 ```bash
 npm run setup          # Start/restart everything (builds, stops old, starts new)
-npm run setup -- --status   # Check daemon status
+npm run setup -- --status   # Check daemon status (exit 0 if all running, 1 if not)
 npm run setup -- --stop     # Stop all daemons
 npm run setup -- --no-build # Restart without rebuilding
 npm run setup -- --no-watch # Start without host watcher
+npm run setup -- --quiet    # Minimal output (agent-friendly)
 npm start              # Start shim only (foreground)
 npm stop               # Stop all daemons
 npm status             # Check daemon status
+```
+
+### Providing API keys (non-interactive)
+
+Keys can be passed via CLI flags, env vars, or written to `.env` manually:
+
+```bash
+# CLI flags (keys are written to .env automatically)
+npm run setup -- --opencode-key sk-xxx --kilo-key yyy --openrouter-key sk-or-zzz
+
+# Env vars (keys are written to .env automatically)
+OPENCODE_API_KEY=sk-xxx npm run setup
+
+# Or just edit .env directly and run setup without flags
 ```
 
 ### Daemon processes

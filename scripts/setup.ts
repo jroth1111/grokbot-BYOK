@@ -1,5 +1,5 @@
 /**
- * One-command setup for grokbot-BYOK v2.
+ * One-command setup for grokbot-BYOK v2. Fully non-interactive.
  *
  *   npm run setup
  *
@@ -7,26 +7,34 @@
  *   1. Checks prerequisites (Node version, node_modules).
  *   2. Copies config.example.json → config.json if not present.
  *   3. Copies .env.example → .env if not present.
- *   4. Prints a provider table and guides the user on where to put API keys.
+ *   4. Writes API keys (from CLI flags or env vars) into .env.
  *   5. Builds the shim + scripts.
  *   6. Starts three detached background daemons with PID files + logs:
  *        a. Shim            (dist/shim.js)
  *        b. Host watcher    (dist/scripts/watch-host.js)
  *        c. Health watchdog (dist/scripts/health-check.js --watch --deploy)
- *   7. Runs a smoke test (health-check one-shot).
- *   8. Prints status summary.
+ *   7. Runs a smoke test and prints status.
  *
  * Re-running `npm run setup` is safe: it stops existing daemons (via PID
  * files) before starting new ones, so it acts as a restart command too.
  *
+ * API keys can be provided via CLI flags or env vars:
+ *   npm run setup -- --opencode-key sk-xxx --openrouter-key sk-or-xxx
+ *   OPENCODE_API_KEY=sk-xxx OPENROUTER_API_KEY=sk-or-xxx npm run setup
+ *
  * Flags:
- *   --no-build    Skip the build step (use existing dist/).
- *   --no-watch    Don't start the host watcher daemon.
- *   --no-health   Don't start the health watchdog daemon.
- *   --stop        Stop all daemons and exit (no build, no start).
- *   --status      Print daemon status and exit.
+ *   --opencode-key=KEY     Set OPENCODE_API_KEY in .env
+ *   --kilo-key=KEY         Set KILO_API_KEY in .env
+ *   --openrouter-key=KEY   Set OPENROUTER_API_KEY in .env
+ *   --local-key=KEY        Set LOCAL_API_KEY in .env
+ *   --no-build             Skip the build step (use existing dist/).
+ *   --no-watch             Don't start the host watcher daemon.
+ *   --no-health            Don't start the health watchdog daemon.
+ *   --quiet                Suppress provider table and detailed output.
+ *   --stop                 Stop all daemons and exit.
+ *   --status               Print daemon status and exit.
  */
-import { existsSync, readFileSync, writeFileSync, unlinkSync, copyFileSync, mkdirSync, openSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, unlinkSync, copyFileSync, openSync } from "node:fs";
 import * as path from "node:path";
 import * as net from "node:net";
 import { spawn, execSync } from "node:child_process";
@@ -55,7 +63,73 @@ const LOGS = {
   health: path.join(LOG_DIR, "grokbot-health-check.log"),
 };
 
-// ─── Utilities ────────────────────────────────────────────────────────────
+// ─── Provider definitions ─────────────────────────────────────────────────
+
+interface ProviderInfo {
+  name: string;
+  envVar: string;
+  cliFlag: string;
+  required: boolean;
+  keyless: boolean;
+  url: string;
+  models: string;
+  description: string;
+}
+
+const PROVIDERS: ProviderInfo[] = [
+  {
+    name: "opencode-go",
+    envVar: "OPENCODE_API_KEY",
+    cliFlag: "--opencode-key",
+    required: true,
+    keyless: false,
+    url: "https://opencode.ai",
+    models: "ox-alpha-free, qwen3.8-max (vision)",
+    description: "Primary provider. Frontier reasoning model, free tier.",
+  },
+  {
+    name: "kilo",
+    envVar: "KILO_API_KEY",
+    cliFlag: "--kilo-key",
+    required: false,
+    keyless: true,
+    url: "https://kilo.ai",
+    models: "stealth/ox-alpha",
+    description: "Keyless anonymous access (200 req/hr/IP). Set key for higher limits.",
+  },
+  {
+    name: "openrouter",
+    envVar: "OPENROUTER_API_KEY",
+    cliFlag: "--openrouter-key",
+    required: false,
+    keyless: false,
+    url: "https://openrouter.ai/keys",
+    models: "stealth/ox-alpha",
+    description: "OpenRouter gateway. Get a key at openrouter.ai/keys.",
+  },
+  {
+    name: "opencode-zen",
+    envVar: "OPENCODE_API_KEY",
+    cliFlag: "--opencode-key",
+    required: false,
+    keyless: false,
+    url: "https://opencode.ai",
+    models: "x-preview-f-free",
+    description: "Secondary OpenCode endpoint. Shares the same key as opencode-go.",
+  },
+  {
+    name: "local",
+    envVar: "LOCAL_API_KEY",
+    cliFlag: "--local-key",
+    required: false,
+    keyless: false,
+    url: "127.0.0.1:3003 (WindsurfAPI)",
+    models: "glm-5.2, glm-5.1, swe-1-7, swe-1-7-medium",
+    description: "Local WindsurfAPI backend. Auto-started if found in ../WindsurfAPI.",
+  },
+];
+
+// ─── Output helpers ───────────────────────────────────────────────────────
 
 const BOLD = "\x1b[1m";
 const DIM = "\x1b[2m";
@@ -65,7 +139,10 @@ const RED = "\x1b[31m";
 const CYAN = "\x1b[36m";
 const RESET = "\x1b[0m";
 
+let quiet = false;
+
 function info(msg: string): void {
+  if (quiet) return;
   console.log(`${CYAN}[setup]${RESET} ${msg}`);
 }
 function ok(msg: string): void {
@@ -77,6 +154,8 @@ function warn(msg: string): void {
 function err(msg: string): void {
   console.error(`${RED}[setup] ERROR${RESET} ${msg}`);
 }
+
+// ─── Utilities ────────────────────────────────────────────────────────────
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -112,7 +191,6 @@ function killPid(pid: number): void {
 }
 
 function stopDaemon(name: string, ...pidFiles: string[]): void {
-  // Try each PID file; stop the first live process found.
   let stopped = false;
   for (const pidFile of pidFiles) {
     const pid = readPid(pidFile);
@@ -123,20 +201,16 @@ function stopDaemon(name: string, ...pidFiles: string[]): void {
     }
     info(`${name}: stopping pid ${pid}`);
     killPid(pid);
-    // Wait up to 3s for graceful exit.
     for (let i = 0; i < 30; i++) {
       if (!isProcessAlive(pid)) break;
       try { process.kill(pid, 0); } catch { break; }
     }
-    // SIGKILL if still alive.
     try { process.kill(pid, "SIGKILL"); } catch { /* dead */ }
     try { unlinkSync(pidFile); } catch { /* ignore */ }
     ok(`${name}: stopped`);
     stopped = true;
   }
-  if (!stopped) {
-    info(`${name}: no running process found`);
-  }
+  if (!stopped) info(`${name}: no running process found`);
 }
 
 function startDaemon(name: string, cmd: string, args: string[], pidFile: string, logFile: string): number | undefined {
@@ -158,67 +232,120 @@ function startDaemon(name: string, cmd: string, args: string[], pidFile: string,
   return undefined;
 }
 
-// ─── Provider table ───────────────────────────────────────────────────────
+// ─── Arg parsing ──────────────────────────────────────────────────────────
 
-interface ProviderInfo {
-  name: string;
-  envVar: string;
-  required: boolean;
-  keyless: boolean;
-  url: string;
-  models: string;
-  description: string;
+interface SetupArgs {
+  noBuild: boolean;
+  noWatch: boolean;
+  noHealth: boolean;
+  quiet: boolean;
+  stop: boolean;
+  status: boolean;
+  keys: Record<string, string>; // envVar -> key value
 }
 
-const PROVIDERS: ProviderInfo[] = [
-  {
-    name: "opencode-go",
-    envVar: "OPENCODE_API_KEY",
-    required: true,
-    keyless: false,
-    url: "https://opencode.ai",
-    models: "ox-alpha-free, qwen3.8-max (vision)",
-    description: "Primary provider. Frontier reasoning model, free tier.",
-  },
-  {
-    name: "kilo",
-    envVar: "KILO_API_KEY",
-    required: false,
-    keyless: true,
-    url: "https://kilo.ai",
-    models: "stealth/ox-alpha",
-    description: "Keyless anonymous access (200 req/hr/IP). Set key for higher limits.",
-  },
-  {
-    name: "openrouter",
-    envVar: "OPENROUTER_API_KEY",
-    required: false,
-    keyless: false,
-    url: "https://openrouter.ai/keys",
-    models: "stealth/ox-alpha",
-    description: "OpenRouter gateway. Get a key at openrouter.ai/keys.",
-  },
-  {
-    name: "opencode-zen",
-    envVar: "OPENCODE_API_KEY",
-    required: false,
-    keyless: false,
-    url: "https://opencode.ai",
-    models: "x-preview-f-free",
-    description: "Secondary OpenCode endpoint. Shares the same key as opencode-go.",
-  },
-  {
-    name: "local",
-    envVar: "LOCAL_API_KEY",
-    required: false,
-    keyless: false,
-    url: "127.0.0.1:3003 (WindsurfAPI)",
-    models: "glm-5.2, glm-5.1, swe-1-7, swe-1-7-medium",
-    description: "Local WindsurfAPI backend. Auto-started if found in ../WindsurfAPI.",
-  },
-];
+function parseArgs(argv: string[]): SetupArgs {
+  const keys: Record<string, string> = {};
+  for (const p of PROVIDERS) {
+    const flagEq = `${p.cliFlag}=`;
+    for (const arg of argv) {
+      if (arg.startsWith(flagEq)) {
+        keys[p.envVar] = arg.slice(flagEq.length);
+      } else if (arg === p.cliFlag) {
+        // --opencode-key sk-xxx (space-separated)
+        const idx = argv.indexOf(arg);
+        if (idx + 1 < argv.length && !argv[idx + 1].startsWith("--")) {
+          keys[p.envVar] = argv[idx + 1];
+        }
+      }
+    }
+  }
+  return {
+    noBuild: argv.includes("--no-build"),
+    noWatch: argv.includes("--no-watch"),
+    noHealth: argv.includes("--no-health"),
+    quiet: argv.includes("--quiet"),
+    stop: argv.includes("--stop"),
+    status: argv.includes("--status"),
+    keys,
+  };
+}
+
+// ─── .env management ──────────────────────────────────────────────────────
+
+/**
+ * Set or update an env var in the .env file. If the var already exists,
+ * replace its value. If not, append it. Preserves comments and other lines.
+ */
+function setEnvVar(envPath: string, varName: string, value: string): void {
+  let content = "";
+  if (existsSync(envPath)) {
+    content = readFileSync(envPath, "utf8");
+  }
+  const re = new RegExp(`^#?\\s*${varName}=.*$`, "m");
+  const newLine = `${varName}=${value}`;
+  if (re.test(content)) {
+    content = content.replace(re, newLine);
+  } else {
+    content = content.trimEnd() + "\n" + newLine + "\n";
+  }
+  writeFileSync(envPath, content, "utf8");
+}
+
+/**
+ * Read a var from the .env file. Returns undefined if not set or is a placeholder.
+ */
+function readEnvVar(envPath: string, varName: string): string | undefined {
+  if (!existsSync(envPath)) return undefined;
+  const content = readFileSync(envPath, "utf8");
+  const re = new RegExp(`^${varName}=(.+)$`, "m");
+  const match = content.match(re);
+  const val = match?.[1]?.trim();
+  if (!val || val.includes("your-") || val.includes("-here")) return undefined;
+  return val;
+}
+
+/**
+ * Write CLI-provided keys into .env. Also picks up keys from the current
+ * process env (e.g. OPENCODE_API_KEY=sk-xxx npm run setup).
+ */
+function writeKeysToEnv(envPath: string, cliKeys: Record<string, string>): string[] {
+  const written: string[] = [];
+  for (const p of PROVIDERS) {
+    if (p.keyless) continue;
+    // CLI flag takes precedence, then process env, then existing .env value.
+    const cliVal = cliKeys[p.envVar];
+    const envVal = process.env[p.envVar];
+    const existingVal = readEnvVar(envPath, p.envVar);
+    const value = cliVal ?? (envVal && !envVal.includes("your-") && !envVal.includes("-here") ? envVal : undefined);
+    if (value) {
+      if (value !== existingVal) {
+        setEnvVar(envPath, p.envVar, value);
+        ok(`Set ${p.envVar} in .env (from ${cliVal ? "CLI flag" : "env var"})`);
+      } else {
+        info(`${p.envVar} already set in .env`);
+      }
+      written.push(p.envVar);
+    }
+  }
+  return written;
+}
+
+/** Check which required keys are missing and return their env var names. */
+function getMissingRequiredKeys(envPath: string): string[] {
+  const missing: string[] = [];
+  for (const p of PROVIDERS) {
+    if (p.keyless || !p.required) continue;
+    if (!readEnvVar(envPath, p.envVar)) missing.push(p.envVar);
+  }
+  return missing;
+}
+
+// ─── Provider table (human-readable, suppressed by --quiet) ───────────────
 
 function printProviderTable(): void {
+  console.log();
+  console.log(`${BOLD}Providers:${RESET}`);
   console.log();
   console.log(`${BOLD}┌──────────────────┬──────────────────────┬──────────┬─────────────────────────────────────────────────────┐${RESET}`);
   console.log(`${BOLD}│ Provider         │ Env Var              │ Required │ Description                                         │${RESET}`);
@@ -232,101 +359,91 @@ function printProviderTable(): void {
   }
   console.log(`${BOLD}└──────────────────┴──────────────────────┴──────────┴─────────────────────────────────────────────────────┘${RESET}`);
   console.log();
-  console.log(`${BOLD}Where to put API keys:${RESET}`);
-  console.log(`  Edit ${CYAN}.env${RESET} in the project root. Example values are in ${CYAN}.env.example${RESET}.`);
+  console.log(`${BOLD}Where to get keys:${RESET}`);
+  console.log(`  OpenCode:    https://opencode.ai         (one key for go + zen)`);
+  console.log(`  Kilo:        https://kilo.ai             (optional — keyless works without a key)`);
+  console.log(`  OpenRouter:  https://openrouter.ai/keys`);
   console.log();
-  console.log(`${BOLD}Provider details:${RESET}`);
-  for (const p of PROVIDERS) {
-    console.log();
-    console.log(`  ${BOLD}${p.name}${RESET} (${p.url})`);
-    console.log(`    Env var:   ${CYAN}${p.envVar}${RESET}`);
-    console.log(`    Required:  ${p.keyless ? "no (keyless — works without a key)" : p.required ? "yes" : "no"}`);
-    console.log(`    Models:    ${p.models}`);
-    console.log(`    ${p.description}`);
-  }
+  console.log(`${BOLD}How to provide keys (non-interactive):${RESET}`);
+  console.log(`  ${CYAN}npm run setup -- --opencode-key sk-xxx --openrouter-key sk-or-xxx${RESET}`);
+  console.log(`  ${CYAN}OPENCODE_API_KEY=sk-xxx npm run setup${RESET}`);
+  console.log(`  Or edit ${CYAN}.env${RESET} manually and run ${CYAN}npm run setup${RESET}`);
   console.log();
   console.log(`${BOLD}Failover order:${RESET} opencode-go → kilo → openrouter → opencode-zen → local`);
   console.log(`${DIM}Providers with missing API keys are automatically skipped (except keyless ones).${RESET}`);
   console.log();
 }
 
-// ─── Env file helpers ─────────────────────────────────────────────────────
+// ─── Config loader ────────────────────────────────────────────────────────
 
-/** Check which API keys are set in .env and report missing ones. */
-function checkEnvKeys(): void {
-  const envPath = path.join(projectRoot, ".env");
-  if (!existsSync(envPath)) {
-    warn(".env not found — copy .env.example and add your API keys");
-    return;
-  }
-  const envContent = readFileSync(envPath, "utf8");
-  const missing: string[] = [];
-  for (const p of PROVIDERS) {
-    if (p.keyless) continue;
-    // Look for ENV_VAR=value where value is not empty and not a placeholder.
-    const re = new RegExp(`^${p.envVar}=(.+)$`, "m");
-    const match = envContent.match(re);
-    const val = match?.[1]?.trim();
-    if (!val || val.includes("your-") || val.includes("-here")) {
-      if (p.required) missing.push(`${p.envVar} (${p.name})`);
-    }
-  }
-  if (missing.length > 0) {
-    warn(`Missing required API keys in .env:`);
-    for (const m of missing) warn(`  ${m}`);
-    console.log();
-    warn(`Edit .env now, then re-run: npm run setup`);
+function loadConfigSafe(): { port: number; host: string; hostConfig?: { sandHostDir?: string } } | null {
+  try {
+    const configPath = path.join(configDir, "config.json");
+    if (!existsSync(configPath)) return null;
+    const raw = readFileSync(configPath, "utf8");
+    const cfg = JSON.parse(raw);
+    return {
+      port: cfg.port ?? 8788,
+      host: cfg.host ?? "127.0.0.1",
+      hostConfig: cfg.hostConfig,
+    };
+  } catch {
+    return null;
   }
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────
 
-function parseArgs(argv: string[]): { noBuild: boolean; noWatch: boolean; noHealth: boolean; stop: boolean; status: boolean } {
-  return {
-    noBuild: argv.includes("--no-build"),
-    noWatch: argv.includes("--no-watch"),
-    noHealth: argv.includes("--no-health"),
-    stop: argv.includes("--stop"),
-    status: argv.includes("--status"),
-  };
-}
-
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
+  quiet = args.quiet;
 
-  // ── --status: print daemon status and exit ──
+  // ── --status ──
   if (args.status) {
-    console.log();
-    console.log(`${BOLD}grokbot-BYOK v2 — daemon status${RESET}`);
-    console.log();
+    if (!quiet) {
+      console.log();
+      console.log(`${BOLD}grokbot-BYOK v2 — daemon status${RESET}`);
+      console.log();
+    }
     const daemons: Array<{ name: string; pidFiles: string[]; logFile: string }> = [
       { name: "Shim", pidFiles: [PIDS.shim, PIDS.shimPort], logFile: LOGS.shim },
       { name: "Host watcher", pidFiles: [PIDS.watch], logFile: LOGS.watch },
       { name: "Health watchdog", pidFiles: [PIDS.health], logFile: LOGS.health },
     ];
+    let allRunning = true;
     for (const d of daemons) {
       let alivePid: number | undefined;
       for (const pf of d.pidFiles) {
         const pid = readPid(pf);
         if (pid !== undefined && isProcessAlive(pid)) { alivePid = pid; break; }
       }
-      const status = alivePid !== undefined ? `${GREEN}running${RESET} (pid ${alivePid})` : `${DIM}stopped${RESET}`;
-      console.log(`  ${d.name.padEnd(18)} ${status}  ${DIM}log: ${d.logFile}${RESET}`);
+      const running = alivePid !== undefined;
+      if (!running) allRunning = false;
+      if (quiet) {
+        console.log(`${d.name}: ${running ? "running" : "stopped"}`);
+      } else {
+        const status = running ? `${GREEN}running${RESET} (pid ${alivePid})` : `${DIM}stopped${RESET}`;
+        console.log(`  ${d.name.padEnd(18)} ${status}  ${DIM}log: ${d.logFile}${RESET}`);
+      }
     }
-    // Also check if the shim port is listening.
     const config = loadConfigSafe();
     if (config) {
       const up = await portIsListening(config.host || "127.0.0.1", config.port);
-      const portLabel = `Port ${config.port}`.padEnd(18);
-      console.log(`  ${portLabel} ${up ? `${GREEN}listening${RESET}` : `${DIM}not listening${RESET}`}`);
+      if (!up) allRunning = false;
+      if (quiet) {
+        console.log(`Port ${config.port}: ${up ? "listening" : "not listening"}`);
+      } else {
+        const portLabel = `Port ${config.port}`.padEnd(18);
+        console.log(`  ${portLabel} ${up ? `${GREEN}listening${RESET}` : `${DIM}not listening${RESET}`}`);
+      }
     }
-    console.log();
-    process.exit(0);
+    if (!quiet) console.log();
+    process.exit(allRunning ? 0 : 1);
   }
 
-  // ── --stop: stop all daemons and exit ──
+  // ── --stop ──
   if (args.stop) {
-    console.log();
+    if (!quiet) console.log();
     info("Stopping all daemons...");
     stopDaemon("Shim", PIDS.shim, PIDS.shimPort);
     stopDaemon("Host watcher", PIDS.watch);
@@ -335,17 +452,14 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  console.log();
-  console.log(`${BOLD}╔══════════════════════════════════════════════════════════════╗${RESET}`);
-  console.log(`${BOLD}║         grokbot-BYOK v2 — Setup                              ║${RESET}`);
-  console.log(`${BOLD}║         Cursor sand-host BYOK inference adapter              ║${RESET}`);
-  console.log(`${BOLD}╚══════════════════════════════════════════════════════════════╝${RESET}`);
-  console.log();
+  if (!quiet) {
+    console.log();
+    console.log(`${BOLD}grokbot-BYOK v2 — Setup${RESET}`);
+    console.log();
+  }
 
-  // ── Step 1: Check prerequisites ──
+  // ── Step 1: Prerequisites ──
   info("Step 1/7: Checking prerequisites...");
-
-  // Node version
   const nodeVersion = process.version;
   const major = parseInt(nodeVersion.slice(1).split(".")[0], 10);
   if (major < 18) {
@@ -354,11 +468,10 @@ async function main(): Promise<void> {
   }
   ok(`Node ${nodeVersion}`);
 
-  // node_modules
   if (!existsSync(path.join(projectRoot, "node_modules"))) {
     info("Installing dependencies (npm install)...");
     try {
-      execSync("npm install", { stdio: "inherit", cwd: projectRoot });
+      execSync("npm install", { stdio: quiet ? "pipe" : "inherit", cwd: projectRoot });
     } catch {
       err("npm install failed");
       process.exit(1);
@@ -373,7 +486,7 @@ async function main(): Promise<void> {
   if (!existsSync(configJson)) {
     if (existsSync(configExample)) {
       copyFileSync(configExample, configJson);
-      ok(`Created config/config.json from example`);
+      ok("Created config/config.json from example");
     } else {
       err("config/config.example.json not found");
       process.exit(1);
@@ -389,7 +502,7 @@ async function main(): Promise<void> {
   if (!existsSync(envFile)) {
     if (existsSync(envExample)) {
       copyFileSync(envExample, envFile);
-      ok(`Created .env from .env.example`);
+      ok("Created .env from .env.example");
     } else {
       warn(".env.example not found, creating empty .env");
       writeFileSync(envFile, "", "utf8");
@@ -398,10 +511,29 @@ async function main(): Promise<void> {
     ok(".env exists");
   }
 
-  // ── Step 4: Print provider info ──
-  info("Step 4/7: Provider configuration");
-  printProviderTable();
-  checkEnvKeys();
+  // ── Step 4: Write keys + print provider info ──
+  info("Step 4/7: Configuring API keys...");
+  const writtenKeys = writeKeysToEnv(envFile, args.keys);
+  if (writtenKeys.length > 0) {
+    ok(`Wrote ${writtenKeys.length} key(s) to .env: ${writtenKeys.join(", ")}`);
+  }
+
+  if (!quiet) printProviderTable();
+
+  const missing = getMissingRequiredKeys(envFile);
+  if (missing.length > 0) {
+    warn(`Missing required API keys: ${missing.join(", ")}`);
+    warn("Provide them via CLI flags or env vars, or edit .env manually:");
+    const flags = missing.map((v) => {
+      const p = PROVIDERS.find((pp) => pp.envVar === v);
+      return p ? `${p.cliFlag} <key>` : `${v}=<key>`;
+    });
+    warn(`  npm run setup -- ${flags.join(" ")}`);
+    warn(`  ${missing.map((v) => `${v}=<key>`).join(" ")} npm run setup`);
+    err("Cannot start without required API keys.");
+    process.exit(1);
+  }
+  ok("All required API keys are set");
 
   // ── Step 5: Build ──
   if (args.noBuild) {
@@ -409,7 +541,7 @@ async function main(): Promise<void> {
   } else {
     info("Step 5/7: Building shim + scripts...");
     try {
-      execSync("npm run build:all", { stdio: "inherit", cwd: projectRoot });
+      execSync("npm run build:all", { stdio: quiet ? "pipe" : "inherit", cwd: projectRoot });
     } catch {
       err("Build failed");
       process.exit(1);
@@ -417,7 +549,6 @@ async function main(): Promise<void> {
     ok("Build complete");
   }
 
-  // Verify dist exists.
   if (!existsSync(path.join(distDir, "shim.js"))) {
     err("dist/shim.js not found — build may have failed. Run: npm run build:all");
     process.exit(1);
@@ -428,17 +559,15 @@ async function main(): Promise<void> {
   stopDaemon("Shim", PIDS.shim, PIDS.shimPort);
   stopDaemon("Host watcher", PIDS.watch);
   stopDaemon("Health watchdog", PIDS.health);
-  await sleep(500); // let OS release sockets
+  await sleep(500);
 
   // ── Step 7: Start daemons ──
   info("Step 7/7: Starting daemons...");
 
-  // 7a: Shim (use start-shim.js which handles WindsurfAPI auto-start + seeding)
+  // 7a: Shim
   const startShimPath = path.join(distDir, "scripts", "start-shim.js");
   const shimPath = path.join(distDir, "shim.js");
   const shimEntry = existsSync(startShimPath) ? startShimPath : shimPath;
-  // Don't pre-write the PID file — the shim writes its own PID on startup.
-  // Just clean up any stale file and start the process.
   try { unlinkSync(PIDS.shim); } catch { /* not present */ }
   const shimOutFd = openSync(LOGS.shim, "a");
   const shimErrFd = openSync(LOGS.shim, "a");
@@ -449,11 +578,9 @@ async function main(): Promise<void> {
     env: process.env,
   });
   shimChild.unref();
-  if (shimChild.pid) {
-    ok(`Shim: starting (pid ${shimChild.pid}, log ${LOGS.shim})`);
-  }
+  if (shimChild.pid) ok(`Shim: starting (pid ${shimChild.pid})`);
 
-  // Wait for shim to start listening.
+  // Wait for shim to listen.
   const config = loadConfigSafe();
   const shimPort = config?.port ?? 8788;
   const shimHost = config?.host ?? "127.0.0.1";
@@ -469,7 +596,7 @@ async function main(): Promise<void> {
     warn(`Check log: ${LOGS.shim}`);
   }
 
-  // 7b: Host watcher (only if host-main.cjs exists)
+  // 7b: Host watcher
   if (args.noWatch) {
     info("Host watcher: skipped (--no-watch)");
   } else {
@@ -480,12 +607,11 @@ async function main(): Promise<void> {
       if (existsSync(watchScript)) {
         startDaemon("Host watcher", "node", [watchScript], PIDS.watch, LOGS.watch);
       } else {
-        warn("Host watcher: dist/scripts/watch-host.js not found (build may be incomplete)");
+        warn("Host watcher: dist/scripts/watch-host.js not found");
       }
     } else {
       info(`Host watcher: host-main.cjs not found at ${hostMain}, skipping`);
-      info(`${DIM}The watcher re-patches Cursor's host bundle when it updates.${RESET}`);
-      info(`${DIM}It will be needed after Cursor is installed. Re-run setup then.${RESET}`);
+      if (!quiet) info(`${DIM}Re-run setup after Cursor is installed to enable auto re-patching.${RESET}`);
     }
   }
 
@@ -497,57 +623,38 @@ async function main(): Promise<void> {
     if (existsSync(healthScript)) {
       startDaemon("Health watchdog", "node", [healthScript, "--watch", "--deploy"], PIDS.health, LOGS.health);
     } else {
-      warn("Health watchdog: dist/scripts/health-check.js not found (build may be incomplete)");
+      warn("Health watchdog: dist/scripts/health-check.js not found");
     }
   }
 
-  // ── Smoke test ──
-  console.log();
-  info("Running smoke test...");
-  if (listening) {
-    ok(`Shim is up on ${shimHost}:${shimPort}`);
-  } else {
-    warn("Shim is not listening — check the log file");
-  }
-
   // ── Summary ──
-  console.log();
-  console.log(`${BOLD}╔══════════════════════════════════════════════════════════════╗${RESET}`);
-  console.log(`${BOLD}║  Setup complete                                             ║${RESET}`);
-  console.log(`${BOLD}╠══════════════════════════════════════════════════════════════╣${RESET}`);
-  console.log(`${BOLD}║${RESET}  Shim:            ${listening ? GREEN + "running" + RESET : RED + "not listening" + RESET}                         ${BOLD}║${RESET}`);
-  const watchRunning = readPid(PIDS.watch) !== undefined && isProcessAlive(readPid(PIDS.watch)!);
-  const healthRunning = readPid(PIDS.health) !== undefined && isProcessAlive(readPid(PIDS.health)!);
-  console.log(`${BOLD}║${RESET}  Host watcher:    ${watchRunning ? GREEN + "running" + RESET : DIM + "stopped" + RESET}                         ${BOLD}║${RESET}`);
-  console.log(`${BOLD}║${RESET}  Health watchdog: ${healthRunning ? GREEN + "running" + RESET : DIM + "stopped" + RESET}                         ${BOLD}║${RESET}`);
-  console.log(`${BOLD}╠══════════════════════════════════════════════════════════════╣${RESET}`);
-  console.log(`${BOLD}║${RESET}  Logs:  ${DIM}/tmp/inference-shim.log${RESET}                              ${BOLD}║${RESET}`);
-  console.log(`${BOLD}║${RESET}         ${DIM}/tmp/grokbot-watch-host.log${RESET}                          ${BOLD}║${RESET}`);
-  console.log(`${BOLD}║${RESET}         ${DIM}/tmp/grokbot-health-check.log${RESET}                        ${BOLD}║${RESET}`);
-  console.log(`${BOLD}╠══════════════════════════════════════════════════════════════╣${RESET}`);
-  console.log(`${BOLD}║${RESET}  ${CYAN}npm run setup -- --status${RESET}   check daemon status          ${BOLD}║${RESET}`);
-  console.log(`${BOLD}║${RESET}  ${CYAN}npm run setup -- --stop${RESET}      stop all daemons             ${BOLD}║${RESET}`);
-  console.log(`${BOLD}║${RESET}  ${CYAN}npm run setup${RESET}               restart everything            ${BOLD}║${RESET}`);
-  console.log(`${BOLD}╚══════════════════════════════════════════════════════════════╝${RESET}`);
-  console.log();
-}
-
-/** Load config safely (may fail if config.json is invalid). */
-function loadConfigSafe(): { port: number; host: string; hostConfig?: { sandHostDir?: string } } | null {
-  try {
-    // Use dynamic import to avoid hard dependency at build time.
-    const configPath = path.join(configDir, "config.json");
-    if (!existsSync(configPath)) return null;
-    const raw = readFileSync(configPath, "utf8");
-    const cfg = JSON.parse(raw);
-    return {
-      port: cfg.port ?? 8788,
-      host: cfg.host ?? "127.0.0.1",
-      hostConfig: cfg.hostConfig,
-    };
-  } catch {
-    return null;
+  if (quiet) {
+    console.log(`shim: ${listening ? "running" : "failed"}`);
+    const watchRunning = readPid(PIDS.watch) !== undefined && isProcessAlive(readPid(PIDS.watch)!);
+    const healthRunning = readPid(PIDS.health) !== undefined && isProcessAlive(readPid(PIDS.health)!);
+    console.log(`host_watcher: ${watchRunning ? "running" : "stopped"}`);
+    console.log(`health_watchdog: ${healthRunning ? "running" : "stopped"}`);
+  } else {
+    console.log();
+    console.log(`${BOLD}Setup complete${RESET}`);
+    console.log();
+    console.log(`  Shim:             ${listening ? GREEN + "running" + RESET : RED + "not listening" + RESET} (${shimHost}:${shimPort})`);
+    const watchRunning = readPid(PIDS.watch) !== undefined && isProcessAlive(readPid(PIDS.watch)!);
+    const healthRunning = readPid(PIDS.health) !== undefined && isProcessAlive(readPid(PIDS.health)!);
+    console.log(`  Host watcher:     ${watchRunning ? GREEN + "running" + RESET : DIM + "stopped" + RESET}`);
+    console.log(`  Health watchdog:  ${healthRunning ? GREEN + "running" + RESET : DIM + "stopped" + RESET}`);
+    console.log();
+    console.log(`  Logs: ${DIM}/tmp/inference-shim.log${RESET}`);
+    console.log(`        ${DIM}/tmp/grokbot-watch-host.log${RESET}`);
+    console.log(`        ${DIM}/tmp/grokbot-health-check.log${RESET}`);
+    console.log();
+    console.log(`  ${CYAN}npm run setup -- --status${RESET}  check status`);
+    console.log(`  ${CYAN}npm run setup -- --stop${RESET}     stop all`);
+    console.log(`  ${CYAN}npm run setup${RESET}               restart`);
+    console.log();
   }
+
+  process.exit(listening ? 0 : 1);
 }
 
 main().catch((e) => {
