@@ -71,20 +71,20 @@ const ROUTING_CLIENT_BODY = `{
   if (!proxyUrl) {
     throw new Error("routingClient: no inference proxy URL configured");
   }
-  const { createConnectClient } = require("@connectrpc/connect");
-  const { createGrpcTransport } = require("@connectrpc/connect-node");
-  const { createClient } = require("@connectrpc/connect");
-  const transport = createGrpcTransport({ baseUrl: proxyUrl, httpVersion: "2" });
-  const client = createClient(transport);
-  const routingClient = {
-    stream: function (req) {
-      return client.stream(req);
-    },
-    unary: function (req) {
-      return client.unary(req);
-    },
-  };
-  return routingClient;
+  // Use the bundle's internal createConnectTransport + createClient (already
+  // in scope from the original host-main.cjs). The shim serves Connect-RPC
+  // over HTTP/1.1, matching the original transport's httpVersion.
+  const transport = createConnectTransport({
+    baseUrl: proxyUrl,
+    httpVersion: "1.1"
+  });
+  const client = createClient(InferenceService, transport);
+  return createProtoSessionProvider(
+    client,
+    options2.requestedModel,
+    void 0,
+    options2.inferenceReason
+  ).getSession(imageResizingMiddleware);
 }`;
 
 /** The marker we grep for to detect an already-patched file. */
