@@ -1,5 +1,10 @@
 # grokbot-BYOK
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Node: 18+](https://img.shields.io/badge/Node.js-18%2B-green.svg)](https://nodejs.org/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.3-blue.svg)](https://www.typescriptlang.org/)
+[![Tests: 359](https://img.shields.io/badge/Tests-359%20passed-brightgreen.svg)](#tests)
+
 **Route Cursor's AI inference through your own LLM API keys.**
 
 Cursor's built-in AI features (chat, tab-completion, agent mode) normally go
@@ -50,9 +55,17 @@ OpenAI SSE.
 
 This shim sits between them:
 
-```
-Cursor editor  ──Connect-RPC──►  grokbot shim  ──OpenAI SSE──►  LLM provider
-                  (binary)         (localhost)      (JSON)         (your keys)
+```mermaid
+graph LR
+    Cursor["Cursor editor<br/>(Connect-RPC, binary)"] -->|"POST /Stream"| Shim
+    Shim["grokbot shim<br/>(localhost:8788)"] -->|"OpenAI SSE (JSON)"| Provider1["OpenRouter"]
+    Shim -->|"OpenAI SSE (JSON)"| Provider2["OpenCode Go"]
+    Shim -->|"OpenAI SSE (JSON)"| Provider3["Kilo"]
+    Shim -->|"OpenAI SSE (JSON)"| Provider4["Local"]
+    Provider1 -->|"your keys"| Keys1["sk-or-xxx"]
+    Provider2 -->|"your keys"| Keys2["sk-xxx"]
+    Provider3 -->|"keyless"| Keys3["200 req/hr"]
+    Provider4 -->|"your keys"| Keys4["sk-local"]
 ```
 
 The shim:
@@ -146,6 +159,31 @@ restarts. It acts as a restart command too.
 
 Every inference request from Cursor follows this path through the shim:
 
+```mermaid
+sequenceDiagram
+    participant C as Cursor
+    participant S as Shim
+    participant P as Provider
+
+    C->>S: POST /Stream (Connect-RPC, binary)
+    S->>S: Parse Connect envelopes
+    S->>S: Translate to OpenAI ChatRequest
+    S->>S: Route to provider (priority/latency/round-robin)
+    S->>S: Vision check + budget guardrail
+    S->>P: POST /v1/chat/completions (OpenAI SSE)
+    alt Provider accepts
+        P-->>S: SSE chunks (text, tool calls, usage)
+        S-->>C: Connect frames (streamed)
+    else Provider rejects or stalls
+        S->>S: Failover to next provider
+        S->>P: Retry with next provider
+    end
+    S-->>C: End stream
+```
+
+<details>
+<summary>Detailed step-by-step lifecycle (click to expand)</summary>
+
 ```
  1. HTTP receive    Cursor POSTs a Connect-RPC streaming request to
                     /aiserver.v1.InferenceService/Stream
@@ -170,10 +208,18 @@ Every inference request from Cursor follows this path through the shim:
 11. Respond         Write Connect frames back to Cursor
 ```
 
+</details>
+
 The shim writes nothing to the outbound response until a provider accepts
 the request, so failover between providers is transparent to Cursor.
 
 ### The host patch
+
+> [!WARNING]
+> The setup script modifies Cursor's `host-main.cjs` in place. A backup is
+> saved as `host-main.cjs.bak` so `npm run uninstall` can restore it. If you
+> manually delete the backup, you'll need to reinstall Cursor to restore the
+> original file.
 
 Cursor's inference client lives in a bundled file called `host-main.cjs`
 (in the `sand-host` directory). The shim patches this file to:
@@ -236,7 +282,12 @@ LOCAL_API_KEY=sk-local-test         # must match WindsurfAPI's API_KEY
 ```
 
 String values in `config/config.json` support `${ENV_VAR}` interpolation, so
-the config references keys by env var name. No secrets in the config file.
+the config references keys by env var name.
+
+> [!TIP]
+> No secrets go in the config file. All API keys live in `.env` and are
+> referenced via `${VAR_NAME}` interpolation in `config.json`. This keeps
+> secrets out of git.
 
 ---
 
@@ -317,6 +368,9 @@ another chance.
 
 ### Environment variables
 
+<details>
+<summary>Full env var reference (click to expand)</summary>
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OPENCODE_API_KEY` | none | OpenCode Go + Zen API key |
@@ -336,6 +390,9 @@ another chance.
 | `MAX_CONSECUTIVE_UPSTREAM_FAILS` | `0` (off) | Stop failover after N consecutive failures |
 | `VALIDATE_TOOL_ARGUMENTS` | `false` | Validate tool call args against schemas |
 
+</details>
+
+> [!NOTE]
 > **WindsurfAPI** is a local LLM server that runs on `127.0.0.1:3003`. It
 > serves GLM and SWE models using the Devin CLI's session token for auth.
 > The `local` provider in the default config points at it. If you don't
@@ -442,6 +499,18 @@ is used as the default fallback.
 
 When `failover: true` (default), the shim tries providers in priority order
 until one succeeds. Each provider has an independent circuit breaker:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Closed
+    Closed --> Open: 3 consecutive failures
+    Open --> HalfOpen: cooldown elapsed
+    HalfOpen --> Closed: probe succeeds
+    HalfOpen --> Open: probe fails
+    Open --> Open: cooldown not elapsed
+```
+
+The circuit states:
 
 - After 3 consecutive failures (configurable via `failureThreshold`), the
   circuit opens and the provider is skipped
@@ -625,6 +694,11 @@ Two optional hard limits, both off by default:
 
 ## Deploy
 
+> [!IMPORTANT]
+> You rarely need to run deploy manually. Use `npm run setup` for normal
+> restarts. The health watchdog calls deploy automatically when the shim's
+> error rate exceeds 50%.
+
 For advanced deployment (atomic rebuild with symlink swap and host restart):
 
 ```bash
@@ -747,6 +821,9 @@ available.
 
 ## Project structure
 
+<details>
+<summary>Full file tree (click to expand)</summary>
+
 ```
 src/
   shim.ts                       Entry point (PID lock, startup, shutdown)
@@ -775,6 +852,8 @@ config/
 test/
   13 test files, 359 tests
 ```
+
+</details>
 
 ---
 
