@@ -45,8 +45,10 @@ import {
   makeResponseInfoFrame,
   makeTextFrame,
   makeUsageFrame,
+  extractUsage,
 } from "./translate/response.js";
 import { ToolCallAccumulator } from "./translate/tools.js";
+import { applyCompatToRequest } from "./providers/compat.js";
 
 /** Connect streaming path served by the shim. */
 const STREAM_PATH = "/aiserver.v1.InferenceService/Stream";
@@ -256,6 +258,7 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
           model: string;
           key: KeyInfo;
           network: NetworkConfig;
+          baseUrl: string;
         }
       | undefined;
     let requestError = false;
@@ -276,6 +279,11 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
       // Re-resolve the model for this specific provider.
       const model = provider.resolveModel(normalizedId, rawModelId);
       openaiBody.model = model;
+
+      // Apply provider-specific compat flags to the request body (e.g.
+      // coalescing multiple system messages, setting the right max_tokens
+      // field name, adding "." for empty assistant tool-call content).
+      applyCompatToRequest(openaiBody, provider.compat);
 
       const maxRetries = provider.network.maxRetries ?? 0;
       const backoffInitialMs =
@@ -332,6 +340,7 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
               model,
               key,
               network: provider.network,
+              baseUrl: provider.baseUrl,
             };
             break providerLoop;
           }
@@ -486,42 +495,66 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
     }
 
     // ---------------------------------------------------------------------
-    // 10. A provider accepted: commit the response and emit responseInfo.
+    // 10. A provider accepted: attempt the stream with empty-completion
+    //     retry. Frames are buffered per attempt; only a non-empty attempt
+    //     (or the last attempt if all are empty) is flushed to the response.
     // ---------------------------------------------------------------------
-    const { resp, providerName, model, key, network } = connected;
-    startConnectResponse(res, 200);
-    const responseId = `chatcmpl-shim-${Date.now().toString(36)}`;
-    writeFrame(res, makeResponseInfoFrame(responseId, model));
+    const { resp: firstResp, providerName, model, key, network, baseUrl } =
+      connected;
+    const requestTimeoutMs =
+      network.requestTimeoutMs ?? config.requestTimeoutMs;
 
-    // ---------------------------------------------------------------------
-    // 11-12. Stream the SSE response back as Connect frames with an idle
-    //        timeout guard.
-    // ---------------------------------------------------------------------
-    const sseParser = new SseParser();
-    const toolAcc = new ToolCallAccumulator();
-    const decoder = new TextDecoder();
+    const MAX_EMPTY_COMPLETION_RETRIES = 2;
+    const EMPTY_COMPLETION_BASE_DELAY_MS = 500;
+    const POST_FINISH_GRACE_MS = 2000;
+    const MAX_TOOL_CALLS_PER_RESPONSE = 20;
 
-    let sawFinish = false;
-    let streamError = false;
-    let promptTokens = 0;
-    let completionTokens = 0;
-    let totalTokens: number | undefined;
-    let reasoningTokens: number | undefined;
-    let cachedTokens: number | undefined;
-    // Set to true once the stream has ended (normally or on error) so a
-    // late-firing idle-timeout callback doesn't flip streamError after the
-    // finally block has already committed the success path. The stream-timeout
-    // guard's clear() cancels a pending timer, but a timer that has already
-    // fired (callback queued behind the finally block) would still run; this
-    // flag makes the callback a no-op in that race window.
-    let streamClosed = false;
+    interface AttemptResult {
+      frames: InferenceStreamResponse[];
+      hasVisibleContent: boolean;
+      sawFinish: boolean;
+      streamError: boolean;
+      promptTokens: number;
+      completionTokens: number;
+      totalTokens: number | undefined;
+      reasoningTokens: number | undefined;
+      cachedTokens: number | undefined;
+      toolCallCount: number;
+    }
 
-    // The reader is assigned inside the try block; the timeout callback
-    // references it via this outer variable so it can cancel a stalled stream.
-    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-    const streamTimeout = createStreamTimeout(
-      network.streamIdleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS,
-      () => {
+    const attemptStream = async (
+      existingResp: Response | undefined,
+    ): Promise<AttemptResult> => {
+      const frames: InferenceStreamResponse[] = [];
+      const responseId = `chatcmpl-shim-${Date.now().toString(36)}`;
+      frames.push(makeResponseInfoFrame(responseId, model));
+
+      const sseParser = new SseParser();
+      const toolAcc = new ToolCallAccumulator();
+      const decoder = new TextDecoder();
+
+      let sawFinish = false;
+      let streamError = false;
+      let hasVisibleContent = false;
+      let promptTokens = 0;
+      let completionTokens = 0;
+      let totalTokens: number | undefined;
+      let reasoningTokens: number | undefined;
+      let cachedTokens: number | undefined;
+      // Set to true once the stream has ended (normally or on error) so a
+      // late-firing idle-timeout callback doesn't flip streamError after the
+      // finally block has already committed the success path. The stream-timeout
+      // guard's clear() cancels a pending timer, but a timer that has already
+      // fired (callback queued behind the finally block) would still run; this
+      // flag makes the callback a no-op in that race window.
+      let streamClosed = false;
+      let graceStarted = false;
+
+      // The reader is assigned inside the try block; the timeout callback
+      // references it via this outer variable so it can cancel a stalled stream.
+      let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+
+      const onTimeout = (): void => {
         // Ignore a timeout that fires after the stream has already closed
         // (e.g. the timer fired but its callback was queued behind the
         // finally block's streamClosed/clear()).
@@ -537,153 +570,317 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
         void reader?.cancel().catch(() => {
           // ignore cancel rejection
         });
-      },
-    );
+      };
 
-    const processData = (data: string): void => {
-      if (data === "[DONE]") {
-        sawFinish = true;
-        return;
-      }
+      let streamTimeout = createStreamTimeout(
+        network.streamIdleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+        onTimeout,
+      );
 
-      let chunk: OpenAISSEChunk;
-      try {
-        chunk = JSON.parse(data) as OpenAISSEChunk;
-      } catch {
-        // Skip malformed JSON payloads.
-        return;
-      }
-
-      // Extract usage data BEFORE the empty-choices skip below: some
-      // providers (e.g. opencode-go's glm-5.2) send the usage in a
-      // separate chunk with an empty choices array, and we must not
-      // lose those token counts.
-      if (chunk.usage) {
-        promptTokens =
-          chunk.usage.prompt_tokens ?? chunk.usage.promptTokens ?? promptTokens;
-        completionTokens =
-          chunk.usage.completion_tokens ??
-          chunk.usage.completionTokens ??
-          completionTokens;
-        totalTokens = chunk.usage.total_tokens ?? chunk.usage.totalTokens ?? totalTokens;
-        reasoningTokens =
-          chunk.usage.completion_tokens_details?.reasoning_tokens ?? reasoningTokens;
-        cachedTokens =
-          chunk.usage.prompt_tokens_details?.cached_tokens ?? cachedTokens;
-      }
-
-      // Some providers (e.g. opencode-go) send a trailing cost-annotation
-      // frame after [DONE] with an empty choices array: {"choices":[],"cost":"0"}.
-      // There's nothing to translate from it; skip early to avoid no-op work.
-      // (Usage was already extracted above, so a usage-only empty-choices
-      // chunk is safely handled before this point.)
-      if (chunk.choices && chunk.choices.length === 0) {
-        return;
-      }
-
-      // Feed the whole chunk; the accumulator skips choices without tool_calls.
-      toolAcc.feed(chunk);
-
-      for (const choice of chunk.choices ?? []) {
-        // Forward reasoning_content (chain-of-thought) as text frames so the
-        // host sees the model's reasoning alongside the final answer. Some
-        // OpenAI-compatible providers (opencode-go, opencode-zen) stream
-        // reasoning_content separately from content for reasoning models.
-        if (choice.delta?.reasoning_content) {
-          writeFrame(res, makeTextFrame(choice.delta.reasoning_content, false));
-        }
-        if (choice.delta?.content) {
-          writeFrame(res, makeTextFrame(choice.delta.content, false));
-        }
-        if (choice.finish_reason) {
+      const processData = (data: string): void => {
+        if (data === "[DONE]") {
           sawFinish = true;
+          return;
         }
-      }
-    };
 
-    try {
-      if (!resp.body) {
-        throw new Error("upstream response has no body");
-      }
-      const r = resp.body.getReader();
-      reader = r;
-      streamTimeout.reset();
-      // eslint-disable-next-line no-constant-condition
-      while (true) {
-        const { done, value } = await r.read();
-        if (done) {
-          break;
+        let chunk: OpenAISSEChunk;
+        try {
+          chunk = JSON.parse(data) as OpenAISSEChunk;
+        } catch {
+          // Skip malformed JSON payloads.
+          return;
         }
+
+        // Extract usage data BEFORE the empty-choices skip below: some
+        // providers (e.g. opencode-go's glm-5.2) send the usage in a
+        // separate chunk with an empty choices array, and we must not
+        // lose those token counts.
+        const extracted = extractUsage(chunk);
+        if (extracted) {
+          promptTokens = extracted.promptTokens || promptTokens;
+          completionTokens = extracted.completionTokens || completionTokens;
+          totalTokens = extracted.totalTokens || totalTokens;
+          reasoningTokens = extracted.reasoningTokens || reasoningTokens;
+          cachedTokens = extracted.cachedTokens ?? cachedTokens;
+        }
+
+        // Some providers (e.g. opencode-go) send a trailing cost-annotation
+        // frame after [DONE] with an empty choices array: {"choices":[],"cost":"0"}.
+        // There's nothing to translate from it; skip early to avoid no-op work.
+        // (Usage was already extracted above, so a usage-only empty-choices
+        // chunk is safely handled before this point.)
+        if (chunk.choices && chunk.choices.length === 0) {
+          return;
+        }
+
+        // Feed the whole chunk; the accumulator skips choices without tool_calls.
+        toolAcc.feed(chunk);
+
+        for (const choice of chunk.choices ?? []) {
+          // Forward reasoning content (chain-of-thought) as text frames so the
+          // host sees the model's reasoning alongside the final answer. Some
+          // OpenAI-compatible providers stream reasoning under different field
+          // names: reasoning_content (llama.cpp/Z.AI), reasoning (OpenRouter),
+          // reasoning_text (other compat endpoints). Pick the first non-empty
+          // alias to avoid duplication when a chunk carries multiple.
+          const delta = choice.delta;
+          if (delta) {
+            const reasoningText =
+              delta.reasoning_content ||
+              delta.reasoning ||
+              delta.reasoning_text ||
+              "";
+            if (reasoningText) {
+              frames.push(makeTextFrame(reasoningText, false));
+              if (reasoningText.length > 0) {
+                hasVisibleContent = true;
+              }
+            }
+            if (delta.content) {
+              frames.push(makeTextFrame(delta.content, false));
+              if (delta.content.length > 0) {
+                hasVisibleContent = true;
+              }
+            }
+          }
+          if (choice.finish_reason) {
+            sawFinish = true;
+          }
+        }
+
+        // A tool call with non-empty parsed arguments is meaningful content.
+        if (toolAcc.size > 0 && toolAcc.hasVisibleContent()) {
+          hasVisibleContent = true;
+        }
+
+        // Tool-call loop defense: if the model produces more than
+        // MAX_TOOL_CALLS_PER_RESPONSE tool calls with no text content
+        // between them, abort the stream to prevent context ballooning.
+        if (toolAcc.size > MAX_TOOL_CALLS_PER_RESPONSE && !hasVisibleContent) {
+          streamError = true;
+          logger.error("tool-call loop detected, aborting stream", {
+            model,
+            provider: providerName,
+            toolCallCount: toolAcc.size,
+            elapsed: Date.now() - requestStart,
+          });
+          void reader?.cancel().catch(() => {
+            // ignore cancel rejection
+          });
+          return;
+        }
+      };
+
+      let resp = existingResp;
+      if (!resp) {
+        const headers: Record<string, string> = {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+        };
+        if (key.value) {
+          headers["Authorization"] = `Bearer ${key.value}`;
+        }
+        const controller = new AbortController();
+        const timeoutHandle = setTimeout(
+          () => controller.abort(),
+          requestTimeoutMs,
+        );
+        try {
+          resp = await fetch(`${baseUrl}/chat/completions`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(openaiBody),
+            signal: controller.signal,
+          });
+          clearTimeout(timeoutHandle);
+          if (!resp.ok || !resp.body) {
+            logger.warn("empty-completion retry fetch failed", {
+              model,
+              provider: providerName,
+              status: resp.status,
+              key: maskKey(key.value),
+              elapsed: Date.now() - requestStart,
+            });
+            frames.push(makeErrorFrame("upstream retry failed"));
+            return {
+              frames,
+              hasVisibleContent: false,
+              sawFinish: false,
+              streamError: true,
+              promptTokens,
+              completionTokens,
+              totalTokens,
+              reasoningTokens,
+              cachedTokens,
+              toolCallCount: toolAcc.size,
+            };
+          }
+        } catch (err) {
+          clearTimeout(timeoutHandle);
+          logger.warn("empty-completion retry fetch error", {
+            model,
+            provider: providerName,
+            key: maskKey(key.value),
+            error: err,
+            elapsed: Date.now() - requestStart,
+          });
+          frames.push(makeErrorFrame("upstream retry failed"));
+          return {
+            frames,
+            hasVisibleContent: false,
+            sawFinish: false,
+            streamError: true,
+            promptTokens,
+            completionTokens,
+            totalTokens,
+            reasoningTokens,
+            cachedTokens,
+            toolCallCount: toolAcc.size,
+          };
+        }
+      }
+
+      try {
+        if (!resp.body) {
+          throw new Error("upstream response has no body");
+        }
+        const r = resp.body.getReader();
+        reader = r;
         streamTimeout.reset();
-        const text = decoder.decode(value, { stream: true });
-        sseParser.feed(text);
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          const { done, value } = await r.read();
+          if (done) {
+            break;
+          }
+          streamTimeout.reset();
+          const text = decoder.decode(value, { stream: true });
+          sseParser.feed(text);
+          for (const data of sseParser.drain()) {
+            processData(data);
+            if (streamError) break;
+          }
+          if (streamError) break;
+          // Post-finish grace window: after finish_reason is seen, switch
+          // to a shorter idle timeout so trailing usage-only chunks are
+          // still drained but a stalled provider is force-closed.
+          if (sawFinish && !graceStarted) {
+            graceStarted = true;
+            streamTimeout.clear();
+            streamTimeout = createStreamTimeout(POST_FINISH_GRACE_MS, onTimeout);
+            streamTimeout.reset();
+          }
+        }
+
+        // Flush any trailing bytes / partial event left in the decoder + parser.
+        const tail = decoder.decode();
+        if (tail.length > 0) {
+          sseParser.feed(tail);
+        }
         for (const data of sseParser.drain()) {
           processData(data);
         }
-      }
+      } catch (err) {
+        // Don't overwrite a streamError already set by the idle timeout.
+        if (!streamError) {
+          streamError = true;
+          logger.error("stream error", {
+            model,
+            provider: providerName,
+            error: err,
+          });
+        }
+      } finally {
+        // Mark the stream closed before clearing the timeout so a
+        // late-firing idle-timeout callback is ignored (see streamClosed).
+        streamClosed = true;
+        streamTimeout.clear();
 
-      // Flush any trailing bytes / partial event left in the decoder + parser.
-      const tail = decoder.decode();
-      if (tail.length > 0) {
-        sseParser.feed(tail);
-      }
-      for (const data of sseParser.drain()) {
-        processData(data);
-      }
-    } catch (err) {
-      // Don't overwrite a streamError already set by the idle timeout.
-      if (!streamError) {
-        streamError = true;
-        logger.error("stream error", {
+        // Flush accumulated tool calls. When the stream errored, emit them as
+        // incomplete so the host knows a tool call was attempted but unfinished.
+        const toolFrames = toolAcc.flush(!streamError);
+        for (const frame of toolFrames) {
+          frames.push(frame);
+        }
+
+        // Emit usage totals (including extended token details if the provider
+        // reported them: total tokens, reasoning tokens, cached tokens).
+        frames.push(
+          makeUsageFrame(promptTokens, completionTokens, totalTokens, reasoningTokens, cachedTokens),
+        );
+
+        // Final frame: a terminal textPart on success, or an error on failure.
+        if (streamError) {
+          frames.push(makeErrorFrame("stream error"));
+        } else {
+          frames.push(makeTextFrame("", true));
+        }
+
+        logger.info("request complete", {
           model,
           provider: providerName,
-          error: err,
+          key: maskKey(key.value),
+          sawFinish,
+          promptTokens,
+          completionTokens,
+          totalTokens,
+          reasoningTokens,
+          cachedTokens,
+          toolCalls: toolAcc.size,
+          streamError,
+          elapsed: Date.now() - requestStart,
         });
       }
-    } finally {
-      // Mark the stream closed before clearing the timeout so a
-      // late-firing idle-timeout callback is ignored (see streamClosed).
-      streamClosed = true;
-      streamTimeout.clear();
 
-      // Flush accumulated tool calls. When the stream errored, emit them as
-      // incomplete so the host knows a tool call was attempted but unfinished.
-      const toolFrames = toolAcc.flush(!streamError);
-      for (const frame of toolFrames) {
-        writeFrame(res, frame);
-      }
-
-      // Emit usage totals (including extended token details if the provider
-      // reported them: total tokens, reasoning tokens, cached tokens).
-      writeFrame(
-        res,
-        makeUsageFrame(promptTokens, completionTokens, totalTokens, reasoningTokens, cachedTokens),
-      );
-
-      // Final frame: a terminal textPart on success, or an error on failure.
-      if (streamError) {
-        writeFrame(res, makeErrorFrame("stream error"));
-      } else {
-        writeFrame(res, makeTextFrame("", true));
-      }
-
-      endStream(res);
-
-      logger.info("request complete", {
-        model,
-        provider: providerName,
-        key: maskKey(key.value),
+      return {
+        frames,
+        hasVisibleContent,
         sawFinish,
+        streamError,
         promptTokens,
         completionTokens,
         totalTokens,
         reasoningTokens,
         cachedTokens,
-        toolCalls: toolAcc.size,
-        streamError,
-        elapsed: Date.now() - requestStart,
-      });
+        toolCallCount: toolAcc.size,
+      };
+    };
+
+    let lastResult: AttemptResult | undefined;
+    for (
+      let emptyAttempt = 0;
+      emptyAttempt <= MAX_EMPTY_COMPLETION_RETRIES;
+      emptyAttempt++
+    ) {
+      if (emptyAttempt > 0) {
+        await sleep(EMPTY_COMPLETION_BASE_DELAY_MS * 2 ** (emptyAttempt - 1));
+      }
+      const result = await attemptStream(
+        emptyAttempt === 0 ? firstResp : undefined,
+      );
+      lastResult = result;
+      if (result.hasVisibleContent || result.streamError) {
+        break;
+      }
+      if (emptyAttempt < MAX_EMPTY_COMPLETION_RETRIES) {
+        logger.info("empty completion, retrying", {
+          model,
+          provider: providerName,
+          attempt: emptyAttempt,
+          completionTokens: result.completionTokens,
+          toolCalls: result.toolCallCount,
+          elapsed: Date.now() - requestStart,
+        });
+      }
     }
+
+    startConnectResponse(res, 200);
+    if (lastResult) {
+      for (const frame of lastResult.frames) {
+        writeFrame(res, frame);
+      }
+    }
+    endStream(res);
   });
 
   // Graceful shutdown: stop accepting new connections, then force-exit.

@@ -9,6 +9,7 @@
 
 import type { OpenAISSEChunk, InferenceStreamResponse } from "../types.js";
 import { makeToolCallFrame } from "./response.js";
+import { parseStreamingJson } from "../utils/json-parse.js";
 
 /** A single accumulated tool call, built up from streaming deltas. */
 export interface AccumulatedToolCall {
@@ -89,5 +90,19 @@ export class ToolCallAccumulator {
     return Array.from(this.calls.entries())
       .sort((a, b) => a[0] - b[0])
       .map(([, v]) => ({ id: v.id, name: v.name, args: v.args }));
+  }
+
+  /**
+   * True if any accumulated tool call has non-empty parsed arguments
+   * (not just `{}`). Used by the empty-completion retry logic to
+   * distinguish a degenerate response from a meaningful one.
+   */
+  hasVisibleContent(): boolean {
+    for (const tc of this.calls.values()) {
+      if (tc.args.length === 0) continue;
+      const parsed = parseStreamingJson(tc.args);
+      if (Object.keys(parsed).length > 0) return true;
+    }
+    return false;
   }
 }

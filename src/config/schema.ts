@@ -31,6 +31,23 @@ const networkConfigSchema = z.object({
   failureThreshold: z.number().positive().optional(),
 });
 
+/** Validation schema for per-provider compat flag overrides. */
+const compatOverridesSchema = z.object({
+  supportsReasoningEffort: z.boolean().optional(),
+  thinkingFormat: z
+    .enum(["openai", "zai", "qwen", "qwen-chat-template", "openrouter"])
+    .optional(),
+  reasoningContentField: z.string().optional(),
+  requiresAssistantContentForToolCalls: z.boolean().optional(),
+  supportsMultipleSystemMessages: z.boolean().optional(),
+  maxTokensField: z.enum(["max_tokens", "max_completion_tokens"]).optional(),
+  streamIdleTimeoutMs: z.number().positive().optional(),
+  stripDeepseekSpecialTokens: z.boolean().optional(),
+  streamMarkupHealingPattern: z
+    .enum(["kimi", "dsml", "thinking"])
+    .optional(),
+});
+
 /** Validation schema for a single provider entry. */
 export const providerConfigSchema = z.object({
   baseUrl: z.string().url(),
@@ -39,6 +56,7 @@ export const providerConfigSchema = z.object({
   defaultModel: z.string(),
   models: z.record(z.string(), z.string()),
   network: networkConfigSchema.optional(),
+  compat: compatOverridesSchema.optional(),
 });
 
 /** Validation schema for the `providers` block. */

@@ -6,7 +6,7 @@
  * streaming layer to translate OpenAI SSE chunks back into Connect frames.
  */
 
-import type { InferenceStreamResponse } from "../types.js";
+import type { InferenceStreamResponse, OpenAISSEChunk } from "../types.js";
 
 /**
  * Build a `responseInfo` frame carrying the response id and model name.
@@ -120,6 +120,79 @@ export function makeUsageFrame(
     usage.cachedTokens = safeTokenCount(cachedTokens);
   }
   return { usage };
+}
+
+/**
+ * Normalized usage object extracted from an OpenAI SSE chunk.
+ */
+export interface ExtractedUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  reasoningTokens: number;
+  cachedTokens: number;
+  cacheWriteTokens: number;
+}
+
+function firstPositiveNumber(...values: (number | undefined)[]): number {
+  for (const value of values) {
+    if (typeof value === "number" && value > 0) return value;
+  }
+  return 0;
+}
+
+/**
+ * Extract a normalized usage object from an OpenAI SSE chunk's `usage` block.
+ *
+ * Checks all the field variants providers use (camelCase aliases, top-level
+ * `cached_tokens`, DeepSeek `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`,
+ * OpenRouter `prompt_tokens_details.cache_write_tokens`) and returns a single
+ * object with `promptTokens`, `completionTokens`, `totalTokens`,
+ * `reasoningTokens`, `cachedTokens`, and `cacheWriteTokens`. Returns `null`
+ * when the chunk carries no usage block.
+ */
+export function extractUsage(chunk: OpenAISSEChunk): ExtractedUsage | null {
+  const usage = chunk.usage;
+  if (!usage) return null;
+  const promptTokens =
+    usage.prompt_tokens ?? usage.promptTokens ?? 0;
+  const completionTokens =
+    usage.completion_tokens ?? usage.completionTokens ?? 0;
+  const reportedTotal =
+    usage.total_tokens ?? usage.totalTokens;
+  const cachedTokens = firstPositiveNumber(
+    usage.cached_tokens,
+    usage.prompt_cache_hit_tokens,
+    usage.prompt_tokens_details?.cached_tokens,
+  );
+  const reasoningTokens = usage.completion_tokens_details?.reasoning_tokens ?? 0;
+  const cacheWriteOpenRouter = usage.prompt_tokens_details?.cache_write_tokens;
+  const cacheWriteDeepSeek = usage.prompt_cache_miss_tokens;
+  const hasDeepSeekCacheHitAndMiss =
+    usage.prompt_cache_hit_tokens !== undefined &&
+    usage.prompt_cache_miss_tokens !== undefined;
+  const cacheWriteTokens =
+    cacheWriteOpenRouter ?? cacheWriteDeepSeek ?? 0;
+  const isDeepSeekUsage =
+    hasDeepSeekCacheHitAndMiss &&
+    cacheWriteOpenRouter === undefined &&
+    (cacheWriteDeepSeek ?? 0) > 0;
+  const cacheWrite = isDeepSeekUsage ? 0 : cacheWriteTokens;
+  const totalTokens =
+    typeof reportedTotal === "number"
+      ? reportedTotal
+      : Math.max(0, promptTokens - cachedTokens - cacheWrite) +
+        completionTokens +
+        cachedTokens +
+        cacheWrite;
+  return {
+    promptTokens: safeTokenCount(promptTokens),
+    completionTokens: safeTokenCount(completionTokens),
+    totalTokens: safeTokenCount(totalTokens),
+    reasoningTokens: safeTokenCount(reasoningTokens),
+    cachedTokens: safeTokenCount(cachedTokens),
+    cacheWriteTokens: safeTokenCount(cacheWrite),
+  };
 }
 
 /**

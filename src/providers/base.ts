@@ -8,6 +8,8 @@
  * and ./local.ts).
  */
 import type { KeyInfo, NetworkConfig, Provider, ProviderConfig } from "../types.js";
+import { resolveCompat } from "./compat.js";
+import type { ProviderCompat } from "./compat.js";
 
 /**
  * Normalize a raw model id for alias lookup.
@@ -47,6 +49,8 @@ export class BaseProvider implements Provider {
   readonly defaultModel: string;
   readonly network: NetworkConfig;
   readonly models: Map<string, string>;
+  /** Resolved provider compat flags (auto-detected from name/baseUrl/model). */
+  readonly compat: ProviderCompat;
 
   /** Round-robin cursor for key selection. Bounded to prevent overflow. */
   private keyCursor: number = 0;
@@ -100,6 +104,13 @@ export class BaseProvider implements Provider {
       }
     }
     this.models = mergedModels;
+
+    this.compat = resolveCompat(
+      name,
+      this.baseUrl,
+      this.defaultModel,
+      config.compat,
+    );
   }
 
   canHandle(normalizedModelId: string): boolean {

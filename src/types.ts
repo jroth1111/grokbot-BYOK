@@ -145,6 +145,9 @@ export interface OpenAISSEChunk {
       role?: string;
       content?: string;
       reasoning_content?: string;
+      reasoning?: string;
+      reasoning_text?: string;
+      reasoning_details?: unknown;
       tool_calls?: {
         index: number;
         id?: string;
@@ -163,8 +166,18 @@ export interface OpenAISSEChunk {
     completionTokens?: number;
     /** CamelCase alias for total_tokens (some OpenAI-compatible providers). */
     totalTokens?: number;
+    /** Top-level cached tokens used by some providers. */
+    cached_tokens?: number;
+    /** DeepSeek prompt cache hit tokens. */
+    prompt_cache_hit_tokens?: number;
+    /** DeepSeek prompt cache miss tokens (cache write). */
+    prompt_cache_miss_tokens?: number;
     /** Breakdown of prompt tokens (e.g. cached tokens from prompt caching). */
-    prompt_tokens_details?: { cached_tokens?: number };
+    prompt_tokens_details?: {
+      cached_tokens?: number;
+      /** OpenRouter cache write tokens. */
+      cache_write_tokens?: number;
+    };
     /** Breakdown of completion tokens (e.g. reasoning tokens for o1-style models). */
     completion_tokens_details?: { reasoning_tokens?: number };
   };
@@ -188,6 +201,8 @@ export type InferenceStreamResponse =
         reasoningTokens?: number;
         /** Cached prompt tokens (prompt caching), if reported. */
         cachedTokens?: number;
+        /** Cache-write tokens (prompt cache misses), if reported. */
+        cacheWriteTokens?: number;
       };
     }
   | { error: { message: string; code: string; errorType: string } };
@@ -241,6 +256,8 @@ export interface Provider {
   readonly apiKey: string;
   readonly defaultModel: string;
   readonly network: NetworkConfig;
+  /** Per-provider compat flags (auto-detected + user overrides). */
+  readonly compat: ProviderCompatFlags;
   /** Alias -> canonical model id map (provider-level, merged with per-key maps). */
   readonly models: Map<string, string>;
   /** Returns true if this provider has an alias for the given model id. */
@@ -265,6 +282,21 @@ export interface ProviderConfig {
   models: Record<string, string>;
   /** Per-provider network/retry config. */
   network?: NetworkConfig;
+  /** Per-provider compat flag overrides. */
+  compat?: Partial<ProviderCompatFlags>;
+}
+
+/** Compat flag overrides a user can set per provider in config. */
+export interface ProviderCompatFlags {
+  supportsReasoningEffort: boolean;
+  thinkingFormat: "openai" | "zai" | "qwen" | "qwen-chat-template" | "openrouter";
+  reasoningContentField: string;
+  requiresAssistantContentForToolCalls: boolean;
+  supportsMultipleSystemMessages: boolean;
+  maxTokensField: "max_tokens" | "max_completion_tokens";
+  streamIdleTimeoutMs: number;
+  stripDeepseekSpecialTokens: boolean;
+  streamMarkupHealingPattern: "kimi" | "dsml" | "thinking" | undefined;
 }
 
 // ---------------------------------------------------------------------------
