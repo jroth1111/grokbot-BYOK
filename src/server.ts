@@ -1415,11 +1415,15 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
           Date.now() - requestStart,
           ttfbMs,
         );
-        // Record performance data for latency-based routing.
+        // Record performance data for latency-based routing. Both TTFB
+        // and throughput are normalized by work (prompt tokens / completion
+        // tokens) so providers are compared apples-to-apples regardless
+        // of the request sizes they happened to serve.
         performanceTracker.record(
           providerName,
           !streamError,
           ttfbMs,
+          promptTokens,
           completionTokens,
           Date.now() - requestStart,
         );
