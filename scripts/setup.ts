@@ -30,6 +30,7 @@
  *   --no-build             Skip the build step (use existing dist/).
  *   --no-watch             Don't start the host watcher daemon.
  *   --no-health            Don't start the health watchdog daemon.
+ *   --no-patch             Don't patch Cursor's host-main.cjs.
  *   --quiet                Suppress provider table and detailed output.
  *   --stop                 Stop all daemons and exit.
  *   --status               Print daemon status and exit.
@@ -49,6 +50,24 @@ const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const distDir = path.resolve(scriptDir, "..");
 const projectRoot = path.resolve(distDir, "..");
 const configDir = path.join(projectRoot, "config");
+
+// ─── Load .env into process.env ───────────────────────────────────────────
+// The config file uses ${VAR} interpolation, and patch-host needs
+// SAND_HOST_DIR. Load .env early so these are available.
+(function sourceEnvFile() {
+  const envFile = path.join(projectRoot, ".env");
+  if (!existsSync(envFile)) return;
+  const text = readFileSync(envFile, "utf8");
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eqIdx = trimmed.indexOf("=");
+    if (eqIdx < 0) continue;
+    const key = trimmed.slice(0, eqIdx).trim();
+    const val = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, "");
+    if (key && process.env[key] === undefined) process.env[key] = val;
+  }
+})();
 
 // ─── Provider definitions ─────────────────────────────────────────────────
 
@@ -148,6 +167,7 @@ interface SetupArgs {
   noBuild: boolean;
   noWatch: boolean;
   noHealth: boolean;
+  noPatch: boolean;
   quiet: boolean;
   stop: boolean;
   status: boolean;
@@ -173,6 +193,7 @@ function parseArgs(argv: string[]): SetupArgs {
     noBuild: argv.includes("--no-build"),
     noWatch: argv.includes("--no-watch"),
     noHealth: argv.includes("--no-health"),
+    noPatch: argv.includes("--no-patch"),
     quiet: argv.includes("--quiet"),
     stop: argv.includes("--stop"),
     status: argv.includes("--status"),
@@ -446,7 +467,31 @@ async function main(): Promise<void> {
   if (listening) ok(`Shim listening on ${shimHost}:${shimPort}`);
   else { err(`Shim did not start listening on ${shimHost}:${shimPort} within 15s`); warn(`Check log: ${LOG_FILES.shim}`); }
 
-  // 7b: Host watcher (only if host-main.cjs exists)
+  // 7b: Patch Cursor's host to route through the shim
+  if (args.noPatch) {
+    info("Host patch: skipped (--no-patch)");
+  } else {
+    const sandHostDir = process.env.SAND_HOST_DIR || config?.hostConfig?.sandHostDir || path.join(process.env.HOME ?? "/root", "sand-host");
+    const hostMain = path.join(sandHostDir, "host-main.cjs");
+    if (existsSync(hostMain)) {
+      const patchScript = path.join(distDir, "scripts", "patch-host.js");
+      if (existsSync(patchScript)) {
+        info("Patching Cursor host to route through shim...");
+        try {
+          execSync(`node ${JSON.stringify(patchScript)}`, { stdio: quiet ? "pipe" : "inherit", cwd: projectRoot });
+          ok("Host patched — Cursor inference now routes through the shim");
+        } catch {
+          warn("Host patch failed — shim is running but Cursor is not hooked in.");
+          warn("Run manually: node dist/scripts/patch-host.js");
+        }
+      } else { warn("Host patch: dist/scripts/patch-host.js not found"); }
+    } else {
+      info(`Host patch: host-main.cjs not found at ${hostMain}, skipping`);
+      if (!quiet) info(`${DIM}Cursor may not be installed. Re-run setup after Cursor is installed.${RESET}`);
+    }
+  }
+
+  // 7c: Host watcher (only if host-main.cjs exists)
   if (args.noWatch) {
     info("Host watcher: skipped (--no-watch)");
   } else {
@@ -464,7 +509,7 @@ async function main(): Promise<void> {
     }
   }
 
-  // 7c: Health watchdog
+  // 7d: Health watchdog
   if (args.noHealth) {
     info("Health watchdog: skipped (--no-health)");
   } else {
