@@ -85,12 +85,25 @@ function convertTools(tools: InferenceTool[] | undefined): OpenAITool[] {
     if (name === "") {
       continue;
     }
+    let parameters = structToJs(t.parameters);
+    // The host wraps JSON-schema tool parameters in a { jsonSchema: { ... } }
+    // envelope (proto3 Struct form). OpenAI's API expects the raw JSON schema
+    // directly as `parameters`, so unwrap the envelope if present.
+    if (
+      parameters &&
+      typeof parameters === "object" &&
+      "jsonSchema" in parameters &&
+      typeof parameters.jsonSchema === "object" &&
+      parameters.jsonSchema !== null
+    ) {
+      parameters = parameters.jsonSchema as Record<string, unknown>;
+    }
     out.push({
       type: "function",
       function: {
         name,
         description: t.description ?? "",
-        parameters: structToJs(t.parameters),
+        parameters,
       },
     });
   }

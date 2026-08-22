@@ -83,4 +83,11 @@ export class ToolCallAccumulator {
   get size(): number {
     return this.calls.size;
   }
+
+  /** Snapshot of accumulated tool calls (for debugging). */
+  get callList(): Array<{ id: string; name: string; args: string }> {
+    return Array.from(this.calls.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([, v]) => ({ id: v.id, name: v.name, args: v.args }));
+  }
 }
