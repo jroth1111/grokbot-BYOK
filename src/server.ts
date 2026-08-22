@@ -246,6 +246,28 @@ async function shadowProbe(
   probeBody.model = model;
   applyCompatToRequest(probeBody, provider.compat, model, provider.name, provider.baseUrl);
 
+  // Estimate prompt tokens from the request body as a fallback. Many
+  // providers only send usage (prompt_tokens) in the final chunk, but
+  // the probe aborts after ~20 tokens — before that chunk arrives.
+  // Without this fallback, promptTokens would be 0 and the prefill
+  // normalization (ttfbMs / promptTokens) wouldn't work. The estimate
+  // is rough (~4 chars/token) but sufficient for normalization.
+  const estimatePromptTokens = (b: OpenAIChatRequest): number => {
+    let chars = 0;
+    for (const msg of b.messages) {
+      if (typeof msg.content === "string") {
+        chars += msg.content.length;
+      } else if (Array.isArray(msg.content)) {
+        for (const part of msg.content) {
+          if (typeof part.text === "string") chars += part.text.length;
+        }
+      }
+      if (msg.role) chars += msg.role.length;
+    }
+    return Math.max(1, Math.ceil(chars / 4));
+  };
+  const estimatedPromptTokens = estimatePromptTokens(probeBody);
+
   const probeStart = Date.now();
   let ttfbMs: number | undefined;
   let completionTokens = 0;
@@ -329,6 +351,13 @@ async function shadowProbe(
     // If we got TTFB but no usage, estimate completion tokens from what we read.
     if (completionTokens === 0 && tokenCount > 0) {
       completionTokens = tokenCount;
+    }
+    // If the provider didn't send prompt_tokens in the stream (many only
+    // send usage in the final chunk, which we aborted before reaching),
+    // use the estimated prompt tokens from the request body so the
+    // prefill normalization (ttfbMs / promptTokens) works.
+    if (promptTokens === 0) {
+      promptTokens = estimatedPromptTokens;
     }
 
     const elapsed = Date.now() - probeStart;
@@ -963,10 +992,16 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
     // 10. A provider accepted: attempt the stream with empty-completion
     //     retry. Frames are buffered per attempt; only a non-empty attempt
     //     (or the last attempt if all are empty) is flushed to the response.
+    //
+    //     These variables are mutable so the cross-provider failover loop
+    //     (section 10b) can reassign them when switching to a different
+    //     provider on empty completion or TTFB timeout. The attemptStream
+    //     closure references them by name, so reassignment here is visible
+    //     inside attemptStream on the next call.
     // ---------------------------------------------------------------------
-    const { resp: firstResp, providerName, model, key, network, baseUrl, compat } =
+    let { resp: firstResp, providerName, model, key, network, baseUrl, compat } =
       connected;
-    const requestTimeoutMs =
+    let requestTimeoutMs =
       network.requestTimeoutMs ?? config.requestTimeoutMs;
 
     // -----------------------------------------------------------------
@@ -1638,12 +1673,6 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
     //      shim silently fails over and returns whichever provider responds.
     // ---------------------------------------------------------------------
     let lastResult: AttemptResult | undefined;
-    let activeProviderName = providerName;
-    let activeModel = model;
-    let activeKey = key;
-    let activeBaseUrl = baseUrl;
-    let activeCompat = compat;
-    let activeNetwork = network;
 
     // Build the list of providers to try: the connected provider first,
     // then the remaining providers in the failover chain (excluding the
@@ -1674,7 +1703,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
 
       // TTFB timeout or empty completion: try the next provider if available.
       const failoverReason = result.ttfbTimedOut ? "ttfb_timeout" : "empty_completion";
-      recordAttempt(activeProviderName, activeModel, failoverReason as AttemptOutcome, emptyAttemptStart, failoverReason);
+      recordAttempt(providerName, model, failoverReason as AttemptOutcome, emptyAttemptStart, failoverReason);
 
       // Find the next provider to try. On the first failover, switch to
       // the next in the chain. On subsequent failovers, continue down.
@@ -1683,8 +1712,8 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         // No more providers to try — log and stop.
         if (emptyAttempt < MAX_EMPTY_COMPLETION_RETRIES) {
           logger.info(`${failoverReason}, no more providers to try`, {
-            model: activeModel,
-            provider: activeProviderName,
+            model,
+            provider: providerName,
             attempt: emptyAttempt,
             elapsed: Date.now() - requestStart,
           });
@@ -1692,10 +1721,14 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         break;
       }
 
-      // Switch to the next provider for the next attempt.
+      // Switch to the next provider for the next attempt. These
+      // assignments update the mutable variables that attemptStream
+      // references via closure, so the next attemptStream call will
+      // fetch from the new provider with the correct key, compat, and
+      // network settings.
       logger.warn(`${failoverReason}, failing over to next provider`, {
-        model: activeModel,
-        from: activeProviderName,
+        model,
+        from: providerName,
         to: nextProvider.name,
         attempt: emptyAttempt,
         elapsed: Date.now() - requestStart,
@@ -1703,14 +1736,15 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
 
       // Re-resolve model + apply compat for the new provider.
       openaiBody = JSON.parse(JSON.stringify(openaiBodySnapshot)) as typeof openaiBody;
-      activeProviderName = nextProvider.name;
-      activeModel = nextProvider.resolveModel(normalizedId);
-      openaiBody.model = activeModel;
-      activeKey = nextProvider.selectKey();
-      activeBaseUrl = nextProvider.baseUrl;
-      activeCompat = nextProvider.compat;
-      activeNetwork = nextProvider.network;
-      applyCompatToRequest(openaiBody, activeCompat, activeModel, nextProvider.name, nextProvider.baseUrl);
+      providerName = nextProvider.name;
+      model = nextProvider.resolveModel(normalizedId);
+      openaiBody.model = model;
+      key = nextProvider.selectKey();
+      baseUrl = nextProvider.baseUrl;
+      compat = nextProvider.compat;
+      network = nextProvider.network;
+      requestTimeoutMs = network.requestTimeoutMs ?? config.requestTimeoutMs;
+      applyCompatToRequest(openaiBody, compat, model, nextProvider.name, nextProvider.baseUrl);
       triedProviderNames.add(nextProvider.name);
     }
 
@@ -1718,8 +1752,8 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
     // differs from the primary (the one the routing strategy selected), add an
     // x-failover header so clients that care can detect they got a fallback.
     const failoverHeaders: Record<string, string> = {};
-    if (activeProviderName !== primary.name) {
-      failoverHeaders["x-failover"] = `${primary.name}->${activeProviderName}`;
+    if (providerName !== primary.name) {
+      failoverHeaders["x-failover"] = `${primary.name}->${providerName}`;
     }
 
     startConnectResponse(res, 200, failoverHeaders);
