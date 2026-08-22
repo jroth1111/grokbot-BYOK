@@ -375,8 +375,15 @@ async function shadowProbe(
       success,
     });
 
+    // Record only prefill (TTFB) data from the probe, not throughput.
+    // The probe reads only ~20 tokens — too few for a stable tokensPerSec
+    // measurement. Including it would contaminate the throughput EWMA
+    // with noisy data (e.g. 10 tok/s from 20 tokens in 2s, when the real
+    // rate is 50+ tok/s). Pass completionTokens=0 so the throughput EWMA
+    // is skipped (per the failed-request guard), while ttfbMs and
+    // promptTokens are still recorded to update the prefill EWMA.
     performanceTracker.record(
-      provider.name, success, ttfbMs, promptTokens, completionTokens, elapsed, false,
+      provider.name, success, ttfbMs, promptTokens, 0, elapsed, false,
     );
   } catch (err) {
     const elapsed = Date.now() - probeStart;
@@ -1051,6 +1058,12 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
     const attemptStream = async (
       existingResp: Response | undefined,
     ): Promise<AttemptResult> => {
+      // Stream-local start time: measures only this attempt's duration,
+      // excluding time spent on previous providers' failed attempts and
+      // the backoff sleep between retries. Used for TTFB and stream
+      // duration measurements so the performance tracker gets accurate
+      // per-provider latency, not inflated by prior attempt overhead.
+      const streamStartMs = Date.now();
       const frames: InferenceStreamResponse[] = [];
       const responseId = `chatcmpl-shim-${Date.now().toString(36)}`;
       frames.push(makeResponseInfoFrame(responseId, model));
@@ -1199,7 +1212,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
               "";
             if (reasoningText) {
               if (ttfbMs === undefined) {
-                ttfbMs = Date.now() - requestStart;
+                ttfbMs = Date.now() - streamStartMs;
                 if (ttfbTimer) { clearTimeout(ttfbTimer); ttfbTimer = undefined; }
               }
               frames.push(makeTextFrame(reasoningText, false));
@@ -1209,7 +1222,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
             }
             if (delta.content) {
               if (ttfbMs === undefined) {
-                ttfbMs = Date.now() - requestStart;
+                ttfbMs = Date.now() - streamStartMs;
                 if (ttfbTimer) { clearTimeout(ttfbTimer); ttfbTimer = undefined; }
               }
               if (markupHealer) {
@@ -1634,13 +1647,19 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         // and throughput are normalized by work (prompt tokens / completion
         // tokens) so providers are compared apples-to-apples regardless
         // of the request sizes they happened to serve.
+        // Success = produced visible content AND no stream error. An empty
+        // completion (no content, no error) is a failure for routing
+        // purposes — the provider returned nothing useful and the retry
+        // loop will fail over. Recording it as success would hide the
+        // failure from the error rate, making the provider look more
+        // reliable than it really is.
         performanceTracker.record(
           providerName,
-          !streamError,
+          hasVisibleContent && !streamError,
           ttfbMs,
           promptTokens,
           completionTokens,
-          Date.now() - requestStart,
+          Date.now() - streamStartMs,
         );
         // Capture the response summary for debugging (opt-in via
         // CAPTURE_BODIES=true). Logs first N text frames + tool call names.
