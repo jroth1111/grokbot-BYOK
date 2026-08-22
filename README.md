@@ -65,6 +65,30 @@ OPENCODE_API_KEY=sk-xxx npm run setup
 # Or just edit .env directly and run setup without flags
 ```
 
+## Uninstall
+
+```bash
+# Stop daemons, remove PID/log files, restore Cursor's host-main.cjs
+npm run uninstall
+
+# Full removal: also delete .env, config.json, dist/, node_modules/
+npm run uninstall -- --purge
+
+# Quiet mode (agent-friendly)
+npm run uninstall -- --quiet
+
+# Leave the host patch in place (don't restore host-main.cjs)
+npm run uninstall -- --keep-host
+```
+
+The uninstall script:
+- Stops all three daemons (shim, host watcher, health watchdog)
+- Removes all PID files and log files from `/tmp/`
+- Restores Cursor's `host-main.cjs` from the `.bak` backup (if one exists)
+- Removes the `inference-proxy.url` file and deployed shim symlink
+- With `--purge`: also removes `.env`, `config/config.json`, `dist/`, `node_modules/`
+- The git repository itself is preserved (delete the directory manually if needed)
+
 ### Daemon processes
 
 | Daemon | PID file | Log file | Purpose |
@@ -191,6 +215,7 @@ src/
     error-classify.ts         Error classification for failover decisions
 scripts/
   setup.ts                    One-command setup (build, start all daemons)
+  uninstall.ts                Uninstall (stop daemons, restore host, optional --purge)
   start-shim.ts               Shim launcher (WindsurfAPI auto-start + seeding)
   deploy.ts                   Atomic deploy (build, stop, deploy, start, test)
   health-check.ts             Watchdog (JSON log parsing, auto-deploy)
