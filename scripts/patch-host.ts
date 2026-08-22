@@ -53,12 +53,17 @@ const ROUTING_CLIENT_BODY = `{
     process.env.SAND_INFERENCE_PROXY_URL ||
     (() => {
       try {
-        return require("fs").readFileSync(
+        const fs = require("fs");
+        const pathFile =
           process.env.SAND_INFERENCE_PROXY_URL_FILE ||
-            (process.env.SAND_HOST_DIR || "/root/sand-host") +
-              "/inference-proxy.url",
-          "utf8"
-        ).trim();
+          // Try __dirname first (the directory of host-main.cjs itself),
+          // then SAND_HOST_DIR, then /root/sand-host as last resort.
+          // __dirname works because this code runs inside host-main.cjs.
+          (typeof __dirname !== "undefined"
+            ? __dirname
+            : process.env.SAND_HOST_DIR || "/root/sand-host") +
+            "/inference-proxy.url";
+        return fs.readFileSync(pathFile, "utf8").trim();
       } catch (e) {
         return null;
       }
