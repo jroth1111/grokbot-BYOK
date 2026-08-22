@@ -73,10 +73,13 @@ const ROUTING_CLIENT_BODY = `{
   }
   // Use the bundle's internal createConnectTransport + createClient (already
   // in scope from the original host-main.cjs). The shim serves Connect-RPC
-  // over HTTP/1.1, matching the original transport's httpVersion.
+  // over HTTP/1.1 and expects JSON envelopes, so we force useBinaryFormat:
+  // false (the bundle defaults to true which sends binary protobuf that the
+  // shim can't parse).
   const transport = createConnectTransport({
     baseUrl: proxyUrl,
-    httpVersion: "1.1"
+    httpVersion: "1.1",
+    useBinaryFormat: false
   });
   const client = createClient(InferenceService, transport);
   return createProtoSessionProvider(
