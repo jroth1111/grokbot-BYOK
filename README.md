@@ -1,7 +1,7 @@
 # grokbot-BYOK
 
 <p align="center">
-  <img src="https://i.ibb.co/TqqGHGHp/Chat-GPT-Image-Aug-22-2026-07-14-39-PM.png" width="300" alt="grokbot-BYOK">
+  <img src="assets/logo.png" width="300" alt="grokbot-BYOK">
 </p>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
