@@ -43,10 +43,10 @@ keys are needed and how to provide them.
 npm run setup          # Start/restart everything (builds, stops old, starts new)
 npm run setup -- --status   # Check daemon status (exit 0 if all running, 1 if not)
 npm run setup -- --stop     # Stop all daemons
-npm run setup -- --no-build # Restart without rebuilding
+npm run setup -- --no-build # Restart without rebuilding (same as npm start)
 npm run setup -- --no-watch # Start without host watcher
 npm run setup -- --quiet    # Minimal output (agent-friendly)
-npm start              # Start shim only (foreground)
+npm start              # Start/restart all daemons (no rebuild, re-patches host)
 npm stop               # Stop all daemons
 npm status             # Check daemon status
 ```

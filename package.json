@@ -14,7 +14,7 @@
     "typecheck": "tsc --noEmit",
     "dev": "tsx src/shim.ts",
     "setup": "node setup.mjs",
-    "start": "node dist/scripts/start-shim.js",
+    "start": "node setup.mjs --no-build",
     "stop": "node setup.mjs -- --stop",
     "status": "node setup.mjs -- --status",
     "uninstall": "node dist/scripts/uninstall.js"
