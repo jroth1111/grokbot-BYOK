@@ -41,6 +41,17 @@ const MIN_SAMPLES = 3;
 /** Penalty multiplier per error: each error reduces effective score by 20%. */
 const ERROR_PENALTY = 0.2;
 
+/** After this many ms since the last sample, a provider's data is considered
+ *  stale and its score is decayed toward zero to encourage re-exploration.
+ *  Default: 5 minutes. */
+const STALE_THRESHOLD_MS = 5 * 60 * 1000;
+
+/** Exploration rate (epsilon) for epsilon-greedy routing. With this
+ *  probability, a random eligible provider is selected instead of the
+ *  best-scoring one, ensuring all providers accumulate fresh data.
+ *  Default: 0.10 (10% of requests explore). */
+const DEFAULT_EPSILON = 0.10;
+
 interface ProviderPerf {
   /** EWMA of TTFB / promptTokens (ms per prompt token). */
   prefillMsPerPromptToken: number;
@@ -192,7 +203,19 @@ class PerformanceTracker {
     // Combined: estimated total time for the reference workload,
     // penalized by error rate.
     const errorPenalty = 1 + p.errorRate * ERROR_PENALTY * 10;
-    return (prefillMs + generationMs) * errorPenalty;
+    const baseScore = (prefillMs + generationMs) * errorPenalty;
+
+    // Staleness decay: reduce the score for providers with stale data
+    // so they get re-explored. The decay factor goes from 1.0 (fresh)
+    // to 0.5 at STALE_THRESHOLD_MS, then asymptotes toward 0.1 beyond
+    // that. This ensures stale providers are preferred over fresh ones
+    // with similar scores, triggering a re-sample.
+    const ageMs = Date.now() - p.lastUpdated;
+    const stalenessDecay = ageMs < STALE_THRESHOLD_MS
+      ? 1.0 - 0.5 * (ageMs / STALE_THRESHOLD_MS)
+      : Math.max(0.1, 0.5 * Math.exp(-(ageMs - STALE_THRESHOLD_MS) / STALE_THRESHOLD_MS));
+
+    return baseScore * stalenessDecay;
   }
 
   /** Get a snapshot of all provider performance stats. */
@@ -202,6 +225,7 @@ class PerformanceTracker {
     avgTokensPerSec: number;
     errorRate: number;
     score: number;
+    ageMs: number | null;
     refPromptTokens: number;
     refCompletionTokens: number;
   }> {
@@ -217,6 +241,7 @@ class PerformanceTracker {
       avgTokensPerSec: number;
       errorRate: number;
       score: number;
+      ageMs: number | null;
       refPromptTokens: number;
       refCompletionTokens: number;
     }> = {};
@@ -227,6 +252,7 @@ class PerformanceTracker {
         avgTokensPerSec: Math.round(p.tokensPerSec * 10) / 10,
         errorRate: Math.round(p.errorRate * 100) / 100,
         score: Math.round(this.score(provider) / 10) / 100,
+        ageMs: this.ageMs(provider),
         refPromptTokens: refPrompt,
         refCompletionTokens: refCompletion,
       };
@@ -238,6 +264,28 @@ class PerformanceTracker {
   hasEnoughData(provider: string): boolean {
     const p = this.perf.get(provider);
     return p !== undefined && p.samples >= MIN_SAMPLES;
+  }
+
+  /**
+   * Epsilon-greedy exploration: with probability epsilon, return true to
+   * indicate the caller should pick a random eligible provider instead of
+   * the best-scoring one. This ensures all providers accumulate fresh
+   * performance data, preventing the router from getting locked into one
+   * provider and never discovering that another has become faster.
+   *
+   * The exploration is only triggered when there are multiple eligible
+   * providers — a single-provider setup always exploits.
+   */
+  shouldExplore(eligibleCount: number): boolean {
+    if (eligibleCount <= 1) return false;
+    return Math.random() < DEFAULT_EPSILON;
+  }
+
+  /** Return ms since the last sample for a provider (for logging). */
+  ageMs(provider: string): number | null {
+    const p = this.perf.get(provider);
+    if (!p || p.lastUpdated === 0) return null;
+    return Date.now() - p.lastUpdated;
   }
 }
 

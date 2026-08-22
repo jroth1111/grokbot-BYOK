@@ -220,10 +220,21 @@ export class ProviderRegistry {
       return eligible[0];
     }
 
-    // Sort by performance score (lower is better). Providers with no
-    // data (score = Infinity) are ordered by their priority position
+    // Epsilon-greedy exploration: with probability epsilon, pick a random
+    // eligible provider instead of the best-scoring one. This ensures all
+    // providers accumulate fresh performance data, preventing the router
+    // from getting locked into one provider and never discovering that
+    // another has become faster.
+    if (performanceTracker.shouldExplore(eligible.length)) {
+      const idx = Math.floor(Math.random() * eligible.length);
+      return eligible[idx];
+    }
+
+    // Exploit: sort by performance score (lower is better). Providers with
+    // no data (score = Infinity) are ordered by their priority position
     // so they get tried before poor-performing providers but after
-    // good-performing ones.
+    // good-performing ones. Staleness decay in score() also pushes
+    // providers with old data to the front for re-sampling.
     const ranked = eligible
       .map((p, idx) => ({ provider: p, score: performanceTracker.score(p.name), priorityIdx: idx }))
       .sort((a, b) => {
