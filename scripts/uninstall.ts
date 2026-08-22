@@ -17,7 +17,7 @@
  *   --quiet      Minimal output (agent-friendly).
  *   --keep-host  Skip host-main.cjs restoration (leave the patch in place).
  */
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import * as path from "node:path";
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
