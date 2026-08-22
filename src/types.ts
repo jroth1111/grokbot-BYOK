@@ -297,6 +297,7 @@ export interface ProviderCompatFlags {
   streamIdleTimeoutMs: number;
   stripDeepseekSpecialTokens: boolean;
   streamMarkupHealingPattern: "kimi" | "dsml" | "thinking" | undefined;
+  supportsImages: boolean;
 }
 
 // ---------------------------------------------------------------------------

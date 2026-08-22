@@ -44,11 +44,15 @@ import {
   makeErrorFrame,
   makeResponseInfoFrame,
   makeTextFrame,
+  makeToolCallFrame,
   makeUsageFrame,
   extractUsage,
 } from "./translate/response.js";
 import { ToolCallAccumulator } from "./translate/tools.js";
 import { applyCompatToRequest } from "./providers/compat.js";
+import { rescueInlineToolCalls, containsDialectMarker } from "./translate/tool-call-rescue.js";
+import { ThinkTagStreamFilter } from "./translate/think-tags.js";
+import { stripSchemaKeys } from "./translate/tool-args.js";
 
 /** Connect streaming path served by the shim. */
 const STREAM_PATH = "/aiserver.v1.InferenceService/Stream";
@@ -531,6 +535,8 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
 
       const sseParser = new SseParser();
       const toolAcc = new ToolCallAccumulator();
+      toolAcc.setTools(openaiBody.tools);
+      const thinkFilter = new ThinkTagStreamFilter();
       const decoder = new TextDecoder();
 
       let sawFinish = false;
@@ -637,7 +643,17 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
               }
             }
             if (delta.content) {
-              frames.push(makeTextFrame(delta.content, false));
+              // DeepSeek-style models serialize reasoning INTO content as
+              // <think>…</think> blocks. Split them back out into reasoning
+              // vs content via the stateful stream filter (handles tag splits
+              // across chunk boundaries without buffering the whole stream).
+              const split = thinkFilter.push(delta.content);
+              if (split.reasoning) {
+                frames.push(makeTextFrame(split.reasoning, false));
+              }
+              if (split.content) {
+                frames.push(makeTextFrame(split.content, false));
+              }
               if (delta.content.length > 0) {
                 hasVisibleContent = true;
               }
@@ -795,6 +811,63 @@ export function createServer(config: ShimConfig, logger: Logger): http.Server {
         // late-firing idle-timeout callback is ignored (see streamClosed).
         streamClosed = true;
         streamTimeout.clear();
+
+        // Flush any remaining think-tags filter state (an unclosed  tag
+        // at stream end flushes the held bytes as reasoning).
+        const thinkTail = thinkFilter.flush();
+        if (thinkTail.reasoning) {
+          frames.push(makeTextFrame(thinkTail.reasoning, false));
+        }
+        if (thinkTail.content) {
+          frames.push(makeTextFrame(thinkTail.content, false));
+        }
+
+        // Inline tool-call dialect rescue: when a model emits tool calls as
+        // TEXT in a private training dialect (Kimi/DeepSeek tokens, Llama
+        // <function=>, Qwen XML) instead of a structured tool_calls array,
+        // re-parse them. This happens most often after failover switches
+        // models mid-task. Collect all text content, check for dialect
+        // markers, and inject rescued calls as toolCallPart frames.
+        if (toolAcc.size === 0 && !streamError) {
+          const textContent = frames
+            .map((f) => (f as { textPart?: { text: string; isFinal: boolean } }).textPart)
+            .filter((tp): tp is { text: string; isFinal: boolean } =>
+              tp !== undefined && !tp.isFinal,
+            )
+            .map((tp) => tp.text)
+            .join("");
+          if (containsDialectMarker(textContent)) {
+            const toolNames = new Set(
+              (openaiBody.tools ?? []).map((t) => t.function.name),
+            );
+            const rescue = rescueInlineToolCalls(textContent, toolNames);
+            if (rescue.calls && rescue.calls.length > 0) {
+              // Remove the text frames that carried the dialect (they're
+              // now tool calls, not prose) and inject tool-call frames.
+              for (let i = frames.length - 1; i >= 0; i--) {
+                const tp = (frames[i] as { textPart?: { isFinal: boolean } }).textPart;
+                if (tp !== undefined && !tp.isFinal) {
+                  frames.splice(i, 1);
+                }
+              }
+              if (rescue.cleanText.length > 0) {
+                frames.push(makeTextFrame(rescue.cleanText, false));
+              }
+              for (const call of rescue.calls) {
+                frames.push(
+                  makeToolCallFrame("", call.name, call.arguments, true),
+                );
+              }
+              hasVisibleContent = true;
+              logger.info("rescued inline tool calls", {
+                model,
+                provider: providerName,
+                count: rescue.calls.length,
+                dialect: "inline",
+              });
+            }
+          }
+        }
 
         // Flush accumulated tool calls. When the stream errored, emit them as
         // incomplete so the host knows a tool call was attempted but unfinished.

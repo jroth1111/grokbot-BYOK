@@ -24,6 +24,7 @@ import {
   structToJs,
   safeStringify,
 } from "../protocol/proto3.js";
+import { stripSchemaKeys } from "./tool-args.js";
 
 /**
  * Convert a single InferenceMessage's `parts` array into an array of OpenAI
@@ -98,6 +99,10 @@ function convertTools(tools: InferenceTool[] | undefined): OpenAITool[] {
     ) {
       parameters = parameters.jsonSchema as Record<string, unknown>;
     }
+    // Strip schema keys that some providers reject with a 400 (e.g. Cohere
+    // rejects `additionalProperties` and `$schema`). These carry no meaning
+    // for the call itself.
+    parameters = stripSchemaKeys(parameters, new Set(["$schema", "additionalProperties"]));
     out.push({
       type: "function",
       function: {

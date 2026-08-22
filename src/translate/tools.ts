@@ -7,9 +7,11 @@
  * frames.
  */
 
-import type { OpenAISSEChunk, InferenceStreamResponse } from "../types.js";
+import type { OpenAISSEChunk, InferenceStreamResponse, OpenAITool } from "../types.js";
 import { makeToolCallFrame } from "./response.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
+import { repairToolArguments, toolSchemaMap, stripSchemaKeys } from "./tool-args.js";
+import type { JsonSchemaish } from "./tool-args.js";
 
 /** A single accumulated tool call, built up from streaming deltas. */
 export interface AccumulatedToolCall {
@@ -26,6 +28,15 @@ export interface AccumulatedToolCall {
  */
 export class ToolCallAccumulator {
   private calls: Map<number, AccumulatedToolCall> = new Map();
+  private schemaMap: Map<string, JsonSchemaish> = new Map();
+
+  /**
+   * Set the tool schemas for this response so `flush` can repair
+   * double-encoded arguments (e.g. GLM emitting `{"plan": "[{\"step\":...}]"}`).
+   */
+  setTools(tools: OpenAITool[] | undefined): void {
+    this.schemaMap = toolSchemaMap(tools);
+  }
 
   /**
    * Feed an OpenAI SSE chunk's tool_calls deltas into the accumulator.
@@ -73,8 +84,10 @@ export class ToolCallAccumulator {
     const frames: InferenceStreamResponse[] = [];
     for (const idx of indices) {
       const tc = this.calls.get(idx)!;
+      const schema = this.schemaMap.get(tc.name);
+      const repaired = repairToolArguments(tc.args, schema);
       frames.push(
-        makeToolCallFrame(tc.id, tc.name, tc.args, isStreamComplete),
+        makeToolCallFrame(tc.id, tc.name, repaired, isStreamComplete),
       );
     }
     return frames;

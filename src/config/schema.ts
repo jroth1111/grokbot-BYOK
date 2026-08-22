@@ -46,6 +46,7 @@ const compatOverridesSchema = z.object({
   streamMarkupHealingPattern: z
     .enum(["kimi", "dsml", "thinking"])
     .optional(),
+  supportsImages: z.boolean().optional(),
 });
 
 /** Validation schema for a single provider entry. */

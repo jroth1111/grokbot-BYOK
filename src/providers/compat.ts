@@ -7,6 +7,7 @@
  * that the request translator consumes via `applyCompatToRequest`.
  */
 import type { OpenAIChatRequest, OpenAIMessage } from "../types.js";
+import { stripImagesForNonVisionModel } from "../translate/vision-guard.js";
 
 export type ThinkingFormat =
   | "openai"
@@ -31,6 +32,7 @@ export interface ProviderCompat {
   streamIdleTimeoutMs: number;
   stripDeepseekSpecialTokens: boolean;
   streamMarkupHealingPattern: StreamMarkupHealingPattern;
+  supportsImages: boolean;
 }
 
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 120_000;
@@ -253,6 +255,31 @@ function detectSupportsReasoningEffort(
   return true;
 }
 
+function detectSupportsImages(
+  provider: string,
+  baseUrl: string,
+  modelId: string,
+): boolean {
+  const id = modelId.toLowerCase();
+  if (isGlmModelId(id)) {
+    return /glm-.*v\b/.test(id) || /glm-4v/.test(id);
+  }
+  if (isKimiModelId(id)) return /kimi-k2(?:\.\d+)?/.test(id);
+  if (isQwenModelId(id)) return /qwen.*vl|qwen.*vision|qwen3\.8-max/.test(id);
+  if (isDeepseekModelId(id)) return /vl|vision/.test(id);
+  if (isGrokProvider(provider, baseUrl)) return true;
+  if (provider === "openai" || hostMatches(baseUrl, "api.openai.com")) {
+    return /gpt-4o|gpt-4-vision|gpt-4-turbo|o[134]-/.test(id);
+  }
+  if (provider === "anthropic" || hostMatches(baseUrl, "api.anthropic.com")) {
+    return /claude/.test(id);
+  }
+  if (provider === "google" || hostMatches(baseUrl, "generativelanguage.googleapis.com")) {
+    return /gemini/.test(id);
+  }
+  return false;
+}
+
 /**
  * Resolve provider compat flags from the provider name, base URL, and model id.
  *
@@ -286,6 +313,7 @@ export function resolveCompat(
       isDeepseekModelId(modelIdLower) &&
       (provider === "nvidia" || provider === "deepseek"),
     streamMarkupHealingPattern: detectStreamMarkupHealingPattern(provider, modelIdLower, base),
+    supportsImages: detectSupportsImages(provider, base, modelIdLower),
   };
   if (overrides) {
     for (const [key, value] of Object.entries(overrides)) {
@@ -350,6 +378,14 @@ export function applyCompatToRequest(
           : msg.content.length > 0);
       if (!hasContent) {
         msg.content = ".";
+      }
+    }
+  }
+
+  if (!compat.supportsImages) {
+    for (const msg of openaiBody.messages) {
+      if (Array.isArray(msg.content)) {
+        msg.content = stripImagesForNonVisionModel(msg.content, false);
       }
     }
   }
