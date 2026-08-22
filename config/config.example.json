@@ -10,7 +10,7 @@
     "ttlMs": 3600000
   },
   "providers": {
-    "priority": ["opencode-go", "kilo", "openrouter", "opencode-zen", "local"],
+    "priority": ["openrouter", "opencode-go", "kilo", "opencode-zen", "local"],
     "configs": {
       "opencode-go": {
         "baseUrl": "https://opencode.ai/zen/go/v1",

@@ -118,7 +118,7 @@ keyless ones).
 | `opencode-zen` | `OPENCODE_API_KEY` | no | x-preview-f-free | Secondary OpenCode endpoint (shared key) |
 | `local` | `LOCAL_API_KEY` | no | glm-5.2, glm-5.1, swe-1-7 | WindsurfAPI on localhost |
 
-**Failover order:** `opencode-go` → `kilo` → `openrouter` → `opencode-zen` → `local`
+**Failover order:** `openrouter` → `opencode-go` → `kilo` → `opencode-zen` → `local`
 
 ### Where to get API keys
 
@@ -157,7 +157,7 @@ at startup. Copy `config/config.example.json` to get started.
   "failover": true,
   "requestTimeoutMs": 30000,
   "providers": {
-    "priority": ["opencode-go", "kilo", "openrouter", "opencode-zen", "local"],
+    "priority": ["openrouter", "opencode-go", "kilo", "opencode-zen", "local"],
     "configs": { ... }
   },
   "hostConfig": {

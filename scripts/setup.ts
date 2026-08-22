@@ -293,8 +293,8 @@ function printProviderTable(): void {
   console.log(`  ${CYAN}OPENCODE_API_KEY=sk-xxx npm run setup${RESET}`);
   console.log(`  Or edit ${CYAN}.env${RESET} manually and run ${CYAN}npm run setup${RESET}`);
   console.log();
-  console.log(`${BOLD}Failover order:${RESET} opencode-go → kilo → openrouter → opencode-zen → local`);
-  console.log(`${DIM}Providers with missing API keys are automatically skipped (except keyless ones).${RESET}`);
+  console.log(`${BOLD}Failover order:${RESET} openrouter → opencode-go → kilo → opencode-zen → local`);
+  console.log(`${DIM}Providers with missing API keys are automatically skipped (except keyless ones like kilo).${RESET}`);
   console.log();
 }
 
