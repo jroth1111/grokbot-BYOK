@@ -49,6 +49,15 @@ const compatOverridesSchema = z.object({
     .optional(),
 });
 
+/** Validation schema for OAuth ("Sign in with ChatGPT") provider auth. */
+const providerAuthSchema = z.object({
+  type: z.literal("chatgpt-oauth"),
+  tokenFile: z.string().optional(),
+  authorizeUrl: z.string().url().optional(),
+  tokenUrl: z.string().url().optional(),
+  revokeUrl: z.string().url().optional(),
+});
+
 /** Validation schema for a single provider entry. */
 export const providerConfigSchema = z.object({
   baseUrl: z.string().url(),
@@ -59,6 +68,9 @@ export const providerConfigSchema = z.object({
   network: networkConfigSchema.optional(),
   compat: compatOverridesSchema.optional(),
   keyless: z.boolean().optional(),
+  auth: providerAuthSchema.optional(),
+  endpointPath: z.string().optional(),
+  wireApi: z.enum(["chat-completions", "responses"]).optional(),
 });
 
 /** Validation schema for the `providers` block. */

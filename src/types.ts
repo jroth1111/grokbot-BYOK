@@ -6,6 +6,11 @@
  * reaching into another module's internals.
  */
 
+// Type-only circular import (erased at compile time): the OAuth token
+// manager lives in providers/chatgpt-oauth.ts but the Provider interface
+// needs its type for the optional authManager field.
+import type { ChatGptTokenManager } from "./providers/chatgpt-oauth.js";
+
 // ---------------------------------------------------------------------------
 // Connect protocol types
 // ---------------------------------------------------------------------------
@@ -214,6 +219,25 @@ export type InferenceStreamResponse =
 /** Routing strategy for selecting among providers that can handle a model. */
 export type RoutingStrategy = "priority" | "round-robin" | "weighted-round-robin" | "fill-first" | "latency";
 
+/** Upstream wire protocol spoken by a provider. */
+export type WireApi = "chat-completions" | "responses";
+
+/**
+ * OAuth-based auth config for providers that authenticate via a browser
+ * login flow instead of static API keys ("Sign in with ChatGPT", the same
+ * OAuth app the Codex CLI uses). The token store is a local JSON file the
+ * login CLI writes and the shim's TokenManager keeps fresh.
+ */
+export interface ProviderAuthConfig {
+  type: "chatgpt-oauth";
+  /** Path to the multi-account token store (default: config/chatgpt-tokens.json). */
+  tokenFile?: string;
+  /** Override the OAuth endpoints (used by tests to point at a local mock). */
+  authorizeUrl?: string;
+  tokenUrl?: string;
+  revokeUrl?: string;
+}
+
 /** A single API key with optional weight. */
 export interface KeyInfo {
   /** The API key value. */
@@ -265,6 +289,12 @@ export interface Provider {
   canHandle(normalizedModelId: string): boolean;
   /** Resolves a normalized model id to the canonical id to send upstream. */
   resolveModel(normalizedModelId: string): string;
+  /** Upstream endpoint path appended to baseUrl (default "/chat/completions"). */
+  readonly endpointPath: string;
+  /** Upstream wire protocol (default "chat-completions"). */
+  readonly wireApi: WireApi;
+  /** OAuth token manager when auth.type is "chatgpt-oauth", else undefined. */
+  readonly authManager?: ChatGptTokenManager;
   /** Select the next API key (for key rotation). */
   selectKey(): KeyInfo;
   /** Mark a key as failed (for rotation). */
@@ -290,6 +320,13 @@ export interface ProviderConfig {
    * (e.g. Kilo's anonymous access for free models at 200 req/hr/IP).
    */
   keyless?: boolean;
+  /** OAuth login auth (e.g. "Sign in with ChatGPT"). Mutually exclusive with
+   *  a meaningful apiKey: when set, credentials come from the token store. */
+  auth?: ProviderAuthConfig;
+  /** Upstream endpoint path appended to baseUrl (default "/chat/completions"). */
+  endpointPath?: string;
+  /** Upstream wire protocol (default "chat-completions"). */
+  wireApi?: WireApi;
 }
 
 /** Compat flag overrides a user can set per provider in config. */

@@ -10,7 +10,7 @@
     "ttlMs": 3600000
   },
   "providers": {
-    "priority": ["openrouter", "opencode-go", "kilo", "opencode-zen", "local"],
+    "priority": ["openrouter", "opencode-go", "kilo", "opencode-zen", "local", "chatgpt"],
     "configs": {
       "opencode-go": {
         "baseUrl": "https://opencode.ai/zen/go/v1",
@@ -134,6 +134,42 @@
           "requestTimeoutMs": 5000,
           "maxRetries": 0,
           "streamIdleTimeoutMs": 60000
+        }
+      },
+      "chatgpt": {
+        "baseUrl": "https://chatgpt.com/backend-api/codex",
+        "apiKey": "",
+        "auth": {
+          "type": "chatgpt-oauth",
+          "tokenFile": "config/chatgpt-tokens.json"
+        },
+        "endpointPath": "/responses",
+        "wireApi": "responses",
+        "defaultModel": "gpt-reserve",
+        "models": {
+          "gpt-reserve": "gpt-reserve",
+          "gpt-5.6-luna": "gpt-5.6-luna",
+          "gpt-5.6-terra": "gpt-5.6-terra",
+          "gpt-6-luna": "gpt-6-luna",
+          "codex-auto-review": "codex-auto-review",
+          "gpt-5.6": "gpt-5.6-luna",
+          "gpt-6": "gpt-6-luna",
+          "codex": "gpt-reserve",
+          "ox alpha": "gpt-reserve",
+          "ox-alpha": "gpt-reserve",
+          "0x alpha": "gpt-reserve",
+          "sand-default": "gpt-reserve",
+          "default": "gpt-reserve"
+        },
+        "compat": {
+          "supportsImages": false,
+          "supportsReasoningEffort": true
+        },
+        "network": {
+          "maxRetries": 1,
+          "rateLimitCooldownMs": 10000,
+          "serverErrorCooldownMs": 30000,
+          "streamIdleTimeoutMs": 120000
         }
       }
     }

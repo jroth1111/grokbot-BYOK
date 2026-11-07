@@ -2,9 +2,13 @@
  * Tests for provider routing, failover chains, and the circuit breaker.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { ProviderRegistry } from "../src/providers/registry.js";
 import { CircuitBreaker } from "../src/providers/failover.js";
 import { BaseProvider } from "../src/providers/base.js";
+import { ChatGptTokenStore } from "../src/providers/chatgpt-oauth.js";
 import type { KeyInfo, NetworkConfig, ProviderConfig } from "../src/types.js";
 
 /** Provider configs taken from config/config.example.json. */
@@ -813,5 +817,61 @@ describe("BaseProvider key rotation with auth errors", () => {
     // Request 2: reset failed keys — key-a should be available again
     provider.resetKeyFailures();
     expect(provider.selectKey().value).toBe("key-a");
+  });
+});
+
+// ===========================================================================
+// ChatGPT OAuth providers ("Sign in with ChatGPT")
+// ===========================================================================
+
+describe("ProviderRegistry chatgpt-oauth providers", () => {
+  function oauthConfigs(tokenFile: string): Record<string, ProviderConfig> {
+    const configs = exampleConfigs();
+    return {
+      ...configs,
+      "opencode-go": { ...configs["opencode-go"], apiKey: "sk-live" },
+      chatgpt: {
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        apiKey: "",
+        auth: { type: "chatgpt-oauth", tokenFile },
+        endpointPath: "/responses",
+        wireApi: "responses",
+        defaultModel: "gpt-5.2-codex",
+        models: { "gpt-5.2-codex": "gpt-5.2-codex" },
+      },
+    };
+  }
+
+  it("excludes oauth providers with no token store (falls to next provider)", () => {
+    const registry = new ProviderRegistry(
+      oauthConfigs("/tmp/byok-nonexistent-tokens.json"),
+      ["chatgpt", "opencode-go"],
+    );
+    const { provider } = registry.resolveProvider("gpt-5.2-codex");
+    expect(provider.name).toBe("opencode-go");
+  });
+
+  it("includes oauth providers once a token store has an enabled account", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "byok-routing-"));
+    const file = path.join(dir, "tokens.json");
+    new ChatGptTokenStore(file).save([
+      {
+        accountId: "acct-1",
+        accessToken: "tok",
+        refreshToken: "rt",
+        expiresAtMs: Date.now() + 3_600_000,
+        obtainedAtMs: Date.now(),
+        enabled: true,
+      },
+    ]);
+    const registry = new ProviderRegistry(oauthConfigs(file), ["chatgpt", "opencode-go"]);
+    const { provider } = registry.resolveProvider("gpt-5.2-codex");
+    expect(provider.name).toBe("chatgpt");
+    // Keys derive from enabled accounts (value = account id) and the
+    // dialect fields flow through for the fetch layer.
+    expect(provider.keys.map((k) => k.value)).toEqual(["acct-1"]);
+    expect(provider.endpointPath).toBe("/responses");
+    expect(provider.wireApi).toBe("responses");
+    expect(provider.authManager).toBeDefined();
   });
 });

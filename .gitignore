@@ -8,3 +8,7 @@ config/config.json
 inference-proxy.url
 *.pid
 windsurfapi.log
+
+# ChatGPT OAuth token store (real credentials — never commit)
+config/chatgpt-tokens.json
+config/chatgpt-tokens.json.*

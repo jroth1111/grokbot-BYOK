@@ -31,7 +31,7 @@ export const DEFAULT_CONFIG: ShimConfig = {
   sessionAffinity: { enabled: false },
   visionFallbackModel: "",
   providers: {
-    priority: ["opencode-go", "opencode-zen", "local"],
+    "priority": ["opencode-go", "opencode-zen", "local", "chatgpt"],
     configs: {
       "opencode-go": {
         baseUrl: "https://opencode.ai/zen/go/v1",
@@ -49,6 +49,15 @@ export const DEFAULT_CONFIG: ShimConfig = {
         baseUrl: "http://127.0.0.1:3003/v1",
         apiKey: "${LOCAL_API_KEY}",
         defaultModel: "glm-5.2",
+        models: {},
+      },
+      chatgpt: {
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        apiKey: "",
+        auth: { type: "chatgpt-oauth", tokenFile: "config/chatgpt-tokens.json" },
+        endpointPath: "/responses",
+        wireApi: "responses",
+        defaultModel: "gpt-reserve",
         models: {},
       },
     },

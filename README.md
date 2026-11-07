@@ -260,8 +260,9 @@ failover. The registry skips providers with missing API keys automatically
 | `kilo` | `KILO_API_KEY` | no (keyless) | stealth/ox-alpha | Kilo gateway. 200 req/hr/IP without a key. |
 | `opencode-zen` | `OPENCODE_API_KEY` | no | x-preview-f-free | OpenCode Zen endpoint (shared key with Go) |
 | `local` | `LOCAL_API_KEY` | no | glm-5.2, glm-5.1, swe-1-7 | WindsurfAPI on localhost:3003 |
+| `chatgpt` | — (OAuth login) | no | gpt-reserve / gpt-5.6 / gpt-6 family | Your ChatGPT account via "Sign in with ChatGPT" — free plans work too (smaller catalog + lower quotas); Plus/Pro unlocks more. List yours with `npm run chatgpt:status -- --models`. |
 
-**Default failover order.** `openrouter` then `opencode-go` then `kilo` then `opencode-zen` then `local`.
+**Default failover order.** `openrouter` then `opencode-go` then `kilo` then `opencode-zen` then `local` then `chatgpt` (active only once you log in).
 
 ### Where to get API keys
 
@@ -292,6 +293,40 @@ the config references keys by env var name.
 > No secrets go in the config file. All API keys live in `.env` and are
 > referenced via `${VAR_NAME}` interpolation in `config.json`. This keeps
 > secrets out of git.
+
+### ChatGPT login (subscription, no API key)
+
+Instead of an API key, ChatGPT Plus/Pro/Team subscribers can route through
+their ChatGPT plan using the same "Sign in with ChatGPT" OAuth flow the
+Codex CLI uses. The shim then calls the Responses API hosted at
+`chatgpt.com/backend-api/codex` and translates it transparently.
+
+```bash
+npm run build:scripts   # once, after cloning/pulling
+npm run chatgpt:login   # opens your browser → sign in
+npm start               # restart the shim to activate the provider
+npm run chatgpt:status  # list signed-in accounts
+```
+
+- **Multiple accounts**: run `chatgpt:login` again in another browser
+  profile — accounts rotate exactly like API keys, and quota exhaustion
+  (the backend's 5-hour usage window) rotates to the next account before
+  failing over to other providers.
+- **Tokens**: stored in `config/chatgpt-tokens.json` (mode 0600); access
+  tokens auto-refresh in the background; a revoked/expired login disables
+  that account until you re-run `chatgpt:login`.
+- **Logout**: `npm run chatgpt:logout -- --all` (or `--account <id>`).
+- **Plan differences**: every plan — including **free** — can use the
+  provider; plans differ in the model catalog (free gets the
+  gpt-reserve / gpt-5.6 / gpt-6 family) and quota. Paid plans unlock more.
+  List your account's actual catalog with `npm run chatgpt:status -- --models`.
+
+> [!WARNING]
+> This OAuth path is officially intended for OpenAI's own clients (Codex).
+> Routing a third-party tool through a ChatGPT subscription is a gray area
+> of the OpenAI ToS and may carry account-risk; the backend is also
+> Cloudflare-protected and models are limited to the Codex family. Use
+> your own informed judgment — an API-key provider is always the safe path.
 
 ---
 
