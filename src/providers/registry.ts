@@ -26,13 +26,47 @@ import {
   ChatGptTokenManager,
   DEFAULT_CHATGPT_TOKEN_FILE,
 } from "./chatgpt-oauth.js";
+import {
+  ClaudeTokenManager,
+  DEFAULT_CLAUDE_TOKEN_FILE,
+} from "./claude-oauth.js";
+import {
+  AntigravityTokenManager,
+  DEFAULT_ANTIGRAVITY_TOKEN_FILE,
+} from "./antigravity-oauth.js";
+import type { OAuthCredentialManager } from "./oauth-core.js";
+
+/** Instantiate the token manager for a login-based provider config. */
+function createAuthManager(
+  auth: NonNullable<ProviderConfig["auth"]>,
+): OAuthCredentialManager | undefined {
+  switch (auth.type) {
+    case "chatgpt-oauth":
+      return new ChatGptTokenManager({
+        tokenFile: auth.tokenFile ?? DEFAULT_CHATGPT_TOKEN_FILE,
+        endpoints: auth,
+      });
+    case "claude-oauth":
+      return new ClaudeTokenManager({
+        tokenFile: auth.tokenFile ?? DEFAULT_CLAUDE_TOKEN_FILE,
+        endpoints: auth,
+      });
+    case "antigravity-oauth":
+      return new AntigravityTokenManager({
+        tokenFile: auth.tokenFile ?? DEFAULT_ANTIGRAVITY_TOKEN_FILE,
+        tokenEndpoint: auth.tokenUrl,
+      });
+    default:
+      return undefined;
+  }
+}
 
 export class ProviderRegistry {
   private providers: Map<string, Provider> = new Map();
   private priorityOrder: string[] = [];
   private readonly strategy: RoutingStrategy;
-  /** OAuth token managers by provider name ("Sign in with ChatGPT" auth). */
-  private authManagers: Map<string, ChatGptTokenManager> = new Map();
+  /** OAuth token managers by provider name (login-based providers). */
+  private authManagers: Map<string, OAuthCredentialManager> = new Map();
 
   /** Round-robin cursor per normalized model id. */
   private roundRobinCursors: Map<string, number> = new Map();
@@ -51,13 +85,12 @@ export class ProviderRegistry {
     // in the priority array are still registered (reachable via getProvider)
     // but won't appear in routing or failover chains.
     for (const [name, config] of Object.entries(configs)) {
-      let authManager: ChatGptTokenManager | undefined;
-      if (config.auth?.type === "chatgpt-oauth") {
-        authManager = new ChatGptTokenManager({
-          tokenFile: config.auth.tokenFile ?? DEFAULT_CHATGPT_TOKEN_FILE,
-          endpoints: config.auth,
-        });
-        this.authManagers.set(name, authManager);
+      let authManager: OAuthCredentialManager | undefined;
+      if (config.auth) {
+        authManager = createAuthManager(config.auth);
+        if (authManager) {
+          this.authManagers.set(name, authManager);
+        }
       }
       this.providers.set(name, new BaseProvider(name, config, authManager));
     }
@@ -72,7 +105,7 @@ export class ProviderRegistry {
     this.priorityOrder = priority.filter((name) => {
       const config = configs[name];
       if (!config) return false;
-      if (config.auth?.type === "chatgpt-oauth") {
+      if (config.auth) {
         return this.authManagers.get(name)?.hasEnabledAccount() ?? false;
       }
       if (config.keyless) return true;
@@ -94,7 +127,7 @@ export class ProviderRegistry {
   }
 
   /** All OAuth token managers (used by the server for background refresh). */
-  getAuthManagers(): ChatGptTokenManager[] {
+  getAuthManagers(): OAuthCredentialManager[] {
     return [...this.authManagers.values()];
   }
 

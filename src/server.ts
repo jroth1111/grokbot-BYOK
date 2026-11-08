@@ -55,11 +55,19 @@ import { ToolCallAccumulator } from "./translate/tools.js";
 import { applyCompatToRequest } from "./providers/compat.js";
 import { detectSupportsImages } from "./providers/compat.js";
 import type { ProviderCompat } from "./providers/compat.js";
-import type { ChatGptTokenManager } from "./providers/chatgpt-oauth.js";
+import type { OAuthCredentialManager } from "./providers/oauth-core.js";
 import {
   adaptResponsesStream,
   translateChatToResponses,
 } from "./translate/responses-api.js";
+import {
+  adaptAnthropicStream,
+  translateChatToAnthropic,
+} from "./translate/anthropic-messages.js";
+import {
+  adaptGeminiStream,
+  translateChatToGemini,
+} from "./translate/gemini-v1internal.js";
 import { rescueInlineToolCalls, containsDialectMarker, startsWithDialectMarker, couldBecomeDialectMarker } from "./translate/tool-call-rescue.js";
 import { ThinkTagStreamFilter } from "./translate/think-tags.js";
 import { StreamMarkupHealing, detectHealingPatternFromText } from "./translate/markup-healing.js";
@@ -175,6 +183,15 @@ const DEFAULT_RETRY_BACKOFF_INITIAL_MS = 500;
 const DEFAULT_RETRY_BACKOFF_MAX_MS = 5_000;
 
 /**
+ * In-request rate-limit backoff cap. Upstream quota errors (e.g. Google
+ * RESOURCE_EXHAUSTED) recommend half-hour waits; sleeping that long inside a
+ * live request would hang the client. Beyond this cap the provider is
+ * abandoned for this request (circuit-breaker cooldown still applies) and
+ * the failover chain takes over immediately.
+ */
+const RATE_LIMIT_FAILOVER_CAP_MS = 60_000;
+
+/**
  * Mask an API key for logging, showing only the first and last few characters.
  */
 function maskKey(key: string): string {
@@ -216,8 +233,12 @@ interface UpstreamTarget {
   name: string;
   baseUrl: string;
   endpointPath: string;
-  wireApi: "chat-completions" | "responses";
-  authManager?: ChatGptTokenManager;
+  wireApi:
+    | "chat-completions"
+    | "responses"
+    | "anthropic-messages"
+    | "gemini-v1internal";
+  authManager?: OAuthCredentialManager;
 }
 
 /**
@@ -243,12 +264,13 @@ async function fetchCompletion(
     "Content-Type": "application/json",
     Accept: "text/event-stream",
   };
+  // Per-provider OAuth headers (Bearer + companions) and transport shape.
+  let dispatcher: unknown;
   if (upstream.authManager) {
-    // OAuth: the KeyInfo value is the account id; resolve a fresh token.
-    const { accessToken, accountId } = await upstream.authManager.getValidAccessToken(key.value);
-    headers["Authorization"] = `Bearer ${accessToken}`;
-    headers["chatgpt-account-id"] = accountId;
-    headers["OpenAI-Beta"] = "responses=v1";
+    // The KeyInfo value is the account id; the manager resolves a fresh
+    // token and adds any provider-specific companion headers.
+    Object.assign(headers, await upstream.authManager.buildUpstreamHeaders(key.value));
+    dispatcher = upstream.authManager.requestDispatcher?.();
   } else if (key.value && !key.value.startsWith("${")) {
     // Skip the header for empty keys AND unresolved "${VAR}" placeholders
     // (e.g. keyless Kilo whose apiKey was never set) — sending the literal
@@ -261,33 +283,67 @@ async function fetchCompletion(
     headers["X-Title"] = "grokbot-BYOK-v2";
     headers["HTTP-Referer"] = "https://github.com/jroth1111/grokbot-byok";
   }
-  const requestBody =
-    upstream.wireApi === "responses"
-      ? JSON.stringify(translateChatToResponses(body))
-      : JSON.stringify(body);
+  // Wire-dialect request translation. Every dialect consumes the same
+  // internal OpenAI Chat Completions body.
+  let requestBody: string;
+  switch (upstream.wireApi) {
+    case "responses":
+      requestBody = JSON.stringify(translateChatToResponses(body));
+      break;
+    case "anthropic-messages":
+      requestBody = JSON.stringify(translateChatToAnthropic(body));
+      break;
+    case "gemini-v1internal":
+      requestBody = JSON.stringify(translateChatToGemini(body));
+      break;
+    default:
+      requestBody = JSON.stringify(body);
+      break;
+  }
   const controller = new AbortController();
   const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const resp = await fetch(`${upstream.baseUrl}${upstream.endpointPath}`, {
+    // Antigravity: the account's project id rides as a query parameter
+    // (endpoint rejects any metadata field in the body; license check needs
+    // the project on the PROD cloudcode endpoint).
+    let upstreamUrl = `${upstream.baseUrl}${upstream.endpointPath}`;
+    if (upstream.wireApi === "gemini-v1internal" && upstream.authManager?.accountContext) {
+      const ctx = await upstream.authManager.accountContext(key.value);
+      if (typeof ctx.projectId === "string" && ctx.projectId) {
+        upstreamUrl += `${upstream.endpointPath.includes("?") ? "&" : "?"}project=${encodeURIComponent(ctx.projectId)}`;
+      }
+    }
+    const resp = await fetch(upstreamUrl, {
       method: "POST",
       headers,
       body: requestBody,
       signal: controller.signal,
-    });
+      ...(dispatcher ? { dispatcher } : {}),
+    } as RequestInit & { dispatcher?: unknown });
     clearTimeout(timeoutHandle);
-    // Responses dialect: wrap the event stream back into OpenAI SSE chunks
+    // Non-OpenAI dialects: wrap the event stream back into OpenAI SSE chunks
     // so the streaming loop, tool accumulator, usage extraction, timeouts,
     // and failover all work unchanged. Only adapt successful bodies — error
     // bodies are read as text by the classification path.
-    if (
-      upstream.wireApi === "responses" &&
-      resp.ok &&
-      resp.body
-    ) {
-      return new Response(adaptResponsesStream(resp.body, body.model), {
-        status: resp.status,
-        headers: resp.headers,
-      });
+    if (resp.ok && resp.body) {
+      if (upstream.wireApi === "responses") {
+        return new Response(adaptResponsesStream(resp.body, body.model), {
+          status: resp.status,
+          headers: resp.headers,
+        });
+      }
+      if (upstream.wireApi === "anthropic-messages") {
+        return new Response(adaptAnthropicStream(resp.body, body.model), {
+          status: resp.status,
+          headers: resp.headers,
+        });
+      }
+      if (upstream.wireApi === "gemini-v1internal") {
+        return new Response(adaptGeminiStream(resp.body, body.model), {
+          status: resp.status,
+          headers: resp.headers,
+        });
+      }
     }
     return resp;
   } catch (err) {
@@ -1103,6 +1159,21 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
           if (decision === "retry") {
             const backoff = computeRateLimitBackoff(errorType, errText) ??
               computeBackoff(attempt, backoffInitialMs, backoffMaxMs);
+            if (backoff > RATE_LIMIT_FAILOVER_CAP_MS) {
+              // Quota-class backoffs (30min) are longer than any client should
+              // wait inside one request — fail over now; the breaker cooldown
+              // keeps this provider out of rotation for a while.
+              logger.warn("rate-limit backoff exceeds failover cap, moving to next provider", {
+                model,
+                provider: provider.name,
+                recommendedBackoffMs: backoff,
+                capMs: RATE_LIMIT_FAILOVER_CAP_MS,
+                attempt,
+              });
+              recordAttempt(provider.name, model, "rate_limited", attemptStart, errText, keyOrdinal);
+              metrics.recordRequest(provider.name, false, Date.now() - attemptStart);
+              break;
+            }
             logger.info("retrying after backoff", {
               model,
               provider: provider.name,

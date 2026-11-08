@@ -381,6 +381,8 @@ describe("DEFAULT_CONFIG", () => {
       "opencode-zen",
       "local",
       "chatgpt",
+      "claude",
+      "antigravity",
     ]);
   });
 });

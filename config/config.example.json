@@ -10,7 +10,7 @@
     "ttlMs": 3600000
   },
   "providers": {
-    "priority": ["openrouter", "opencode-go", "kilo", "opencode-zen", "local", "chatgpt"],
+    "priority": ["openrouter", "opencode-go", "kilo", "opencode-zen", "local", "chatgpt", "claude", "antigravity"],
     "configs": {
       "opencode-go": {
         "baseUrl": "https://opencode.ai/zen/go/v1",
@@ -168,6 +168,67 @@
         "network": {
           "maxRetries": 1,
           "rateLimitCooldownMs": 10000,
+          "serverErrorCooldownMs": 30000,
+          "streamIdleTimeoutMs": 120000
+        }
+      },
+      "claude": {
+        "baseUrl": "https://api.anthropic.com",
+        "apiKey": "",
+        "auth": {
+          "type": "claude-oauth",
+          "tokenFile": "config/oauth/claude-tokens.json"
+        },
+        "endpointPath": "/v1/messages",
+        "wireApi": "anthropic-messages",
+        "defaultModel": "claude-sonnet-4-5",
+        "models": {
+          "claude-sonnet-4-5": "claude-sonnet-4-5",
+          "claude-opus-4-5": "claude-opus-4-5",
+          "claude-haiku-4-5": "claude-haiku-4-5",
+          "claude-sonnet-4-5-thinking-10000": "claude-sonnet-4-5-thinking-10000",
+          "claude-opus-4-5-thinking-32000": "claude-opus-4-5-thinking-32000",
+          "claude": "claude-sonnet-4-5",
+          "sonnet": "claude-sonnet-4-5",
+          "opus": "claude-opus-4-5",
+          "default": "claude-sonnet-4-5"
+        },
+        "compat": {
+          "supportsImages": false,
+          "supportsReasoningEffort": false
+        },
+        "network": {
+          "maxRetries": 1,
+          "rateLimitCooldownMs": 10000,
+          "serverErrorCooldownMs": 30000,
+          "streamIdleTimeoutMs": 120000
+        }
+      },
+      "antigravity": {
+        "baseUrl": "https://cloudcode-pa.googleapis.com",
+        "apiKey": "",
+        "auth": {
+          "type": "antigravity-oauth",
+          "tokenFile": "config/oauth/antigravity-tokens.json"
+        },
+        "endpointPath": "/v1internal:streamGenerateContent?alt=sse",
+        "wireApi": "gemini-v1internal",
+        "defaultModel": "gemini-3-pro-preview",
+        "models": {
+          "gemini-3-pro-preview": "gemini-3-pro-preview",
+          "gemini-2.5-pro": "gemini-2.5-pro",
+          "gemini-2.5-flash": "gemini-2.5-flash",
+          "gemini": "gemini-3-pro-preview",
+          "gemini-3": "gemini-3-pro-preview",
+          "default": "gemini-3-pro-preview"
+        },
+        "compat": {
+          "supportsImages": false,
+          "supportsReasoningEffort": false
+        },
+        "network": {
+          "maxRetries": 1,
+          "rateLimitCooldownMs": 300000,
           "serverErrorCooldownMs": 30000,
           "streamIdleTimeoutMs": 120000
         }

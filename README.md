@@ -260,9 +260,11 @@ failover. The registry skips providers with missing API keys automatically
 | `kilo` | `KILO_API_KEY` | no (keyless) | stealth/ox-alpha | Kilo gateway. 200 req/hr/IP without a key. |
 | `opencode-zen` | `OPENCODE_API_KEY` | no | x-preview-f-free | OpenCode Zen endpoint (shared key with Go) |
 | `local` | `LOCAL_API_KEY` | no | glm-5.2, glm-5.1, swe-1-7 | WindsurfAPI on localhost:3003 |
-| `chatgpt` | — (OAuth login) | no | gpt-reserve / gpt-5.6 / gpt-6 family | Your ChatGPT account via "Sign in with ChatGPT" — free plans work too (smaller catalog + lower quotas); Plus/Pro unlocks more. List yours with `npm run chatgpt:status -- --models`. |
+| `chatgpt` | — (OAuth login) | no | gpt-reserve / gpt-5.6 / gpt-6 family | Your ChatGPT account via "Sign in with ChatGPT" — free plans work too (smaller catalog + lower quotas); Plus/Pro unlocks more. |
+| `claude` | — (OAuth login) | no | claude-sonnet/opus/haiku 4.5 (+ `-thinking-N`) | Claude Pro/Max subscription via the Claude Code OAuth flow. |
+| `antigravity` | — (OAuth login) | no | gemini-3-pro / gemini-2.5 family | Any Google account via the Antigravity IDE OAuth flow — free accounts include Gemini quota. |
 
-**Default failover order.** `openrouter` then `opencode-go` then `kilo` then `opencode-zen` then `local` then `chatgpt` (active only once you log in).
+**Default failover order.** `openrouter` → `opencode-go` → `kilo` → `opencode-zen` → `local` → `chatgpt` → `claude` → `antigravity` (login providers activate once you sign in).
 
 ### Where to get API keys
 
@@ -294,39 +296,45 @@ the config references keys by env var name.
 > referenced via `${VAR_NAME}` interpolation in `config.json`. This keeps
 > secrets out of git.
 
-### ChatGPT login (subscription, no API key)
+### Subscription login (ChatGPT / Claude / Antigravity — no API keys)
 
-Instead of an API key, ChatGPT Plus/Pro/Team subscribers can route through
-their ChatGPT plan using the same "Sign in with ChatGPT" OAuth flow the
-Codex CLI uses. The shim then calls the Responses API hosted at
-`chatgpt.com/backend-api/codex` and translates it transparently.
+Instead of API keys, log in with your existing subscriptions. All three use
+the same OAuth flows their official CLI/IDE clients use; the shim translates
+each upstream wire format (OpenAI Responses / Anthropic Messages / Gemini
+v1internal) transparently.
 
 ```bash
-npm run build:scripts   # once, after cloning/pulling
-npm run chatgpt:login   # opens your browser → sign in
-npm start               # restart the shim to activate the provider
-npm run chatgpt:status  # list signed-in accounts
+npm run build:scripts          # once, after cloning/pulling
+npm run login -- chatgpt       # or: claude | antigravity
+npm run login -- claude --auto-config   # sets defaultModel to the first
+                                       # model your account can actually use
+npm start                       # restart the shim to activate
+npm run login --status          # all providers, all accounts
 ```
 
-- **Multiple accounts**: run `chatgpt:login` again in another browser
-  profile — accounts rotate exactly like API keys, and quota exhaustion
-  (the backend's 5-hour usage window) rotates to the next account before
-  failing over to other providers.
-- **Tokens**: stored in `config/chatgpt-tokens.json` (mode 0600); access
-  tokens auto-refresh in the background; a revoked/expired login disables
-  that account until you re-run `chatgpt:login`.
-- **Logout**: `npm run chatgpt:logout -- --all` (or `--account <id>`).
-- **Plan differences**: every plan — including **free** — can use the
-  provider; plans differ in the model catalog (free gets the
-  gpt-reserve / gpt-5.6 / gpt-6 family) and quota. Paid plans unlock more.
-  List your account's actual catalog with `npm run chatgpt:status -- --models`.
+- **Multiple accounts per provider**: re-run login in another browser
+  profile. Accounts carry a **priority** (`--priority N`, lower =
+  preferred) and fail down automatically; quota exhaustion (429) rotates
+  accounts before failing over to other providers.
+- **Model discovery**: after login the CLI probes/lists the models your
+  account can actually use; `--auto-config` sets `defaultModel` to the
+  first one (or copy the printed suggestion into `config/config.json`).
+- **Tokens**: per-provider stores under `config/oauth/` (mode 0600),
+  refreshed automatically in the background; revoked logins disable that
+  account until re-login.
+- **Logout**: `npm run logout -- claude` (or `--all` / `--account <id>`);
+  the `npm run chatgpt:*` aliases remain for muscle memory.
+- **Plan requirements**: ChatGPT and Antigravity work on **free** plans
+  (smaller catalogs/quotas). Claude requires an **active Claude Pro/Max
+  subscription** — Anthropic's authorize page rejects free accounts outright.
 
 > [!WARNING]
-> This OAuth path is officially intended for OpenAI's own clients (Codex).
-> Routing a third-party tool through a ChatGPT subscription is a gray area
-> of the OpenAI ToS and may carry account-risk; the backend is also
-> Cloudflare-protected and models are limited to the Codex family. Use
-> your own informed judgment — an API-key provider is always the safe path.
+> These OAuth paths are officially intended for the providers' own clients.
+> Routing a third-party tool through a subscription sits in a gray area of
+> each provider's ToS and may carry account risk. Claude additionally sits
+> behind Cloudflare and Antigravity enforces a client fingerprint
+> (HTTP/1.1-only, versioned User-Agent) — both are handled here, but the
+> providers may change behavior at any time.
 
 ---
 

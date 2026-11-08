@@ -596,6 +596,7 @@ async function main(): Promise<void> {
     console.log(`  ${CYAN}npm run setup -- --stop${RESET}     stop all`);
     console.log(`  ${CYAN}npm run setup${RESET}               restart`);
     console.log(`  ${CYAN}npm run chatgpt:login${RESET}      route via a ChatGPT subscription (optional, no API key)`);
+    console.log(`  ${CYAN}npm run login -- claude${RESET}      …or Claude / Antigravity subscriptions`);
     console.log();
   }
 

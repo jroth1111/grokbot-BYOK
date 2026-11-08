@@ -12,3 +12,5 @@ windsurfapi.log
 # ChatGPT OAuth token store (real credentials — never commit)
 config/chatgpt-tokens.json
 config/chatgpt-tokens.json.*
+# Claude / Antigravity OAuth token stores
+config/oauth/

@@ -31,7 +31,7 @@ export const DEFAULT_CONFIG: ShimConfig = {
   sessionAffinity: { enabled: false },
   visionFallbackModel: "",
   providers: {
-    "priority": ["opencode-go", "opencode-zen", "local", "chatgpt"],
+    "priority": ["opencode-go", "opencode-zen", "local", "chatgpt", "claude", "antigravity"],
     configs: {
       "opencode-go": {
         baseUrl: "https://opencode.ai/zen/go/v1",
@@ -59,6 +59,25 @@ export const DEFAULT_CONFIG: ShimConfig = {
         wireApi: "responses",
         defaultModel: "gpt-reserve",
         models: {},
+      },
+      claude: {
+        baseUrl: "https://api.anthropic.com",
+        apiKey: "",
+        auth: { type: "claude-oauth", tokenFile: "config/oauth/claude-tokens.json" },
+        endpointPath: "/v1/messages",
+        wireApi: "anthropic-messages",
+        defaultModel: "claude-sonnet-4-5",
+        models: {},
+      },
+      antigravity: {
+        baseUrl: "https://cloudcode-pa.googleapis.com",
+        apiKey: "",
+        auth: { type: "antigravity-oauth", tokenFile: "config/oauth/antigravity-tokens.json" },
+        endpointPath: "/v1internal:streamGenerateContent?alt=sse",
+        wireApi: "gemini-v1internal",
+        defaultModel: "gemini-3-pro-preview",
+        models: {},
+        network: { rateLimitCooldownMs: 300000 },
       },
     },
   },

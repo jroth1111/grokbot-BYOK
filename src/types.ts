@@ -7,9 +7,9 @@
  */
 
 // Type-only circular import (erased at compile time): the OAuth token
-// manager lives in providers/chatgpt-oauth.ts but the Provider interface
-// needs its type for the optional authManager field.
-import type { ChatGptTokenManager } from "./providers/chatgpt-oauth.js";
+// managers live in providers/*-oauth.ts but the Provider interface needs
+// their common type for the optional authManager field.
+import type { OAuthCredentialManager } from "./providers/oauth-core.js";
 
 // ---------------------------------------------------------------------------
 // Connect protocol types
@@ -220,17 +220,26 @@ export type InferenceStreamResponse =
 export type RoutingStrategy = "priority" | "round-robin" | "weighted-round-robin" | "fill-first" | "latency";
 
 /** Upstream wire protocol spoken by a provider. */
-export type WireApi = "chat-completions" | "responses";
+export type WireApi =
+  | "chat-completions"
+  | "responses"
+  | "anthropic-messages"
+  | "gemini-v1internal";
+
+/** Login-based auth types (browser OAuth per provider). */
+export type OAuthProviderType =
+  | "chatgpt-oauth"
+  | "claude-oauth"
+  | "antigravity-oauth";
 
 /**
  * OAuth-based auth config for providers that authenticate via a browser
- * login flow instead of static API keys ("Sign in with ChatGPT", the same
- * OAuth app the Codex CLI uses). The token store is a local JSON file the
- * login CLI writes and the shim's TokenManager keeps fresh.
+ * login flow instead of static API keys. The token store is a local JSON
+ * file the login CLI writes and the shim's TokenManager keeps fresh.
  */
 export interface ProviderAuthConfig {
-  type: "chatgpt-oauth";
-  /** Path to the multi-account token store (default: config/chatgpt-tokens.json). */
+  type: OAuthProviderType;
+  /** Path to the multi-account token store (provider-specific default). */
   tokenFile?: string;
   /** Override the OAuth endpoints (used by tests to point at a local mock). */
   authorizeUrl?: string;
@@ -293,8 +302,10 @@ export interface Provider {
   readonly endpointPath: string;
   /** Upstream wire protocol (default "chat-completions"). */
   readonly wireApi: WireApi;
-  /** OAuth token manager when auth.type is "chatgpt-oauth", else undefined. */
-  readonly authManager?: ChatGptTokenManager;
+  /** OAuth token manager when an auth.type is set, else undefined. */
+  readonly authManager?: OAuthCredentialManager;
+  /** How keys/accounts rotate: round-robin (default) or priority fill-first. */
+  readonly keySelection: "round-robin" | "priority";
   /** Select the next API key (for key rotation). */
   selectKey(): KeyInfo;
   /** Mark a key as failed (for rotation). */
@@ -327,6 +338,10 @@ export interface ProviderConfig {
   endpointPath?: string;
   /** Upstream wire protocol (default "chat-completions"). */
   wireApi?: WireApi;
+  /** Key/account rotation mode. OAuth providers default to "priority"
+   *  (preferred account first, fail-down to the next); key providers keep
+   *  round-robin. */
+  keySelection?: "round-robin" | "priority";
 }
 
 /** Compat flag overrides a user can set per provider in config. */

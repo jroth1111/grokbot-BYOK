@@ -15,14 +15,29 @@
  * CLI appends each signed-in account to a local token-store file, and the
  * provider rotates across accounts exactly like it rotates API keys.
  *
+ * The generic machinery (token store, single-flight refresh manager,
+ * loopback callback server) lives in oauth-core.ts; this module only
+ * carries the ChatGPT specifics.
+ *
  * NOTE: this path is officially intended for OpenAI's own clients; routing
  * a third-party tool through it sits in a gray area of the OpenAI ToS and
  * may carry account-risk. Use with your own informed judgment.
  */
-import * as crypto from "node:crypto";
-import * as fs from "node:fs";
-import * as path from "node:path";
-import type { KeyInfo } from "../types.js";
+import {
+  OAuthAccountMismatchError,
+  OAuthError,
+  OAuthTokenManagerBase,
+  OAuthTokenStore,
+  generatePkcePair,
+  generateStateToken,
+  maskSecret,
+  type OAuthAccount,
+  type OAuthLogger,
+  type RefreshOutcome,
+} from "./oauth-core.js";
+
+export { maskSecret, OAuthError };
+export type { OAuthLogger };
 
 // ---------------------------------------------------------------------------
 // Endpoints & constants (mirror codex-rs/login)
@@ -59,9 +74,6 @@ export const CHATGPT_OAUTH_SCOPE = "openid profile email offline_access";
 /** Default token-store path, relative to the process cwd (like the config). */
 export const DEFAULT_CHATGPT_TOKEN_FILE = "config/chatgpt-tokens.json";
 
-/** Refresh the access token when it expires within this window (ms). */
-const REFRESH_MARGIN_MS = 5 * 60 * 1000;
-
 /** Configurable endpoints (tests point these at a local mock). */
 export interface ChatGptOAuthEndpoints {
   authorizeUrl: string;
@@ -77,14 +89,8 @@ export function defaultEndpoints(): ChatGptOAuthEndpoints {
   };
 }
 
-/** Minimal logger surface the manager needs (avoids a hard dep on log.ts). */
-export interface ChatGptLogger {
-  info(message: string, meta?: Record<string, unknown>): void;
-  warn(message: string, meta?: Record<string, unknown>): void;
-}
-
 // ---------------------------------------------------------------------------
-// PKCE
+// PKCE (re-exported from the shared core under the historical names)
 // ---------------------------------------------------------------------------
 
 export interface PkcePair {
@@ -92,19 +98,14 @@ export interface PkcePair {
   codeChallenge: string;
 }
 
-/** Generate a PKCE pair (S256). Verifier is 64 base64url chars (RFC 7636 allows 43-128). */
+/** Generate a PKCE pair (S256). */
 export function generatePkce(): PkcePair {
-  const codeVerifier = crypto.randomBytes(48).toString("base64url");
-  const codeChallenge = crypto
-    .createHash("sha256")
-    .update(codeVerifier)
-    .digest("base64url");
-  return { codeVerifier, codeChallenge };
+  return generatePkcePair();
 }
 
 /** Random URL-safe state parameter. */
 export function generateState(): string {
-  return crypto.randomBytes(24).toString("base64url");
+  return generateStateToken();
 }
 
 /** Build the browser-facing authorize URL (Authorization Code + PKCE S256). */
@@ -181,39 +182,16 @@ export function extractChatgptAuthClaim(
 }
 
 // ---------------------------------------------------------------------------
-// Token store (multi-account JSON file, 0600, atomic writes)
+// Accounts & token store
 // ---------------------------------------------------------------------------
 
 /** One signed-in ChatGPT account and its OAuth tokens. */
-export interface ChatGptAccount {
+export interface ChatGptAccount extends OAuthAccount {
   /** chatgpt_account_id from the access-token JWT (also the routing key id). */
   accountId: string;
-  /** Email from the id-token claims, if available (display only). */
-  email?: string;
-  /** ChatGPT plan (plus/pro/...), if the token claims expose it. */
+  /** ChatGPT plan (free/plus/pro/...), if the token claims expose it. */
   plan?: string;
-  accessToken: string;
-  refreshToken: string;
   idToken?: string;
-  /** Access-token expiry (epoch ms). Refreshed before it lapses. */
-  expiresAtMs: number;
-  /** When the tokens were last obtained/refreshed (epoch ms). */
-  obtainedAtMs: number;
-  /** false after an invalid_grant — the account must re-login. */
-  enabled: boolean;
-  /** Rotation weight (1 = equal share across accounts). */
-  weight?: number;
-}
-
-interface TokenFileShape {
-  version: 1;
-  accounts: ChatGptAccount[];
-}
-
-/** Mask a token/account id for logging. */
-export function maskSecret(value: string): string {
-  if (value.length <= 8) return "***";
-  return `${value.slice(0, 6)}...${value.slice(-4)}`;
 }
 
 /**
@@ -236,84 +214,20 @@ function hydrateAccountFromToken(account: ChatGptAccount): ChatGptAccount {
   }
 }
 
-export class ChatGptTokenStore {
-  readonly filePath: string;
-
+/** ChatGPT token store (same file format as the generic store + claim hydration). */
+export class ChatGptTokenStore extends OAuthTokenStore {
   constructor(filePath: string) {
-    this.filePath = filePath;
+    super(filePath, hydrateAccountFromToken);
   }
 
-  /** Load all accounts; a missing/corrupt file yields an empty list. */
   load(): ChatGptAccount[] {
-    try {
-      const raw = fs.readFileSync(this.filePath, "utf8");
-      const parsed = JSON.parse(raw) as Partial<TokenFileShape>;
-      if (!parsed || !Array.isArray(parsed.accounts)) return [];
-      return parsed.accounts
-        .filter(
-          (a): a is ChatGptAccount =>
-            !!a &&
-            typeof a.accountId === "string" &&
-            typeof a.refreshToken === "string" &&
-            a.refreshToken.length > 0,
-        )
-        .map((a) => hydrateAccountFromToken(a));
-    } catch {
-      return [];
-    }
-  }
-
-  /** Atomically persist the account list (write tmp + rename, mode 0600). */
-  save(accounts: ChatGptAccount[]): void {
-    const dir = path.dirname(this.filePath);
-    fs.mkdirSync(dir, { recursive: true });
-    const payload: TokenFileShape = { version: 1, accounts };
-    const tmp = `${this.filePath}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + "\n", {
-      mode: 0o600,
-    });
-    try {
-      fs.chmodSync(tmp, 0o600);
-    } catch {
-      // chmod is best-effort (e.g. some filesystems); the write mode above
-      // already requested 0600.
-    }
-    fs.renameSync(tmp, this.filePath);
-  }
-
-  /** Insert or replace an account (keyed by accountId). */
-  upsert(account: ChatGptAccount): void {
-    const accounts = this.load().filter((a) => a.accountId !== account.accountId);
-    accounts.push(account);
-    this.save(accounts);
-  }
-
-  /** Remove an account by id. Returns true when it existed. */
-  remove(accountId: string): boolean {
-    const accounts = this.load();
-    const next = accounts.filter((a) => a.accountId !== accountId);
-    if (next.length === accounts.length) return false;
-    this.save(next);
-    return true;
+    return super.load() as ChatGptAccount[];
   }
 }
 
 // ---------------------------------------------------------------------------
 // OAuth HTTP helpers (token exchange / refresh / revoke)
 // ---------------------------------------------------------------------------
-
-/** A structured OAuth failure. `invalid_grant` means "re-login required". */
-export class OAuthError extends Error {
-  readonly kind: "invalid_grant" | "http" | "network";
-  readonly status?: number;
-
-  constructor(kind: OAuthError["kind"], message: string, status?: number) {
-    super(message);
-    this.name = "OAuthError";
-    this.kind = kind;
-    this.status = status;
-  }
-}
 
 /** Raw token-endpoint response (subset of fields we consume). */
 export interface OAuthTokenResponse {
@@ -433,213 +347,79 @@ export async function revokeRefreshToken(opts: {
 }
 
 // ---------------------------------------------------------------------------
-// Token manager (used by the shim at request time)
+// Token manager (chatgpt specifics on the generic skeleton)
 // ---------------------------------------------------------------------------
 
 export interface ChatGptTokenManagerOptions {
   tokenFile: string;
   endpoints?: Partial<ChatGptOAuthEndpoints>;
   now?: () => number;
-  logger?: ChatGptLogger;
+  logger?: OAuthLogger;
 }
 
 /**
  * Keeps every signed-in ChatGPT account's access token fresh and hands the
  * current credential to the fetch layer, mirroring how static API keys work
  * elsewhere: one account == one `KeyInfo` whose `value` is the account id.
- *
- * Refreshes are single-flight per account (a burst of concurrent requests
- * triggers at most one token-endpoint call) and persist the rotating
- * refresh token atomically before the new access token is used.
  */
-export class ChatGptTokenManager {
-  private readonly store: ChatGptTokenStore;
+export class ChatGptTokenManager extends OAuthTokenManagerBase<ChatGptAccount> {
   private readonly endpoints: ChatGptOAuthEndpoints;
-  private readonly now: () => number;
-  private readonly logger?: ChatGptLogger;
-  private accounts: Map<string, ChatGptAccount> = new Map();
-  /** In-flight refresh per account (single-flight). */
-  private inflight: Map<string, Promise<boolean>> = new Map();
 
   constructor(opts: ChatGptTokenManagerOptions) {
-    this.store = new ChatGptTokenStore(opts.tokenFile);
+    super({
+      tokenFile: opts.tokenFile,
+      now: opts.now,
+      logger: opts.logger,
+      hydrate: hydrateAccountFromToken,
+    });
     this.endpoints = { ...defaultEndpoints(), ...opts.endpoints };
-    this.now = opts.now ?? Date.now;
-    this.logger = opts.logger;
-    for (const account of this.store.load()) {
-      this.accounts.set(account.accountId, account);
-    }
   }
 
-  /**
-   * True when an account can serve Codex-backend traffic. Plan is NOT a
-   * gate: free-tier accounts work too — the backend serves them a different
-   * model catalog (e.g. gpt-reserve / gpt-5.6 / gpt-6 families) and lower
-   * quotas, and rejects unknown models itself. Only explicit disables
-   * (invalid_grant / logout) remove an account from rotation.
-   */
-  private isUsable(account: ChatGptAccount): boolean {
-    return account.enabled;
+  protected get providerLabel(): string {
+    return "chatgpt";
   }
 
-  /** True when at least one usable account exists (routing eligibility). */
-  hasEnabledAccount(): boolean {
-    for (const account of this.accounts.values()) {
-      if (this.isUsable(account)) return true;
-    }
-    return false;
-  }
-
-  /** All accounts (snapshot, display purposes). */
-  getAccounts(): ChatGptAccount[] {
-    return [...this.accounts.values()];
-  }
-
-  /**
-   * KeyInfos for the provider's rotation machinery: one per enabled
-   * account, `value` = account id (the actual token is resolved at
-   * request time so it's always fresh).
-   */
-  getKeyInfos(): KeyInfo[] {
-    const infos: KeyInfo[] = [];
-    for (const account of this.accounts.values()) {
-      if (!this.isUsable(account)) continue;
-      infos.push({ value: account.accountId, weight: account.weight ?? 1, enabled: true });
-    }
-    return infos;
-  }
-
-  /**
-   * Resolve a currently-valid access token for the account, refreshing it
-   * first when it is about to expire (or already has).
-   */
-  async getValidAccessToken(
-    accountId: string,
-  ): Promise<{ accessToken: string; accountId: string }> {
-    let account = this.accounts.get(accountId);
-    if (!account) {
-      throw new Error(`chatgpt oauth: unknown account ${maskSecret(accountId)}`);
-    }
-    if (!account.enabled) {
-      throw new Error(
-        `chatgpt oauth: account ${maskSecret(accountId)} disabled — run npm run chatgpt:login`,
+  protected async doRefresh(account: ChatGptAccount): Promise<RefreshOutcome> {
+    const tokens = await refreshAccessToken({
+      refreshToken: account.refreshToken,
+      tokenUrl: this.endpoints.tokenUrl,
+    });
+    const claims = extractChatgptAuthClaim(tokens.access_token);
+    // The refreshed token must still belong to the same ChatGPT account —
+    // a mismatch means the user re-logged-in elsewhere on this slot.
+    if (claims.accountId && claims.accountId !== account.accountId) {
+      throw new OAuthAccountMismatchError(
+        `refreshed token belongs to ${maskSecret(claims.accountId)}, not ${maskSecret(account.accountId)}`,
       );
     }
-    if (account.expiresAtMs - this.now() < REFRESH_MARGIN_MS) {
-      await this.refreshAccount(accountId);
-      account = this.accounts.get(accountId)!;
-      if (!account.enabled) {
-        throw new Error(
-          `chatgpt oauth: account ${maskSecret(accountId)} could not be refreshed — re-login required`,
-        );
-      }
-    }
-    return { accessToken: account.accessToken, accountId };
-  }
-
-  /** Force a refresh regardless of expiry (e.g. after an upstream 401). */
-  async forceRefresh(accountId: string): Promise<boolean> {
-    return this.refreshAccount(accountId);
-  }
-
-  /**
-   * Refresh every enabled account whose token expires within the margin.
-   * Returns how many were refreshed. Intended for a periodic background
-   * sweep so request-time refreshes are rare.
-   */
-  async refreshDueAccounts(): Promise<number> {
-    let refreshed = 0;
-    for (const [accountId, account] of this.accounts) {
-      if (!this.isUsable(account)) continue;
-      if (account.expiresAtMs - this.now() < 10 * 60 * 1000) {
-        if (await this.refreshAccount(accountId)) refreshed++;
-      }
-    }
-    return refreshed;
-  }
-
-  /** Single-flight wrapper around {@link doRefresh}. */
-  private async refreshAccount(accountId: string): Promise<boolean> {
-    const existing = this.inflight.get(accountId);
-    if (existing) return existing;
-    const promise = this.doRefresh(accountId).finally(() => {
-      this.inflight.delete(accountId);
-    });
-    this.inflight.set(accountId, promise);
-    return promise;
-  }
-
-  private async doRefresh(accountId: string): Promise<boolean> {
-    const account = this.accounts.get(accountId);
-    if (!account) return false;
-    try {
-      const tokens = await refreshAccessToken({
-        refreshToken: account.refreshToken,
-        tokenUrl: this.endpoints.tokenUrl,
-      });
-      const claims = extractChatgptAuthClaim(tokens.access_token);
-      // The refreshed token must still belong to the same ChatGPT account —
-      // a mismatch means the user re-logged-in elsewhere on this account
-      // slot (Codex treats this as a hard error; we disable the entry).
-      if (claims.accountId && claims.accountId !== accountId) {
-        this.logger?.warn("chatgpt oauth: account mismatch after refresh, disabling", {
-          account: maskSecret(accountId),
-          tokenAccount: maskSecret(claims.accountId),
-        });
-        account.enabled = false;
-        this.persist();
-        return false;
-      }
-      const expiresAtMs =
-        claims.expiresAtMs ??
-        (tokens.expires_in && tokens.expires_in > 0
-          ? this.now() + tokens.expires_in * 1000
-          : this.now() + 60 * 60 * 1000);
-      const next: ChatGptAccount = {
-        ...account,
-        accessToken: tokens.access_token,
-        // Refresh tokens rotate on every use; keep the old one only when the
-        // endpoint did not issue a replacement.
-        refreshToken: tokens.refresh_token ?? account.refreshToken,
+    const expiresAtMs =
+      claims.expiresAtMs ??
+      (tokens.expires_in && tokens.expires_in > 0
+        ? this.now() + tokens.expires_in * 1000
+        : this.now() + 60 * 60 * 1000);
+    return {
+      accessToken: tokens.access_token,
+      // Refresh tokens rotate on every use; keep the old one only when the
+      // endpoint did not issue a replacement.
+      refreshToken: tokens.refresh_token ?? account.refreshToken,
+      expiresAtMs,
+      accountPatch: {
         idToken: tokens.id_token ?? account.idToken,
-        expiresAtMs,
-        obtainedAtMs: this.now(),
-        enabled: true,
         email: account.email ?? claims.email,
         plan: account.plan ?? claims.plan,
-      };
-      this.accounts.set(accountId, next);
-      this.persist();
-      this.logger?.info("chatgpt oauth: token refreshed", {
-        account: maskSecret(accountId),
-        expiresAtMs,
-      });
-      return true;
-    } catch (err) {
-      if (err instanceof OAuthError && err.kind === "invalid_grant") {
-        this.logger?.warn("chatgpt oauth: refresh token invalid, account disabled — re-login required", {
-          account: maskSecret(accountId),
-        });
-        account.enabled = false;
-        this.persist();
-      } else {
-        this.logger?.warn("chatgpt oauth: token refresh failed (transient)", {
-          account: maskSecret(accountId),
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-      return false;
-    }
+      },
+    };
   }
 
-  private persist(): void {
-    try {
-      this.store.save([...this.accounts.values()]);
-    } catch (err) {
-      this.logger?.warn("chatgpt oauth: failed to persist token store", {
-        file: this.store.filePath,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+  /** Upstream headers: Bearer + ChatGPT account routing + responses beta. */
+  override async buildUpstreamHeaders(
+    accountId: string,
+  ): Promise<Record<string, string>> {
+    const { accessToken, accountId: id } = await this.getValidAccessToken(accountId);
+    return {
+      Authorization: `Bearer ${accessToken}`,
+      "chatgpt-account-id": id,
+      "OpenAI-Beta": "responses=v1",
+    };
   }
 }

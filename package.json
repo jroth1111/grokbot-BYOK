@@ -5,8 +5,8 @@
   "type": "module",
   "main": "dist/shim.js",
   "scripts": {
-    "build": "esbuild src/shim.ts --bundle --platform=node --format=esm --outfile=dist/shim.js --target=node18 --banner:js='#!/usr/bin/env node' && chmod +x dist/shim.js",
-    "build:scripts": "esbuild scripts/deploy.ts scripts/health-check.ts scripts/patch-host.ts scripts/watch-host.ts scripts/start-shim.ts scripts/setup.ts scripts/uninstall.ts scripts/chatgpt-login.ts --bundle --platform=node --format=esm --outdir=dist/scripts --target=node18 --banner:js='#!/usr/bin/env node' && chmod +x dist/scripts/*.js",
+    "build": "esbuild src/shim.ts --bundle --platform=node --format=esm --outfile=dist/shim.js --target=node18 --external:undici --banner:js='#!/usr/bin/env node' && chmod +x dist/shim.js",
+    "build:scripts": "esbuild scripts/deploy.ts scripts/health-check.ts scripts/patch-host.ts scripts/watch-host.ts scripts/start-shim.ts scripts/setup.ts scripts/uninstall.ts scripts/login.ts --bundle --platform=node --format=esm --outdir=dist/scripts --target=node18 --external:undici --banner:js='#!/usr/bin/env node' && chmod +x dist/scripts/*.js",
     "clean": "rm -rf dist",
     "build:all": "npm run clean && npm run build && npm run build:scripts",
     "test": "node --experimental-vm-modules node_modules/.bin/vitest run",
@@ -18,12 +18,16 @@
     "stop": "node setup.mjs -- --stop",
     "status": "node setup.mjs -- --status",
     "uninstall": "node dist/scripts/uninstall.js",
-    "chatgpt:login": "node dist/scripts/chatgpt-login.js",
-    "chatgpt:logout": "node dist/scripts/chatgpt-login.js --logout",
-    "chatgpt:status": "node dist/scripts/chatgpt-login.js --status"
+    "login": "node dist/scripts/login.js",
+    "logout": "node dist/scripts/login.js --logout",
+    "login:status": "node dist/scripts/login.js --status",
+    "chatgpt:login": "node dist/scripts/login.js chatgpt",
+    "chatgpt:logout": "node dist/scripts/login.js --logout chatgpt",
+    "chatgpt:status": "node dist/scripts/login.js --status"
   },
   "dependencies": {
     "ajv": "^8.17.1",
+    "undici": "^8.12.4",
     "zod": "^3.22.0"
   },
   "devDependencies": {
