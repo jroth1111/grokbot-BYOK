@@ -4,6 +4,8 @@
   <img src="assets/logo.png" width="300" alt="grokbot-BYOK">
 </p>
 
+> 📖 **完整使用说明见 [USAGE.md](USAGE.md)** — 安装、订阅登录(ChatGPT/Claude/Antigravity)、多账号优先级、配置参考、排障手册。
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node: 18+](https://img.shields.io/badge/Node.js-18%2B-green.svg)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.3-blue.svg)](https://www.typescriptlang.org/)
