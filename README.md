@@ -4,8 +4,6 @@
   <img src="assets/logo.png" width="300" alt="grokbot-BYOK">
 </p>
 
-> 📖 **完整使用说明见 [USAGE.md](USAGE.md)** — 安装、订阅登录(ChatGPT/Claude/Antigravity)、多账号优先级、配置参考、排障手册。
-
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node: 18+](https://img.shields.io/badge/Node.js-18%2B-green.svg)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.3-blue.svg)](https://www.typescriptlang.org/)
@@ -262,6 +260,7 @@ failover. The registry skips providers with missing API keys automatically
 | `kilo` | `KILO_API_KEY` | no (keyless) | stealth/ox-alpha | Kilo gateway. 200 req/hr/IP without a key. |
 | `opencode-zen` | `OPENCODE_API_KEY` | no | x-preview-f-free | OpenCode Zen endpoint (shared key with Go) |
 | `local` | `LOCAL_API_KEY` | no | glm-5.2, glm-5.1, swe-1-7 | WindsurfAPI on localhost:3003 |
+| `zai` | `ZAI_API_KEY` | no | glm-5.3 / glm-5.2 / glm-4.7 | Z.AI GLM international — GLM Coding Plan key (z.ai). Primary by default when set. |
 | `chatgpt` | — (OAuth login) | no | gpt-reserve / gpt-5.6 / gpt-6 family | Your ChatGPT account via "Sign in with ChatGPT" — free plans work too (smaller catalog + lower quotas); Plus/Pro unlocks more. |
 | `claude` | — (OAuth login) | no | claude-sonnet/opus/haiku 4.5 (+ `-thinking-N`) | Claude Pro/Max subscription via the Claude Code OAuth flow. |
 | `antigravity` | — (OAuth login) | no | gemini-3-pro / gemini-2.5 family | Any Google account via the Antigravity IDE OAuth flow — free accounts include Gemini quota. |
@@ -285,6 +284,7 @@ automatically at startup. See `.env.example` for the full template.
 ```bash
 # .env
 OPENCODE_API_KEY=sk-your-opencode-key
+ZAI_API_KEY=your-zai-glm-key       # Z.AI GLM international / GLM Coding Plan
 KILO_API_KEY=your-kilo-key          # optional (keyless works without this)
 OPENROUTER_API_KEY=sk-or-v1-your-key
 LOCAL_API_KEY=sk-local-test         # must match WindsurfAPI's API_KEY

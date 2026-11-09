@@ -10,7 +10,7 @@
     "ttlMs": 3600000
   },
   "providers": {
-    "priority": ["openrouter", "opencode-go", "kilo", "opencode-zen", "local", "chatgpt", "claude", "antigravity"],
+    "priority": ["zai", "openrouter", "opencode-go", "kilo", "opencode-zen", "local", "chatgpt", "claude", "antigravity"],
     "configs": {
       "opencode-go": {
         "baseUrl": "https://opencode.ai/zen/go/v1",
@@ -134,6 +134,34 @@
           "requestTimeoutMs": 5000,
           "maxRetries": 0,
           "streamIdleTimeoutMs": 60000
+        }
+      },
+      "zai": {
+        "baseUrl": "https://api.z.ai/api/coding/paas/v4",
+        "apiKey": "${ZAI_API_KEY}",
+        "defaultModel": "glm-5.3",
+        "models": {
+          "glm-5.3": "glm-5.3",
+          "glm-5.2": "glm-5.2",
+          "glm-5.1": "glm-5.1",
+          "glm-4.7": "glm-4.7",
+          "glm-4.7-flash": "glm-4.7-flash",
+          "glm-4.6": "glm-4.6",
+          "glm-5.3-flash": "glm-5.3-flash",
+          "glm": "glm-5.3",
+          "codex": "glm-5.3",
+          "ox alpha free": "glm-5.3",
+          "ox alpha": "glm-5.3",
+          "ox-alpha": "glm-5.3",
+          "0x alpha": "glm-5.3",
+          "sand-default": "glm-5.3",
+          "default": "glm-5.3"
+        },
+        "network": {
+          "maxRetries": 1,
+          "rateLimitCooldownMs": 10000,
+          "serverErrorCooldownMs": 30000,
+          "streamIdleTimeoutMs": 120000
         }
       },
       "chatgpt": {

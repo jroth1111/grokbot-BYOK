@@ -98,6 +98,16 @@ const PROVIDERS: ProviderInfo[] = [
     description: "Primary provider. Frontier reasoning model, free tier.",
   },
   {
+    name: "zai",
+    envVar: "ZAI_API_KEY",
+    cliFlag: "--zai-key",
+    required: false,
+    keyless: false,
+    url: "https://z.ai",
+    models: "glm-5.3, glm-5.2, glm-4.7",
+    description: "Z.AI GLM international (GLM Coding Plan). Get a key at z.ai.",
+  },
+  {
     name: "kilo",
     envVar: "KILO_API_KEY",
     cliFlag: "--kilo-key",

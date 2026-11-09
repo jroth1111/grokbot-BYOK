@@ -31,8 +31,14 @@ export const DEFAULT_CONFIG: ShimConfig = {
   sessionAffinity: { enabled: false },
   visionFallbackModel: "",
   providers: {
-    "priority": ["opencode-go", "opencode-zen", "local", "chatgpt", "claude", "antigravity"],
+    "priority": ["zai", "opencode-go", "opencode-zen", "local", "chatgpt", "claude", "antigravity"],
     configs: {
+      zai: {
+        baseUrl: "https://api.z.ai/api/coding/paas/v4",
+        apiKey: "${ZAI_API_KEY}",
+        defaultModel: "glm-5.3",
+        models: {},
+      },
       "opencode-go": {
         baseUrl: "https://opencode.ai/zen/go/v1",
         apiKey: "${OPENCODE_API_KEY}",
