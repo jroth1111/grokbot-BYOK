@@ -49,6 +49,15 @@ const compatOverridesSchema = z.object({
     .optional(),
 });
 
+/** Validation schema for OAuth (login-based) provider auth. */
+const providerAuthSchema = z.object({
+  type: z.enum(["chatgpt-oauth", "claude-oauth", "antigravity-oauth"]),
+  tokenFile: z.string().optional(),
+  authorizeUrl: z.string().url().optional(),
+  tokenUrl: z.string().url().optional(),
+  revokeUrl: z.string().url().optional(),
+});
+
 /** Validation schema for a single provider entry. */
 export const providerConfigSchema = z.object({
   baseUrl: z.string().url(),
@@ -59,6 +68,12 @@ export const providerConfigSchema = z.object({
   network: networkConfigSchema.optional(),
   compat: compatOverridesSchema.optional(),
   keyless: z.boolean().optional(),
+  auth: providerAuthSchema.optional(),
+  endpointPath: z.string().optional(),
+  wireApi: z
+    .enum(["chat-completions", "responses", "anthropic-messages", "gemini-v1internal"])
+    .optional(),
+  keySelection: z.enum(["round-robin", "priority"]).optional(),
 });
 
 /** Validation schema for the `providers` block. */
@@ -89,6 +104,7 @@ export const shimConfigSchema = z.object({
   routingStrategy: z.enum(["priority", "round-robin", "weighted-round-robin", "fill-first", "latency"]).default("priority"),
   sessionAffinity: sessionAffinitySchema,
   visionFallbackModel: z.string().default(""),
+  passthroughUpstream: z.string().url().optional(),
   providers: providersSchema,
   hostConfig: hostConfigSchema,
 });

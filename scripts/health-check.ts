@@ -205,23 +205,41 @@ async function main(): Promise<void> {
   // window so we retry at most once per window period.
   const deployCooldownMs = windowSec * 1000;
   let lastDeployMs = 0;
+  // Deploy only on SUSTAINED criticality: CRITICAL on two consecutive
+  // probes (>= one interval). The first probe runs immediately after the
+  // watchdog itself is started — right when the shim is still booting and
+  // hasn't bound its port yet. Deploying on that first probe killed the
+  // just-started shim and raced its replacement, leaving the system with
+  // no shim at all.
+  let consecutiveCritical = 0;
   // eslint-disable-next-line no-constant-condition
   while (true) {
     const status = await runOnce();
+    if (status === "CRITICAL") {
+      consecutiveCritical++;
+    } else {
+      consecutiveCritical = 0;
+    }
     if (status === "CRITICAL" && args.deploy) {
-      const nowMs = Date.now();
-      if (nowMs - lastDeployMs >= deployCooldownMs) {
-        lastDeployMs = nowMs;
-        log.warn("health-check: CRITICAL — auto-running deploy");
-        try {
-          execSync("node dist/scripts/deploy.js", { stdio: "inherit" });
-        } catch (err) {
-          log.error("health-check: auto-deploy failed", { error: err instanceof Error ? err.message : String(err) });
-        }
-      } else {
-        log.warn("health-check: CRITICAL — deploy cooldown active, skipping", {
-          cooldownRemainingSec: Math.ceil((deployCooldownMs - (nowMs - lastDeployMs)) / 1000),
+      if (consecutiveCritical < 2) {
+        log.warn("health-check: CRITICAL — startup/transient grace, deploying only if the next check is critical too", {
+          consecutiveCritical,
         });
+      } else {
+        const nowMs = Date.now();
+        if (nowMs - lastDeployMs >= deployCooldownMs) {
+          lastDeployMs = nowMs;
+          log.warn("health-check: CRITICAL — auto-running deploy");
+          try {
+            execSync("node dist/scripts/deploy.js", { stdio: "inherit" });
+          } catch (err) {
+            log.error("health-check: auto-deploy failed", { error: err instanceof Error ? err.message : String(err) });
+          }
+        } else {
+          log.warn("health-check: CRITICAL — deploy cooldown active, skipping", {
+            cooldownRemainingSec: Math.ceil((deployCooldownMs - (nowMs - lastDeployMs)) / 1000),
+          });
+        }
       }
     }
     await sleep(intervalSec * 1000);

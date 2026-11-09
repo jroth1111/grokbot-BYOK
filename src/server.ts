@@ -55,6 +55,19 @@ import { ToolCallAccumulator } from "./translate/tools.js";
 import { applyCompatToRequest } from "./providers/compat.js";
 import { detectSupportsImages } from "./providers/compat.js";
 import type { ProviderCompat } from "./providers/compat.js";
+import type { OAuthCredentialManager } from "./providers/oauth-core.js";
+import {
+  adaptResponsesStream,
+  translateChatToResponses,
+} from "./translate/responses-api.js";
+import {
+  adaptAnthropicStream,
+  translateChatToAnthropic,
+} from "./translate/anthropic-messages.js";
+import {
+  adaptGeminiStream,
+  translateChatToGemini,
+} from "./translate/gemini-v1internal.js";
 import { rescueInlineToolCalls, containsDialectMarker, startsWithDialectMarker, couldBecomeDialectMarker } from "./translate/tool-call-rescue.js";
 import { ThinkTagStreamFilter } from "./translate/think-tags.js";
 import { StreamMarkupHealing, detectHealingPatternFromText } from "./translate/markup-healing.js";
@@ -87,6 +100,9 @@ const SHUTDOWN_GRACE_MS = 10_000;
 
 /** Interval between session-affinity cleanup sweeps (ms). */
 const SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+
+/** Interval between OAuth access-token refresh sweeps (ms). */
+const OAUTH_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
 
 /** Default stream idle timeout (ms) when a provider doesn't specify one. */
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 120_000;
@@ -167,6 +183,15 @@ const DEFAULT_RETRY_BACKOFF_INITIAL_MS = 500;
 const DEFAULT_RETRY_BACKOFF_MAX_MS = 5_000;
 
 /**
+ * In-request rate-limit backoff cap. Upstream quota errors (e.g. Google
+ * RESOURCE_EXHAUSTED) recommend half-hour waits; sleeping that long inside a
+ * live request would hang the client. Beyond this cap the provider is
+ * abandoned for this request (circuit-breaker cooldown still applies) and
+ * the failover chain takes over immediately.
+ */
+const RATE_LIMIT_FAILOVER_CAP_MS = 60_000;
+
+/**
  * Mask an API key for logging, showing only the first and last few characters.
  */
 function maskKey(key: string): string {
@@ -203,16 +228,34 @@ function detectSupportsImagesForModel(
   return detectSupportsImages(provider.name, provider.baseUrl, modelId);
 }
 
+/** The subset of Provider that the upstream fetch layer needs. */
+interface UpstreamTarget {
+  name: string;
+  baseUrl: string;
+  endpointPath: string;
+  wireApi:
+    | "chat-completions"
+    | "responses"
+    | "anthropic-messages"
+    | "gemini-v1internal";
+  authManager?: OAuthCredentialManager;
+}
+
 /**
- * Fetch an OpenAI chat completion stream from a provider.
+ * Fetch a chat completion stream from a provider.
  *
- * Builds the auth header from the key, sets the request timeout via an
- * AbortController, and returns the Response. Throws on network error or
- * timeout (AbortError). The caller is responsible for checking `resp.ok`
- * and reading the body.
+ * Builds the request per provider dialect: static-key providers POST the
+ * OpenAI Chat Completions body to `{baseUrl}/chat/completions`, while OAuth
+ * ("Sign in with ChatGPT") providers resolve the account's current access
+ * token via the auth manager, add the `chatgpt-account-id` header, translate
+ * the body to the Responses API wire format, and adapt the response stream
+ * back into standard OpenAI SSE so every downstream consumer is oblivious
+ * to the dialect. Sets the request timeout via an AbortController, and
+ * returns the Response. Throws on network error or timeout (AbortError).
+ * The caller is responsible for checking `resp.ok` and reading the body.
  */
 async function fetchCompletion(
-  baseUrl: string,
+  upstream: UpstreamTarget,
   body: OpenAIChatRequest,
   key: KeyInfo,
   timeoutMs: number,
@@ -221,25 +264,87 @@ async function fetchCompletion(
     "Content-Type": "application/json",
     Accept: "text/event-stream",
   };
-  if (key.value) {
+  // Per-provider OAuth headers (Bearer + companions) and transport shape.
+  let dispatcher: unknown;
+  if (upstream.authManager) {
+    // The KeyInfo value is the account id; the manager resolves a fresh
+    // token and adds any provider-specific companion headers.
+    Object.assign(headers, await upstream.authManager.buildUpstreamHeaders(key.value));
+    dispatcher = upstream.authManager.requestDispatcher?.();
+  } else if (key.value && !key.value.startsWith("${")) {
+    // Skip the header for empty keys AND unresolved "${VAR}" placeholders
+    // (e.g. keyless Kilo whose apiKey was never set) — sending the literal
+    // placeholder as a Bearer token gets it 401'd as INVALID_TOKEN.
     headers["Authorization"] = `Bearer ${key.value}`;
   }
   // OpenRouter attribution headers (optional, for app rankings).
   // Only sent when the provider host is openrouter.ai.
-  if (baseUrl.includes("openrouter.ai")) {
+  if (upstream.baseUrl.includes("openrouter.ai")) {
     headers["X-Title"] = "grokbot-BYOK-v2";
     headers["HTTP-Referer"] = "https://github.com/jroth1111/grokbot-byok";
+  }
+  // Wire-dialect request translation. Every dialect consumes the same
+  // internal OpenAI Chat Completions body.
+  let requestBody: string;
+  switch (upstream.wireApi) {
+    case "responses":
+      requestBody = JSON.stringify(translateChatToResponses(body));
+      break;
+    case "anthropic-messages":
+      requestBody = JSON.stringify(translateChatToAnthropic(body));
+      break;
+    case "gemini-v1internal":
+      requestBody = JSON.stringify(translateChatToGemini(body));
+      break;
+    default:
+      requestBody = JSON.stringify(body);
+      break;
   }
   const controller = new AbortController();
   const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const resp = await fetch(`${baseUrl}/chat/completions`, {
+    // Antigravity: the account's project id rides as a query parameter
+    // (endpoint rejects any metadata field in the body; license check needs
+    // the project on the PROD cloudcode endpoint).
+    let upstreamUrl = `${upstream.baseUrl}${upstream.endpointPath}`;
+    if (upstream.wireApi === "gemini-v1internal" && upstream.authManager?.accountContext) {
+      const ctx = await upstream.authManager.accountContext(key.value);
+      if (typeof ctx.projectId === "string" && ctx.projectId) {
+        upstreamUrl += `${upstream.endpointPath.includes("?") ? "&" : "?"}project=${encodeURIComponent(ctx.projectId)}`;
+      }
+    }
+    const resp = await fetch(upstreamUrl, {
       method: "POST",
       headers,
-      body: JSON.stringify(body),
+      body: requestBody,
       signal: controller.signal,
-    });
+      ...(dispatcher ? { dispatcher } : {}),
+    } as RequestInit & { dispatcher?: unknown });
     clearTimeout(timeoutHandle);
+    // Non-OpenAI dialects: wrap the event stream back into OpenAI SSE chunks
+    // so the streaming loop, tool accumulator, usage extraction, timeouts,
+    // and failover all work unchanged. Only adapt successful bodies — error
+    // bodies are read as text by the classification path.
+    if (resp.ok && resp.body) {
+      if (upstream.wireApi === "responses") {
+        return new Response(adaptResponsesStream(resp.body, body.model), {
+          status: resp.status,
+          headers: resp.headers,
+        });
+      }
+      if (upstream.wireApi === "anthropic-messages") {
+        return new Response(adaptAnthropicStream(resp.body, body.model), {
+          status: resp.status,
+          headers: resp.headers,
+        });
+      }
+      if (upstream.wireApi === "gemini-v1internal") {
+        return new Response(adaptGeminiStream(resp.body, body.model), {
+          status: resp.status,
+          headers: resp.headers,
+        });
+      }
+    }
     return resp;
   } catch (err) {
     clearTimeout(timeoutHandle);
@@ -339,7 +444,7 @@ async function shadowProbe(
   let success = false;
 
   try {
-    const resp = await fetchCompletion(provider.baseUrl, probeBody, key, probeTimeoutMs);
+    const resp = await fetchCompletion(provider, probeBody, key, probeTimeoutMs);
     if (!resp.ok || !resp.body) {
       logger.warn("shadow probe: upstream non-2xx", {
         requestId,
@@ -481,6 +586,99 @@ async function shadowProbe(
  * so provider routing state, circuit state, and session bindings persist for
  * the lifetime of the server.
  */
+/**
+ * Transparent reverse proxy for non-inference requests.
+ *
+ * When CURSOR_API_BASE_URL points the host app at the shim, every RPC other
+ * than the inference stream (auth, dashboard, models, analytics, updates…)
+ * is forwarded verbatim to the real backend — same method, headers (incl.
+ * the caller's Authorization), and body — and the response (including SSE /
+ * binary Connect payloads) is streamed back untouched. The local shim never
+ * inspects or logs these bodies.
+ */
+async function proxyPassThrough(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  upstreamBase: string,
+  logger: Logger,
+): Promise<void> {
+  const controller = new AbortController();
+  const teardown = (): void => {
+    controller.abort();
+    res.removeListener("close", teardown);
+    req.removeListener("aborted", teardown);
+  };
+  res.once("close", teardown);
+  req.once("aborted", teardown);
+
+  try {
+    const upstream = new URL(req.url ?? "/", upstreamBase);
+    // Forward every header except hop-by-hop framing ones the transport
+    // recomputes; Authorization/Cookie/User-Agent ride through unchanged.
+    const headers: Record<string, string> = {};
+    for (const [name, value] of Object.entries(req.headers)) {
+      if (value === undefined) continue;
+      if (["host", "connection", "content-length", "transfer-encoding"].includes(name)) {
+        continue;
+      }
+      headers[name] = Array.isArray(value) ? value.join(", ") : value;
+    }
+
+    const upstreamResp = await fetch(upstream, {
+      method: req.method,
+      headers,
+      body: req.method === "GET" || req.method === "HEAD" ? undefined : req,
+      signal: controller.signal,
+      // undici requires duplex for streamed request bodies.
+      ...(req.method === "GET" || req.method === "HEAD" ? {} : { duplex: "half" }),
+    } as RequestInit & { duplex?: string });
+
+    const responseHeaders: Record<string, string> = {};
+    upstreamResp.headers.forEach((value, name) => {
+      if (name === "transfer-encoding" || name === "content-length" || name === "connection") {
+        return;
+      }
+      responseHeaders[name] = value;
+    });
+    res.writeHead(upstreamResp.status, responseHeaders);
+    if (upstreamResp.body) {
+      const reader = upstreamResp.body.getReader();
+      res.on("close", () => {
+        void reader.cancel().catch(() => {
+          // upstream already closed
+        });
+      });
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!res.write(value)) {
+          await new Promise<void>((resolve) => res.once("drain", resolve));
+        }
+      }
+    }
+    res.end();
+    logger.info("passthrough", {
+      method: req.method,
+      path: req.url,
+      status: upstreamResp.status,
+    });
+  } catch (err) {
+    teardown();
+    if (!res.headersSent) {
+      res.writeHead(502, { "Content-Type": "text/plain" });
+    }
+    res.end(`passthrough failed: ${err instanceof Error ? err.message : String(err)}`);
+    logger.warn("passthrough failed", {
+      method: req.method,
+      path: req.url,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  } finally {
+    res.removeListener("close", teardown);
+    req.removeListener("aborted", teardown);
+  }
+}
+
 export function createServer(config: ShimConfig, baseLogger: Logger): http.Server {
   const registry = new ProviderRegistry(
     config.providers.configs,
@@ -507,6 +705,24 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
   );
   cleanupHandle.unref();
 
+  // Keep OAuth ("Sign in with ChatGPT") access tokens fresh with a periodic
+  // background sweep so request-time refreshes are rare. Refresh failures
+  // are logged inside the manager; a failing account gets disabled there.
+  const oauthManagers = registry.getAuthManagers();
+  let oauthRefreshHandle: ReturnType<typeof setInterval> | undefined;
+  if (oauthManagers.length > 0) {
+    const sweep = (): void => {
+      for (const manager of oauthManagers) {
+        void manager.refreshDueAccounts().catch(() => {
+          // Errors already surfaced by the manager's logger (if any).
+        });
+      }
+    };
+    oauthRefreshHandle = setInterval(sweep, OAUTH_REFRESH_INTERVAL_MS);
+    oauthRefreshHandle.unref();
+    sweep();
+  }
+
   // Periodically log per-provider metrics (requests, error rate, latency
   // histogram, TTFB). Uses the same interval as session cleanup.
   const metricsHandle = setInterval(
@@ -523,8 +739,16 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
   metricsHandle.unref();
 
   const server = http.createServer(async (req, res) => {
-    // Only the streaming inference path is supported.
+    // Only the streaming inference path is served locally; everything else
+    // is either 404 or, when passthroughUpstream is configured, transparently
+    // proxied (used with CURSOR_API_BASE_URL redirection so the host app's
+    // auth/dashboard/analytics RPCs keep hitting the real backend while
+    // inference is served by local providers).
     if (req.method !== "POST" || req.url !== STREAM_PATH) {
+      if (config.passthroughUpstream) {
+        await proxyPassThrough(req, res, config.passthroughUpstream, baseLogger);
+        return;
+      }
       res.writeHead(404, { "Content-Type": "text/plain" });
       res.end("not found");
       return;
@@ -826,6 +1050,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
           baseUrl: string;
           compat: ProviderCompat;
           connectionStartMs: number;
+          providerRef: Provider;
         }
       | undefined;
     let requestErrorMessage: string | null = null;
@@ -886,13 +1111,21 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       );
 
       let authRotations = 0;
+      // Accounts already force-refreshed during this request (OAuth 401
+      // recovery — one refresh attempt per account, then rotate away).
+      const oauthRefreshedAccounts = new Set<string>();
+      // Sticky key: set when an OAuth refresh succeeded so the immediate
+      // retry reuses the SAME account with its fresh token instead of the
+      // round-robin cursor rotating to the next one.
+      let stickyKey: KeyInfo | undefined;
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        const key = provider.selectKey();
+        const key = stickyKey ?? provider.selectKey();
+        stickyKey = undefined;
         const keyOrdinal = provider.keys.indexOf(key);
 
         const attemptStart = Date.now();
         try {
-          const resp = await fetchCompletion(provider.baseUrl, openaiBody, key, requestTimeoutMs);
+          const resp = await fetchCompletion(provider, openaiBody, key, requestTimeoutMs);
 
           if (resp.ok && resp.body) {
             breaker.recordSuccess(provider.name);
@@ -916,6 +1149,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
               baseUrl: provider.baseUrl,
               compat: provider.compat,
               connectionStartMs: attemptStart,
+              providerRef: provider,
             };
             recordAttempt(provider.name, model, "ok", attemptStart, undefined, keyOrdinal);
             resetBreaker(consecBreaker);
@@ -938,6 +1172,32 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
           // transient errors (429/5xx). We track auth rotations separately
           // and bail out when every key has been tried with an auth error.
           if (errorType === "auth-error") {
+            // OAuth providers: a 401 usually means the cached access token
+            // was revoked or expired server-side ahead of schedule. Try one
+            // forced token refresh for this account before rotating away;
+            // on success retry the SAME account with its fresh token.
+            if (
+              provider.authManager &&
+              key.value &&
+              !oauthRefreshedAccounts.has(key.value)
+            ) {
+              oauthRefreshedAccounts.add(key.value);
+              const refreshed = await provider.authManager
+                .forceRefresh(key.value)
+                .catch(() => false);
+              if (refreshed) {
+                logger.info("oauth token refreshed after auth error, retrying account", {
+                  model,
+                  provider: provider.name,
+                  account: maskKey(key.value),
+                  elapsed: Date.now() - attemptStart,
+                });
+                stickyKey = key;
+                // Don't consume a retry attempt for the refresh retry.
+                attempt--;
+                continue;
+              }
+            }
             provider.markKeyFailed(key);
             authRotations++;
             logger.warn("auth error, rotating key", {
@@ -1000,6 +1260,21 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
           if (decision === "retry") {
             const backoff = computeRateLimitBackoff(errorType, errText) ??
               computeBackoff(attempt, backoffInitialMs, backoffMaxMs);
+            if (backoff > RATE_LIMIT_FAILOVER_CAP_MS) {
+              // Quota-class backoffs (30min) are longer than any client should
+              // wait inside one request — fail over now; the breaker cooldown
+              // keeps this provider out of rotation for a while.
+              logger.warn("rate-limit backoff exceeds failover cap, moving to next provider", {
+                model,
+                provider: provider.name,
+                recommendedBackoffMs: backoff,
+                capMs: RATE_LIMIT_FAILOVER_CAP_MS,
+                attempt,
+              });
+              recordAttempt(provider.name, model, "rate_limited", attemptStart, errText, keyOrdinal);
+              metrics.recordRequest(provider.name, false, Date.now() - attemptStart);
+              break;
+            }
             logger.info("retrying after backoff", {
               model,
               provider: provider.name,
@@ -1149,8 +1424,12 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
     //     closure references them by name, so reassignment here is visible
     //     inside attemptStream on the next call.
     // ---------------------------------------------------------------------
-    let { resp: firstResp, providerName, model, key, network, baseUrl, compat, connectionStartMs } =
+    let { resp: firstResp, providerName, model, key, network, baseUrl, compat, connectionStartMs, providerRef } =
       connected;
+    // The provider object the current attempt targets (mutable across the
+    // cross-provider failover loop below so the retry fetch picks up the
+    // right dialect/auth for whichever provider is serving the attempt).
+    let currentProvider = providerRef;
     let requestTimeoutMs = adaptiveRequestTimeoutMs(
       network.requestTimeoutMs ?? config.requestTimeoutMs,
       openaiBody,
@@ -1550,7 +1829,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       if (!resp) {
         const retryStartMs = Date.now();
         try {
-          resp = await fetchCompletion(baseUrl, openaiBody, key, requestTimeoutMs);
+          resp = await fetchCompletion(currentProvider, openaiBody, key, requestTimeoutMs);
           if (!resp.ok || !resp.body) {
             // If the retry fetch hits an auth error (401/402/403), the
             // provider's credentials are exhausted — open the circuit so
@@ -2069,6 +2348,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       openaiBody.model = model;
       key = nextProvider.selectKey();
       baseUrl = nextProvider.baseUrl;
+      currentProvider = nextProvider;
       compat = nextProvider.compat;
       network = nextProvider.network;
       requestTimeoutMs = adaptiveRequestTimeoutMs(
@@ -2105,6 +2385,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
     shuttingDown = true;
     clearInterval(cleanupHandle);
     clearInterval(metricsHandle);
+    if (oauthRefreshHandle) clearInterval(oauthRefreshHandle);
     baseLogger.info("server shutting down", {});
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(1), SHUTDOWN_GRACE_MS).unref();
@@ -2122,6 +2403,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
     process.removeListener("SIGTERM", shutdown);
     process.removeListener("SIGINT", shutdown);
     clearInterval(cleanupHandle);
+    if (oauthRefreshHandle) clearInterval(oauthRefreshHandle);
   });
 
   return server;

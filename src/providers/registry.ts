@@ -22,11 +22,51 @@
 import type { Provider, ProviderConfig, RoutingStrategy } from "../types.js";
 import { BaseProvider, normalizeModelId } from "./base.js";
 import { performanceTracker } from "./performance.js";
+import {
+  ChatGptTokenManager,
+  DEFAULT_CHATGPT_TOKEN_FILE,
+} from "./chatgpt-oauth.js";
+import {
+  ClaudeTokenManager,
+  DEFAULT_CLAUDE_TOKEN_FILE,
+} from "./claude-oauth.js";
+import {
+  AntigravityTokenManager,
+  DEFAULT_ANTIGRAVITY_TOKEN_FILE,
+} from "./antigravity-oauth.js";
+import type { OAuthCredentialManager } from "./oauth-core.js";
+
+/** Instantiate the token manager for a login-based provider config. */
+function createAuthManager(
+  auth: NonNullable<ProviderConfig["auth"]>,
+): OAuthCredentialManager | undefined {
+  switch (auth.type) {
+    case "chatgpt-oauth":
+      return new ChatGptTokenManager({
+        tokenFile: auth.tokenFile ?? DEFAULT_CHATGPT_TOKEN_FILE,
+        endpoints: auth,
+      });
+    case "claude-oauth":
+      return new ClaudeTokenManager({
+        tokenFile: auth.tokenFile ?? DEFAULT_CLAUDE_TOKEN_FILE,
+        endpoints: auth,
+      });
+    case "antigravity-oauth":
+      return new AntigravityTokenManager({
+        tokenFile: auth.tokenFile ?? DEFAULT_ANTIGRAVITY_TOKEN_FILE,
+        tokenEndpoint: auth.tokenUrl,
+      });
+    default:
+      return undefined;
+  }
+}
 
 export class ProviderRegistry {
   private providers: Map<string, Provider> = new Map();
   private priorityOrder: string[] = [];
   private readonly strategy: RoutingStrategy;
+  /** OAuth token managers by provider name (login-based providers). */
+  private authManagers: Map<string, OAuthCredentialManager> = new Map();
 
   /** Round-robin cursor per normalized model id. */
   private roundRobinCursors: Map<string, number> = new Map();
@@ -45,17 +85,29 @@ export class ProviderRegistry {
     // in the priority array are still registered (reachable via getProvider)
     // but won't appear in routing or failover chains.
     for (const [name, config] of Object.entries(configs)) {
-      this.providers.set(name, new BaseProvider(name, config));
+      let authManager: OAuthCredentialManager | undefined;
+      if (config.auth) {
+        authManager = createAuthManager(config.auth);
+        if (authManager) {
+          this.authManagers.set(name, authManager);
+        }
+      }
+      this.providers.set(name, new BaseProvider(name, config, authManager));
     }
 
     // Filter the priority list: skip providers whose API key is empty
     // or unresolved (env var not set → "${VAR}" literal remains) unless
-    // they are marked `keyless`. This lets users define multiple ox-alpha
+    // they are marked `keyless`. OAuth providers participate only when at
+    // least one enabled account exists in their token store (i.e. the user
+    // has run the login flow). This lets users define multiple ox-alpha
     // providers in config and only the ones with valid keys (or keyless
     // ones) will be active in the failover chain.
     this.priorityOrder = priority.filter((name) => {
       const config = configs[name];
       if (!config) return false;
+      if (config.auth) {
+        return this.authManagers.get(name)?.hasEnabledAccount() ?? false;
+      }
       if (config.keyless) return true;
       const key = config.apiKey;
       return key.length > 0 && !key.startsWith("${");
@@ -72,6 +124,11 @@ export class ProviderRegistry {
   /** The active routing strategy. */
   getStrategy(): RoutingStrategy {
     return this.strategy;
+  }
+
+  /** All OAuth token managers (used by the server for background refresh). */
+  getAuthManagers(): OAuthCredentialManager[] {
+    return [...this.authManagers.values()];
   }
 
   /**

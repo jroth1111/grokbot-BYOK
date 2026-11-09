@@ -260,8 +260,12 @@ failover. The registry skips providers with missing API keys automatically
 | `kilo` | `KILO_API_KEY` | no (keyless) | stealth/ox-alpha | Kilo gateway. 200 req/hr/IP without a key. |
 | `opencode-zen` | `OPENCODE_API_KEY` | no | x-preview-f-free | OpenCode Zen endpoint (shared key with Go) |
 | `local` | `LOCAL_API_KEY` | no | glm-5.2, glm-5.1, swe-1-7 | WindsurfAPI on localhost:3003 |
+| `zai` | `ZAI_API_KEY` | no | glm-5.3 / glm-5.2 / glm-4.7 | Z.AI GLM international — GLM Coding Plan key (z.ai). Primary by default when set. |
+| `chatgpt` | — (OAuth login) | no | gpt-reserve / gpt-5.6 / gpt-6 family | Your ChatGPT account via "Sign in with ChatGPT" — free plans work too (smaller catalog + lower quotas); Plus/Pro unlocks more. |
+| `claude` | — (OAuth login) | no | claude-sonnet/opus/haiku 4.5 (+ `-thinking-N`) | Claude Pro/Max subscription via the Claude Code OAuth flow. |
+| `antigravity` | — (OAuth login) | no | gemini-3-pro / gemini-2.5 family | Any Google account via the Antigravity IDE OAuth flow — free accounts include Gemini quota. |
 
-**Default failover order.** `openrouter` then `opencode-go` then `kilo` then `opencode-zen` then `local`.
+**Default failover order.** `openrouter` → `opencode-go` → `kilo` → `opencode-zen` → `local` → `chatgpt` → `claude` → `antigravity` (login providers activate once you sign in).
 
 ### Where to get API keys
 
@@ -280,6 +284,7 @@ automatically at startup. See `.env.example` for the full template.
 ```bash
 # .env
 OPENCODE_API_KEY=sk-your-opencode-key
+ZAI_API_KEY=your-zai-glm-key       # Z.AI GLM international / GLM Coding Plan
 KILO_API_KEY=your-kilo-key          # optional (keyless works without this)
 OPENROUTER_API_KEY=sk-or-v1-your-key
 LOCAL_API_KEY=sk-local-test         # must match WindsurfAPI's API_KEY
@@ -292,6 +297,46 @@ the config references keys by env var name.
 > No secrets go in the config file. All API keys live in `.env` and are
 > referenced via `${VAR_NAME}` interpolation in `config.json`. This keeps
 > secrets out of git.
+
+### Subscription login (ChatGPT / Claude / Antigravity — no API keys)
+
+Instead of API keys, log in with your existing subscriptions. All three use
+the same OAuth flows their official CLI/IDE clients use; the shim translates
+each upstream wire format (OpenAI Responses / Anthropic Messages / Gemini
+v1internal) transparently.
+
+```bash
+npm run build:scripts          # once, after cloning/pulling
+npm run login -- chatgpt       # or: claude | antigravity
+npm run login -- claude --auto-config   # sets defaultModel to the first
+                                       # model your account can actually use
+npm start                       # restart the shim to activate
+npm run login --status          # all providers, all accounts
+```
+
+- **Multiple accounts per provider**: re-run login in another browser
+  profile. Accounts carry a **priority** (`--priority N`, lower =
+  preferred) and fail down automatically; quota exhaustion (429) rotates
+  accounts before failing over to other providers.
+- **Model discovery**: after login the CLI probes/lists the models your
+  account can actually use; `--auto-config` sets `defaultModel` to the
+  first one (or copy the printed suggestion into `config/config.json`).
+- **Tokens**: per-provider stores under `config/oauth/` (mode 0600),
+  refreshed automatically in the background; revoked logins disable that
+  account until re-login.
+- **Logout**: `npm run logout -- claude` (or `--all` / `--account <id>`);
+  the `npm run chatgpt:*` aliases remain for muscle memory.
+- **Plan requirements**: ChatGPT and Antigravity work on **free** plans
+  (smaller catalogs/quotas). Claude requires an **active Claude Pro/Max
+  subscription** — Anthropic's authorize page rejects free accounts outright.
+
+> [!WARNING]
+> These OAuth paths are officially intended for the providers' own clients.
+> Routing a third-party tool through a subscription sits in a gray area of
+> each provider's ToS and may carry account risk. Claude additionally sits
+> behind Cloudflare and Antigravity enforces a client fingerprint
+> (HTTP/1.1-only, versioned User-Agent) — both are handled here, but the
+> providers may change behavior at any time.
 
 ---
 

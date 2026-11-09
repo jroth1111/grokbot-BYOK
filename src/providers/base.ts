@@ -8,6 +8,7 @@
 import type { KeyInfo, NetworkConfig, Provider, ProviderConfig } from "../types.js";
 import { resolveCompat } from "./compat.js";
 import type { ProviderCompat } from "./compat.js";
+import type { OAuthCredentialManager } from "./oauth-core.js";
 
 /**
  * Normalize a raw model id for alias lookup.
@@ -49,6 +50,14 @@ export class BaseProvider implements Provider {
   readonly models: Map<string, string>;
   /** Resolved provider compat flags (auto-detected from name/baseUrl/model). */
   readonly compat: ProviderCompat;
+  /** Upstream endpoint path appended to baseUrl (default /chat/completions). */
+  readonly endpointPath: string;
+  /** Upstream wire protocol (default chat-completions). */
+  readonly wireApi: Provider["wireApi"];
+  /** OAuth token manager when an auth.type is set. */
+  readonly authManager?: OAuthCredentialManager;
+  /** How keys/accounts rotate: round-robin or priority fill-first. */
+  readonly keySelection: "round-robin" | "priority";
 
   /** Round-robin cursor for key selection. Bounded to prevent overflow. */
   private keyCursor: number = 0;
@@ -60,7 +69,11 @@ export class BaseProvider implements Provider {
    */
   private failedKeys: Set<string> = new Set();
 
-  constructor(name: string, config: ProviderConfig) {
+  constructor(
+    name: string,
+    config: ProviderConfig,
+    authManager?: OAuthCredentialManager,
+  ) {
     this.name = name;
     // Guard against undefined/null baseUrl and trim surrounding whitespace
     // before stripping trailing slashes so edge cases like
@@ -68,14 +81,24 @@ export class BaseProvider implements Provider {
     this.baseUrl = (config.baseUrl ?? "").trim().replace(/\/+$/, "");
     this.defaultModel = config.defaultModel;
     this.network = config.network ?? {};
+    this.endpointPath = config.endpointPath ?? "/chat/completions";
+    this.wireApi = config.wireApi ?? "chat-completions";
+    this.authManager = authManager;
+    // OAuth accounts rotate by priority (preferred account first, failing
+    // down to the next); static key pools keep round-robin unless overridden.
+    this.keySelection = config.keySelection ?? (authManager ? "priority" : "round-robin");
 
-    // Build the keys array. If `config.keys` is provided and non-empty,
-    // use those (filtering out explicitly disabled keys). Otherwise,
-    // create a single KeyInfo from the legacy `config.apiKey` field.
-    // If all provided keys are disabled (leaving an empty array after
-    // filtering), fall back to the legacy `config.apiKey` so selectKey
-    // never returns undefined.
-    if (config.keys && config.keys.length > 0) {
+    // Build the keys array. OAuth providers derive their rotation set from
+    // the token store (one KeyInfo per enabled ChatGPT account, value =
+    // account id — the actual access token is resolved at request time).
+    // Otherwise: if `config.keys` is provided and non-empty, use those
+    // (filtering out explicitly disabled keys). Otherwise, create a single
+    // KeyInfo from the legacy `config.apiKey` field. If all provided keys
+    // are disabled (leaving an empty array after filtering), fall back to
+    // the legacy `config.apiKey` so selectKey never returns undefined.
+    if (authManager) {
+      this.keys = authManager.getKeyInfos();
+    } else if (config.keys && config.keys.length > 0) {
       this.keys = config.keys.filter((k) => k.enabled !== false);
     } else {
       this.keys = [];
@@ -123,6 +146,13 @@ export class BaseProvider implements Provider {
       // All keys failed — reset and try again.
       this.failedKeys.clear();
       return this.keys[0];
+    }
+    // Priority mode: the key array is priority-ordered at construction
+    // (OAuth managers return preferred accounts first), so the first
+    // enabled entry is always the current pick; failures skip it until
+    // reset. No cursor — account precedence is stable per request.
+    if (this.keySelection === "priority") {
+      return enabled[0];
     }
     const key = enabled[this.keyCursor % enabled.length];
     // Wrap the cursor within enabled.length to prevent unbounded growth

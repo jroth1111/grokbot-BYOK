@@ -6,6 +6,11 @@
  * reaching into another module's internals.
  */
 
+// Type-only circular import (erased at compile time): the OAuth token
+// managers live in providers/*-oauth.ts but the Provider interface needs
+// their common type for the optional authManager field.
+import type { OAuthCredentialManager } from "./providers/oauth-core.js";
+
 // ---------------------------------------------------------------------------
 // Connect protocol types
 // ---------------------------------------------------------------------------
@@ -214,6 +219,34 @@ export type InferenceStreamResponse =
 /** Routing strategy for selecting among providers that can handle a model. */
 export type RoutingStrategy = "priority" | "round-robin" | "weighted-round-robin" | "fill-first" | "latency";
 
+/** Upstream wire protocol spoken by a provider. */
+export type WireApi =
+  | "chat-completions"
+  | "responses"
+  | "anthropic-messages"
+  | "gemini-v1internal";
+
+/** Login-based auth types (browser OAuth per provider). */
+export type OAuthProviderType =
+  | "chatgpt-oauth"
+  | "claude-oauth"
+  | "antigravity-oauth";
+
+/**
+ * OAuth-based auth config for providers that authenticate via a browser
+ * login flow instead of static API keys. The token store is a local JSON
+ * file the login CLI writes and the shim's TokenManager keeps fresh.
+ */
+export interface ProviderAuthConfig {
+  type: OAuthProviderType;
+  /** Path to the multi-account token store (provider-specific default). */
+  tokenFile?: string;
+  /** Override the OAuth endpoints (used by tests to point at a local mock). */
+  authorizeUrl?: string;
+  tokenUrl?: string;
+  revokeUrl?: string;
+}
+
 /** A single API key with optional weight. */
 export interface KeyInfo {
   /** The API key value. */
@@ -265,6 +298,14 @@ export interface Provider {
   canHandle(normalizedModelId: string): boolean;
   /** Resolves a normalized model id to the canonical id to send upstream. */
   resolveModel(normalizedModelId: string): string;
+  /** Upstream endpoint path appended to baseUrl (default "/chat/completions"). */
+  readonly endpointPath: string;
+  /** Upstream wire protocol (default "chat-completions"). */
+  readonly wireApi: WireApi;
+  /** OAuth token manager when an auth.type is set, else undefined. */
+  readonly authManager?: OAuthCredentialManager;
+  /** How keys/accounts rotate: round-robin (default) or priority fill-first. */
+  readonly keySelection: "round-robin" | "priority";
   /** Select the next API key (for key rotation). */
   selectKey(): KeyInfo;
   /** Mark a key as failed (for rotation). */
@@ -290,6 +331,17 @@ export interface ProviderConfig {
    * (e.g. Kilo's anonymous access for free models at 200 req/hr/IP).
    */
   keyless?: boolean;
+  /** OAuth login auth (e.g. "Sign in with ChatGPT"). Mutually exclusive with
+   *  a meaningful apiKey: when set, credentials come from the token store. */
+  auth?: ProviderAuthConfig;
+  /** Upstream endpoint path appended to baseUrl (default "/chat/completions"). */
+  endpointPath?: string;
+  /** Upstream wire protocol (default "chat-completions"). */
+  wireApi?: WireApi;
+  /** Key/account rotation mode. OAuth providers default to "priority"
+   *  (preferred account first, fail-down to the next); key providers keep
+   *  round-robin. */
+  keySelection?: "round-robin" | "priority";
 }
 
 /** Compat flag overrides a user can set per provider in config. */
@@ -341,6 +393,14 @@ export interface ShimConfig {
    * VISION_FALLBACK_MODEL env.
    */
   visionFallbackModel?: string;
+  /**
+   * When set (e.g. "https://api2.cursor.sh"), every request that is NOT the
+   * local inference stream path is transparently proxied to this upstream —
+   * headers and body forwarded verbatim, responses streamed back. Used with
+   * CURSOR_API_BASE_URL redirection so the host app's auth/dashboard/etc.
+   * RPCs keep working while inference is served locally.
+   */
+  passthroughUpstream?: string;
   providers: {
     priority: string[];
     configs: Record<string, ProviderConfig>;

@@ -43,6 +43,10 @@ import {
   PID_FILES, LOG_FILES, DAEMON_STATUS_LIST, findAlivePid, resolveSandHostDir,
   stopAllDaemons, startDaemon, portIsListening, sleep,
 } from "../src/utils/daemon.js";
+import {
+  ChatGptTokenStore,
+  DEFAULT_CHATGPT_TOKEN_FILE,
+} from "../src/providers/chatgpt-oauth.js";
 
 // ─── Paths ────────────────────────────────────────────────────────────────
 
@@ -92,6 +96,16 @@ const PROVIDERS: ProviderInfo[] = [
     url: "https://opencode.ai",
     models: "ox-alpha-free, qwen3.8-max (vision)",
     description: "Primary provider. Frontier reasoning model, free tier.",
+  },
+  {
+    name: "zai",
+    envVar: "ZAI_API_KEY",
+    cliFlag: "--zai-key",
+    required: false,
+    keyless: false,
+    url: "https://z.ai",
+    models: "glm-5.3, glm-5.2, glm-4.7",
+    description: "Z.AI GLM international (GLM Coding Plan). Get a key at z.ai.",
   },
   {
     name: "kilo",
@@ -265,6 +279,37 @@ function getMissingRequiredKeys(envPath: string): string[] {
   return missing;
 }
 
+/**
+ * True when at least one enabled ChatGPT account exists in the token store
+ * (i.e. `npm run chatgpt:login` has been completed). A signed-in ChatGPT
+ * subscription satisfies the "at least one usable provider" requirement,
+ * so users who route exclusively through their ChatGPT plan are not blocked
+ * by the missing OPENCODE_API_KEY check.
+ */
+function chatgptAccountAvailable(): boolean {
+  let tokenFile = DEFAULT_CHATGPT_TOKEN_FILE;
+  try {
+    const raw = readFileSync(path.join(configDir, "config.json"), "utf8");
+    const cfg = JSON.parse(raw) as {
+      providers?: { configs?: Record<string, { auth?: { tokenFile?: string } }> };
+    };
+    for (const provider of Object.values(cfg.providers?.configs ?? {})) {
+      if (provider?.auth?.tokenFile) {
+        tokenFile = provider.auth.tokenFile;
+        break;
+      }
+    }
+  } catch {
+    // No config or unreadable — fall back to the default store path.
+  }
+  try {
+    const resolved = path.resolve(projectRoot, tokenFile);
+    return new ChatGptTokenStore(resolved).load().some((a) => a.enabled);
+  } catch {
+    return false;
+  }
+}
+
 // ─── Provider table (suppressed by --quiet) ───────────────────────────────
 
 function printProviderTable(): void {
@@ -293,7 +338,7 @@ function printProviderTable(): void {
   console.log(`  ${CYAN}OPENCODE_API_KEY=sk-xxx npm run setup${RESET}`);
   console.log(`  Or edit ${CYAN}.env${RESET} manually and run ${CYAN}npm run setup${RESET}`);
   console.log();
-  console.log(`${BOLD}Failover order:${RESET} openrouter → opencode-go → kilo → opencode-zen → local`);
+  console.log(`${BOLD}Failover order:${RESET} openrouter → opencode-go → kilo → opencode-zen → local → chatgpt (OAuth: npm run chatgpt:login)`);
   console.log(`${DIM}Providers with missing API keys are automatically skipped (except keyless ones like kilo).${RESET}`);
   console.log();
 }
@@ -407,7 +452,11 @@ async function main(): Promise<void> {
   if (!quiet) printProviderTable();
 
   const missing = getMissingRequiredKeys(envFile);
-  if (missing.length > 0) {
+  if (missing.length > 0 && chatgptAccountAvailable()) {
+    warn(`Missing API keys: ${missing.join(", ")} — continuing because a signed-in ChatGPT account is available.`);
+    warn(`  (Add keys later via: npm run setup -- ${missing.map((v) => `${v}=<key>`).join(" ")})`);
+    ok("ChatGPT OAuth account available — chatgpt provider active");
+  } else if (missing.length > 0) {
     warn(`Missing required API keys: ${missing.join(", ")}`);
     const flags = missing.map((v) => {
       const p = PROVIDERS.find((pp) => pp.envVar === v);
@@ -415,6 +464,7 @@ async function main(): Promise<void> {
     });
     warn(`  npm run setup -- ${flags.join(" ")}`);
     warn(`  ${missing.map((v) => `${v}=<key>`).join(" ")} npm run setup`);
+    warn(`  …or skip API keys entirely: npm run chatgpt:login (use a ChatGPT subscription)`);
     err("Cannot start without required API keys.");
     process.exit(1);
   }
@@ -555,6 +605,8 @@ async function main(): Promise<void> {
     console.log(`  ${CYAN}npm run setup -- --status${RESET}  check status`);
     console.log(`  ${CYAN}npm run setup -- --stop${RESET}     stop all`);
     console.log(`  ${CYAN}npm run setup${RESET}               restart`);
+    console.log(`  ${CYAN}npm run chatgpt:login${RESET}      route via a ChatGPT subscription (optional, no API key)`);
+    console.log(`  ${CYAN}npm run login -- claude${RESET}      …or Claude / Antigravity subscriptions`);
     console.log();
   }
 

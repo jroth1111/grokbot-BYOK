@@ -66,6 +66,28 @@ function portIsListening(host: string, port: number, timeoutMs = 1000): Promise<
   });
 }
 
+/** Read a numeric PID from a file, or undefined. */
+function readPid(pidFile: string): number | undefined {
+  if (!existsSync(pidFile)) return undefined;
+  try {
+    const parsed = parseInt(readFileSync(pidFile, "utf8").trim(), 10);
+    return Number.isNaN(parsed) ? undefined : parsed;
+  } catch {
+    return undefined;
+  }
+}
+
+/** True when a PID maps to a live process. */
+function isPidAlive(pid: number | undefined): boolean {
+  if (pid === undefined) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Kill a process by PID file, then pkill by pattern. Best-effort. */
 async function stopOldShim(pidFile: string): Promise<void> {
   if (existsSync(pidFile)) {
@@ -102,6 +124,47 @@ async function stopOldShim(pidFile: string): Promise<void> {
     execSync('pkill -f "dist/shim.js"', { stdio: "ignore" });
   } catch {
     /* no matching process */
+  }
+}
+
+/**
+ * Wait until the old shim has fully exited and its PID files are clear.
+ *
+ * The shim's graceful shutdown can take several seconds (server.close waits
+ * for open connections; the internal grace period is 10s), while a freshly
+ * started shim refuses to boot while the per-port PID file still points at
+ * a LIVE process. Racing that check used to leave the system with no shim
+ * at all: deploy killed the old one, the new one bailed on the lock, and
+ * the deploy failed after the fact. Poll both PID files (the legacy
+ * /tmp/inference-shim.pid deploy itself writes and the per-port
+ * /tmp/inference-shim-<port>.pid the shim writes) until their PIDs are
+ * gone, force-kill stragglers, then remove the stale files.
+ */
+async function waitForShimExit(pidFile: string, port: number): Promise<void> {
+  const perPortPidFile = `/tmp/inference-shim-${port}.pid`;
+  for (let i = 0; i < 25; i++) {
+    const legacyPid = readPid(pidFile);
+    const portPid = readPid(perPortPidFile);
+    if (!isPidAlive(legacyPid) && !isPidAlive(portPid)) break;
+    await sleep(400);
+  }
+  // Force-kill anything that outlived the grace window.
+  for (const pid of [readPid(pidFile), readPid(perPortPidFile)]) {
+    if (isPidAlive(pid)) {
+      try {
+        process.kill(pid!, "SIGKILL");
+      } catch {
+        /* already dead */
+      }
+    }
+  }
+  // Clear stale PID files so the new shim starts cleanly.
+  for (const f of [pidFile, perPortPidFile]) {
+    try {
+      unlinkSync(f);
+    } catch {
+      /* not present */
+    }
   }
 }
 
@@ -158,42 +221,51 @@ async function main(): Promise<void> {
   // Step 3: stop old shim
   log.info("deploy: step 3/8 stop old shim");
   await stopOldShim(pidFile);
+  await waitForShimExit(pidFile, shimPort);
   // Brief pause for the OS to release the listening socket.
   await sleep(500);
 
   // Step 4: deploy (symlink or copy) — atomic via temp file + rename.
-  log.info("deploy: step 4/8 deploy shim", { copy: args.copy, target: deployTarget });
-  const tmpTarget = `${deployTarget}.${process.pid}.tmp`;
-  try {
-    // Clean up any stale temp file from a previous failed run.
+  // When the host dir doesn't exist (Grok Bot host not installed on this
+  // machine), there is nothing to deploy into — warn and continue instead of
+  // hard-failing AFTER the old shim was already stopped (which would leave
+  // the system dead until the next manual start).
+  if (!existsSync(sandHostDir)) {
+    log.warn("deploy: sand-host dir not found — skipping shim deployment (Grok Bot host not installed)", { sandHostDir });
+  } else {
+    log.info("deploy: step 4/8 deploy shim", { copy: args.copy, target: deployTarget });
+    const tmpTarget = `${deployTarget}.${process.pid}.tmp`;
     try {
-      unlinkSync(tmpTarget);
-    } catch {
-      /* not present */
+      // Clean up any stale temp file from a previous failed run.
+      try {
+        unlinkSync(tmpTarget);
+      } catch {
+        /* not present */
+      }
+      if (args.copy) {
+        copyFileSync(shimBuilt, tmpTarget);
+      } else {
+        // Relative symlink so the link survives repo moves.
+        const linkTarget = path.relative(path.dirname(deployTarget), shimBuilt);
+        symlinkSync(linkTarget, tmpTarget);
+      }
+      // Atomically replace the deploy target (POSIX rename).
+      renameSync(tmpTarget, deployTarget);
+    } catch (err) {
+      // Clean up the temp file on failure.
+      try {
+        unlinkSync(tmpTarget);
+      } catch {
+        /* ignore */
+      }
+      log.error("deploy: failed to deploy shim", { error: err instanceof Error ? err.message : String(err) });
+      process.exit(1);
     }
-    if (args.copy) {
-      copyFileSync(shimBuilt, tmpTarget);
-    } else {
-      // Relative symlink so the link survives repo moves.
-      const linkTarget = path.relative(path.dirname(deployTarget), shimBuilt);
-      symlinkSync(linkTarget, tmpTarget);
-    }
-    // Atomically replace the deploy target (POSIX rename).
-    renameSync(tmpTarget, deployTarget);
-  } catch (err) {
-    // Clean up the temp file on failure.
-    try {
-      unlinkSync(tmpTarget);
-    } catch {
-      /* ignore */
-    }
-    log.error("deploy: failed to deploy shim", { error: err instanceof Error ? err.message : String(err) });
-    process.exit(1);
   }
 
   // Step 5: start new shim
   log.info("deploy: step 5/8 start new shim", { port: shimPort });
-  try {
+  const spawnShim = (): void => {
     const child = execSync(
       `nohup node ${JSON.stringify(shimBuilt)} > ${JSON.stringify(logFile)} 2>&1 & echo $!`,
       { cwd: projectRoot },
@@ -202,19 +274,45 @@ async function main(): Promise<void> {
     if (!Number.isNaN(pid)) {
       writeFileSync(pidFile, String(pid));
     }
+  };
+  const waitForListen = async (): Promise<boolean> => {
+    for (let i = 0; i < 10; i++) {
+      if (await portIsListening(shimHost, shimPort)) return true;
+      await sleep(1000);
+    }
+    return false;
+  };
+  try {
+    spawnShim();
   } catch (err) {
     log.error("deploy: failed to start shim", { error: err instanceof Error ? err.message : String(err) });
     process.exit(1);
   }
 
-  // Wait up to 10s for the port to listen.
-  let listening = false;
-  for (let i = 0; i < 10; i++) {
-    if (await portIsListening(shimHost, shimPort)) {
-      listening = true;
-      break;
+  // Wait for the port; if the spawn lost a lock race with a lingering
+  // graceful-shutdown holder (the fresh shim exits instantly with "another
+  // shim instance is already running"), sweep EVERYTHING and retry once.
+  let listening = await waitForListen();
+  if (!listening) {
+    log.warn("deploy: shim did not come up — sweeping stragglers and retrying once", { port: shimPort });
+    try {
+      execSync('pkill -f "dist/shim.js"', { stdio: "ignore" });
+    } catch {
+      /* no matching process */
     }
-    await sleep(1000);
+    await waitForShimExit(pidFile, shimPort);
+    // Also wait for the socket itself to be released.
+    for (let i = 0; i < 10; i++) {
+      if (!(await portIsListening(shimHost, shimPort))) break;
+      await sleep(500);
+    }
+    try {
+      spawnShim();
+    } catch (err) {
+      log.error("deploy: failed to start shim (retry)", { error: err instanceof Error ? err.message : String(err) });
+      process.exit(1);
+    }
+    listening = await waitForListen();
   }
   if (!listening) {
     log.error("deploy: shim did not start listening in time", { port: shimPort });

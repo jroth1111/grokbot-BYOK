@@ -154,6 +154,15 @@ export class CircuitBreaker {
    */
   classifyErrorFromResponse(status: number, bodyText: string): ErrorType {
     const errObj = { status, message: bodyText } as Record<string, unknown>;
+    // ChatGPT-backend usage limit: a 429 whose body carries the
+    // `usage_limit_reached` code means the *account* (not the provider) is
+    // out of quota for the current window. Treat it like an auth error so
+    // the caller rotates to the next account and fails over only when every
+    // account is exhausted — plain rate-limit cooldown would waste the
+    // other accounts' quota.
+    if (status === 429 && bodyText.includes("usage_limit_reached")) {
+      return "auth-error";
+    }
     // Content-blocked: non-retryable safety filter — don't waste failover.
     if (isContentBlockedText(bodyText)) return "request-error";
     // Context too large: retryable — another provider may accept it.

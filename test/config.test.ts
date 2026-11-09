@@ -376,7 +376,15 @@ describe("DEFAULT_CONFIG", () => {
   });
 
   it("has the expected provider priority order", () => {
-    expect(DEFAULT_CONFIG.providers.priority).toEqual(["opencode-go", "opencode-zen", "local"]);
+    expect(DEFAULT_CONFIG.providers.priority).toEqual([
+      "zai",
+      "opencode-go",
+      "opencode-zen",
+      "local",
+      "chatgpt",
+      "claude",
+      "antigravity",
+    ]);
   });
 });
 

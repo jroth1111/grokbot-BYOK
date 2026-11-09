@@ -30,6 +30,10 @@ import type {
   SessionAffinityConfig,
   ShimConfig,
 } from "../src/types.js";
+import { ChatGptTokenStore, type ChatGptAccount } from "../src/providers/chatgpt-oauth.js";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 // Each createServer() call registers SIGTERM/SIGINT listeners on `process`
 // (for graceful shutdown) that are never removed when the server closes. This
@@ -61,6 +65,8 @@ interface MockUpstreamOpts {
   authKeyStatus?: Record<string, number>;
   /** SSE chunks to send when an auth-key override resolves to status 200. */
   authKeySseChunks?: object[];
+  /** JSON body override per bearer token (e.g. usage_limit_reached 429s). */
+  authKeyBody?: Record<string, object>;
   /** If set, send SSE comment keepalives (":keepalive\n\n") every N ms before
    *  the real SSE chunks. Used to test that keepalive-only bytes don't reset
    *  the stream idle timeout. */
@@ -77,6 +83,10 @@ interface MockUpstream {
   callCount: { value: number };
   /** Authorization headers received, in call order. */
   receivedAuths: string[];
+  /** Full header maps received, in call order (chatgpt-account-id checks). */
+  receivedHeaderMaps: Record<string, string | string[] | undefined>[];
+  /** Request bodies received, in call order (wire-format assertions). */
+  receivedBodies: string[];
 }
 
 /**
@@ -90,91 +100,106 @@ function startMockUpstream(opts: MockUpstreamOpts = {}): Promise<MockUpstream> {
   return new Promise((resolve, reject) => {
     const callCount = { value: 0 };
     const receivedAuths: string[] = [];
+    const receivedHeaderMaps: Record<string, string | string[] | undefined>[] = [];
+    const receivedBodies: string[] = [];
 
     const server = http.createServer((req, res) => {
-      callCount.value++;
-      const auth = (req.headers["authorization"] as string | undefined) ?? "";
-      receivedAuths.push(auth);
-
       // Swallow errors from aborted client connections so a cancelled fetch
       // (e.g. timeout/stall) never crashes the mock.
       req.on("error", () => {});
       res.on("error", () => {});
 
-      // Resolve the status for this call.
-      let status = opts.status ?? 200;
-      let sseChunks = opts.sseChunks;
-      if (opts.statusSequence && callCount.value - 1 < opts.statusSequence.length) {
-        status = opts.statusSequence[callCount.value - 1];
-      }
-      if (opts.authKeyStatus) {
-        const bearer = auth.replace(/^Bearer\s+/, "");
-        if (bearer in opts.authKeyStatus) {
-          status = opts.authKeyStatus[bearer];
-          if (status === 200 && opts.authKeySseChunks) {
-            sseChunks = opts.authKeySseChunks;
-          }
+      const bodyChunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => bodyChunks.push(c));
+      req.on("end", () => {
+        callCount.value++;
+        const auth = (req.headers["authorization"] as string | undefined) ?? "";
+        receivedAuths.push(auth);
+        receivedHeaderMaps.push({ ...req.headers });
+        receivedBodies.push(Buffer.concat(bodyChunks).toString("utf8"));
+
+        // Resolve the status for this call.
+        let status = opts.status ?? 200;
+        let sseChunks = opts.sseChunks;
+        if (opts.statusSequence && callCount.value - 1 < opts.statusSequence.length) {
+          status = opts.statusSequence[callCount.value - 1];
         }
-      }
-
-      const respond = (): void => {
-        if (res.destroyed || res.writableEnded) return;
-
-        if (opts.stall) {
-          res.writeHead(200, {
-            "Content-Type": "text/event-stream",
-            ...(opts.headers ?? {}),
-          });
-          // Force the headers out so the client's fetch resolves on the 200
-          // head; we then intentionally never write a body or end the response.
-          res.flushHeaders();
-          return;
-        }
-
-        if (status === 200 && sseChunks) {
-          res.writeHead(200, {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            ...(opts.headers ?? {}),
-          });
-          // If keepalive is configured, send comment lines periodically
-          // before the real data. This simulates providers like OpenRouter
-          // that send ":keepalive\n\n" to hold the socket open.
-          if (opts.keepaliveMs && opts.keepaliveDurationMs) {
-            const kaStart = Date.now();
-            const kaTimer = setInterval(() => {
-              if (Date.now() - kaStart >= opts.keepaliveDurationMs!) {
-                clearInterval(kaTimer);
-                for (const chunk of sseChunks!) {
-                  res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-                }
-                res.write("data: [DONE]\n\n");
-                res.end();
-              } else {
-                res.write(":keepalive\n\n");
-              }
-            }, opts.keepaliveMs);
-          } else {
-            for (const chunk of sseChunks) {
-              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        if (opts.authKeyStatus) {
+          const bearer = auth.replace(/^Bearer\s+/, "");
+          if (bearer in opts.authKeyStatus) {
+            status = opts.authKeyStatus[bearer];
+            if (status === 200 && opts.authKeySseChunks) {
+              sseChunks = opts.authKeySseChunks;
             }
-            res.write("data: [DONE]\n\n");
-            res.end();
           }
-        } else {
-          res.writeHead(status, {
-            "Content-Type": "application/json",
-            ...(opts.headers ?? {}),
-          });
-          res.end(JSON.stringify({ error: { message: `mock ${status}` } }));
         }
-      };
+        let bodyOverride: object | undefined;
+        if (opts.authKeyBody) {
+          const bearer = auth.replace(/^Bearer\s+/, "");
+          if (bearer in opts.authKeyBody) {
+            bodyOverride = opts.authKeyBody[bearer];
+          }
+        }
 
-      if (opts.delayMs && opts.delayMs > 0) {
-        setTimeout(respond, opts.delayMs);
-      } else {
-        respond();
-      }
+        const respond = (): void => {
+          if (res.destroyed || res.writableEnded) return;
+
+          if (opts.stall) {
+            res.writeHead(200, {
+              "Content-Type": "text/event-stream",
+              ...(opts.headers ?? {}),
+            });
+            // Force the headers out so the client's fetch resolves on the 200
+            // head; we then intentionally never write a body or end the response.
+            res.flushHeaders();
+            return;
+          }
+
+          if (status === 200 && sseChunks) {
+            res.writeHead(200, {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache",
+              ...(opts.headers ?? {}),
+            });
+            // If keepalive is configured, send comment lines periodically
+            // before the real data. This simulates providers like OpenRouter
+            // that send ":keepalive\n\n" to hold the socket open.
+            if (opts.keepaliveMs && opts.keepaliveDurationMs) {
+              const kaStart = Date.now();
+              const kaTimer = setInterval(() => {
+                if (Date.now() - kaStart >= opts.keepaliveDurationMs!) {
+                  clearInterval(kaTimer);
+                  for (const chunk of sseChunks!) {
+                    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+                  }
+                  res.write("data: [DONE]\n\n");
+                  res.end();
+                } else {
+                  res.write(":keepalive\n\n");
+                }
+              }, opts.keepaliveMs);
+            } else {
+              for (const chunk of sseChunks) {
+                res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+              }
+              res.write("data: [DONE]\n\n");
+              res.end();
+            }
+          } else {
+            res.writeHead(status, {
+              "Content-Type": "application/json",
+              ...(opts.headers ?? {}),
+            });
+            res.end(JSON.stringify(bodyOverride ?? { error: { message: `mock ${status}` } }));
+          }
+        };
+
+        if (opts.delayMs && opts.delayMs > 0) {
+          setTimeout(respond, opts.delayMs);
+        } else {
+          respond();
+        }
+      });
     });
 
     server.on("error", reject);
@@ -187,6 +212,8 @@ function startMockUpstream(opts: MockUpstreamOpts = {}): Promise<MockUpstream> {
           url: `http://127.0.0.1:${addr.port}/v1`,
           callCount,
           receivedAuths,
+          receivedHeaderMaps,
+          receivedBodies,
         });
       } else {
         reject(new Error("mock upstream did not bind to a port"));
@@ -229,6 +256,10 @@ function makeConfig(
     };
     if (override.keys !== undefined) config.keys = override.keys;
     if (override.network !== undefined) config.network = override.network;
+    if (override.auth !== undefined) config.auth = override.auth;
+    if (override.endpointPath !== undefined) config.endpointPath = override.endpointPath;
+    if (override.wireApi !== undefined) config.wireApi = override.wireApi;
+    if (override.compat !== undefined) config.compat = override.compat;
     configs[name] = config;
   }
   return {
@@ -928,6 +959,106 @@ describe("server integration: 429 triggers failover", () => {
   );
 });
 
+describe("server integration: quota-class 429 fails over without long sleep", () => {
+  // The in-request rate-limit backoff cap under test (mirrors the server
+  // constant; kept small here so a regression fails fast).
+  const CAP_PROBE_MS = 60_000;
+
+  let shim: { server: http.Server; port: number };
+  let primary: MockUpstream;
+  let secondary: MockUpstream;
+
+  beforeAll(async () => {
+    // Quota-class 429 whose recommended backoff (30 min) exceeds the
+    // in-request cap — the shim must move on to the secondary immediately
+    // instead of sleeping out the backoff inside the request.
+    primary = await startMockUpstream({
+      authKeyStatus: { "test-key": 429 },
+      authKeyBody: {
+        "test-key": {
+          error: { code: 429, message: "Your quota will reset after 1800 seconds" },
+        },
+      },
+    });
+    secondary = await startMockUpstream({ sseChunks: textSseChunks() });
+    const config = makeConfig(
+      { primary: primary.url, secondary: secondary.url },
+      { failover: true },
+    );
+    shim = await startShim(config);
+  });
+
+  afterAll(() => cleanup(shim.server, primary.server, secondary.server));
+
+  it("serves via the secondary quickly despite the 30-min recommended backoff", async () => {
+    const started = Date.now();
+    const { status, body } = await sendRequest(shim.port, basicRequest());
+    const elapsed = Date.now() - started;
+    expect(status).toBe(200);
+    // A 30-minute in-request sleep would blow every timeout; assert we
+    // returned in well under the rate-limit cap.
+    expect(elapsed).toBeLessThan(CAP_PROBE_MS);
+
+    const { frames } = parseResponse(body);
+    const text = frames
+      .filter(
+        (f) =>
+          "textPart" in f &&
+          !(f as { textPart: { isFinal: boolean } }).textPart.isFinal,
+      )
+      .map((f) => (f as { textPart: { text: string } }).textPart.text)
+      .join("");
+    expect(text).toBe("Hello world");
+    expect(primary.callCount.value).toBe(1);
+    expect(secondary.callCount.value).toBe(1);
+  });
+});
+
+describe("server integration: passthroughUpstream proxies non-inference RPCs", () => {
+  let shim: { server: http.Server; port: number };
+  let apiMock: MockUpstream;
+
+  beforeAll(async () => {
+    apiMock = await startMockUpstream({ sseChunks: textSseChunks() });
+    const config = makeConfig({ primary: apiMock.url });
+    config.passthroughUpstream = apiMock.url;
+    shim = await startShim(config);
+  });
+
+  afterAll(() => cleanup(shim.server, apiMock.server));
+
+  it("proxies non-stream paths verbatim while Stream stays local", async () => {
+    // GET passthrough (headers + status + body verbatim).
+    const getResp = await fetch(`http://127.0.0.1:${shim.port}/some/rpc/path`);
+    expect(getResp.status).toBe(200);
+
+    // POST passthrough with a body + auth header.
+    const postResp = await fetch(
+      `http://127.0.0.1:${shim.port}/aiserver.v1.DashboardService/GetState`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer x" },
+        body: JSON.stringify({ hi: 1 }),
+      },
+    );
+    expect(postResp.status).toBe(200);
+
+    // The inference stream path is still served by the LOCAL provider chain.
+    const { status, body } = await sendRequest(shim.port, basicRequest());
+    expect(status).toBe(200);
+    const { frames } = parseResponse(body);
+    const text = frames
+      .filter(
+        (f) =>
+          "textPart" in f &&
+          !(f as { textPart: { isFinal: boolean } }).textPart.isFinal,
+      )
+      .map((f) => (f as { textPart: { text: string } }).textPart.text)
+      .join("");
+    expect(text).toBe("Hello world");
+  });
+});
+
 describe("server integration: 401 triggers key rotation", () => {
   let shim: { server: http.Server; port: number };
   let upstream: MockUpstream;
@@ -1491,4 +1622,578 @@ describe("server integration: keepalive bytes don't reset stream idle timeout", 
     },
     10000,
   );
+});
+
+// ===========================================================================
+// ChatGPT OAuth provider ("Sign in with ChatGPT", Responses wire API)
+// ===========================================================================
+
+/** Minimal unsigned JWT carrying the OpenAI auth claim. */
+function fakeAccessJwt(accountId: string): string {
+  const b64url = (obj: object) => Buffer.from(JSON.stringify(obj)).toString("base64url");
+  return [
+    b64url({ alg: "none", typ: "JWT" }),
+    b64url({
+      "https://api.openai.com/auth": { chatgpt_account_id: accountId },
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    }),
+    "sig",
+  ].join(".");
+}
+
+function chatgptAccount(
+  accountId: string,
+  overrides: Partial<ChatGptAccount> = {},
+): ChatGptAccount {
+  return {
+    accountId,
+    accessToken: fakeAccessJwt(accountId),
+    refreshToken: `rt-${accountId}`,
+    expiresAtMs: Date.now() + 55 * 60 * 1000,
+    obtainedAtMs: Date.now(),
+    enabled: true,
+    ...overrides,
+  };
+}
+
+/** Write a token store to a temp file and return its path. */
+function writeChatgptTokenFile(accounts: ChatGptAccount[]): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "byok-shim-oauth-"));
+  const file = path.join(dir, "chatgpt-tokens.json");
+  new ChatGptTokenStore(file).save(accounts);
+  return file;
+}
+
+/** Mock auth.openai.com token endpoint (form POST, refresh grant). */
+function startOAuthTokenMock(): Promise<{
+  server: http.Server;
+  url: string;
+  refreshCalls: string[];
+}> {
+  return new Promise((resolve, reject) => {
+    const refreshCalls: string[] = [];
+    const server = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("end", () => {
+        const params = new URLSearchParams(Buffer.concat(chunks).toString("utf8"));
+        const refreshToken = params.get("refresh_token") ?? "";
+        refreshCalls.push(refreshToken);
+        if (refreshToken.includes("revoked")) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "invalid_grant" }));
+          return;
+        }
+        const accountId = refreshToken.replace(/^rt-/, "");
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            // Plain (non-JWT) string tokens keep the account-mismatch check inert.
+            access_token: `tok-fresh-${accountId}`,
+            refresh_token: `${refreshToken}-2`,
+            expires_in: 3600,
+            token_type: "Bearer",
+          }),
+        );
+      });
+    });
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      if (addr && typeof addr === "object") {
+        resolve({ server, url: `http://127.0.0.1:${addr.port}/oauth/token`, refreshCalls });
+      } else {
+        reject(new Error("oauth token mock did not bind"));
+      }
+    });
+  });
+}
+
+/** A Responses-API SSE event sequence: reasoning + text + usage. */
+function responsesTextChunks(): object[] {
+  return [
+    { type: "response.created", response: { id: "resp_1" } },
+    { type: "response.output_item.added", output_index: 0, item: { type: "message", role: "assistant" } },
+    { type: "response.reasoning_summary_text.delta", delta: "thinking" },
+    { type: "response.output_text.delta", delta: "Hello" },
+    { type: "response.output_text.delta", delta: " world" },
+    {
+      type: "response.completed",
+      response: { usage: { input_tokens: 12, output_tokens: 6, total_tokens: 18 } },
+    },
+  ];
+}
+
+/** Options every chatgpt provider entry in these tests shares. */
+function chatgptOverride(tokenFile: string, tokenUrl: string): Partial<ProviderConfig> {
+  return {
+    apiKey: "",
+    auth: { type: "chatgpt-oauth", tokenFile, tokenUrl },
+    endpointPath: "/responses",
+    wireApi: "responses",
+    defaultModel: "gpt-5.2-codex",
+    models: { "test-model": "gpt-5.2-codex", "sand-default": "gpt-5.2-codex" },
+    compat: { supportsImages: false, supportsReasoningEffort: true },
+  };
+}
+
+/** Collect the visible (non-final) text of a parsed response. */
+function responseText(frames: InferenceStreamResponse[]): string {
+  return frames
+    .filter(
+      (f) =>
+        "textPart" in f && !(f as { textPart: { isFinal: boolean } }).textPart.isFinal,
+    )
+    .map((f) => (f as { textPart: { text: string } }).textPart.text)
+    .join("");
+}
+
+describe("server integration: chatgpt oauth provider (responses wire api)", () => {
+  let shim: { server: http.Server; port: number };
+  let upstream: MockUpstream;
+  let tokenMock: { server: http.Server; url: string; refreshCalls: string[] };
+  let tokenFile: string;
+
+  beforeAll(async () => {
+    tokenMock = await startOAuthTokenMock();
+    tokenFile = writeChatgptTokenFile([
+      chatgptAccount("acct-1", { accessToken: "tok-acct-1" }),
+    ]);
+    upstream = await startMockUpstream({
+      sseChunks: responsesTextChunks(),
+      authKeyStatus: { "tok-acct-1": 200 },
+    });
+    const config = makeConfig(
+      { chatgpt: upstream.url },
+      { providerOverrides: { chatgpt: chatgptOverride(tokenFile, tokenMock.url) } },
+    );
+    shim = await startShim(config);
+  });
+
+  afterAll(() => cleanup(shim.server, upstream.server, tokenMock.server));
+
+  it("streams responses-api events through translation with account headers", async () => {
+    const { status, body } = await sendRequest(shim.port, basicRequest());
+    expect(status).toBe(200);
+
+    const { frames } = parseResponse(body);
+    expect(frames.some((f) => "error" in f)).toBe(false);
+    // Reasoning deltas + content deltas both surface as text frames.
+    expect(responseText(frames)).toBe("thinkingHello world");
+    const usage = frames.find((f) => "usage" in f) as
+      | { usage: { promptTokens: number; completionTokens: number; totalTokens?: number } }
+      | undefined;
+    expect(usage?.usage.promptTokens).toBe(12);
+    expect(usage?.usage.completionTokens).toBe(6);
+    expect(usage?.usage.totalTokens).toBe(18);
+
+    // The upstream saw the OAuth bearer + account header, and only one call
+    // (token comfortably valid → no refresh round-trip).
+    expect(upstream.receivedAuths).toEqual([`Bearer tok-acct-1`]);
+    expect(upstream.receivedHeaderMaps[0]["chatgpt-account-id"]).toBe("acct-1");
+    expect(upstream.callCount.value).toBe(1);
+    expect(tokenMock.refreshCalls).toHaveLength(0);
+  });
+});
+
+describe("server integration: chatgpt usage_limit_reached rotates account", () => {
+  let shim: { server: http.Server; port: number };
+  let upstream: MockUpstream;
+  let tokenMock: { server: http.Server; url: string; refreshCalls: string[] };
+
+  beforeAll(async () => {
+    tokenMock = await startOAuthTokenMock();
+    // acct-1's refresh token is revoked: the forced refresh after the 429
+    // fails fast (invalid_grant) and the request rotates to acct-2.
+    const tokenFile = writeChatgptTokenFile([
+      chatgptAccount("acct-1", {
+        accessToken: "tok-acct-1",
+        refreshToken: "rt-revoked-acct-1",
+      }),
+      chatgptAccount("acct-2", { accessToken: "tok-acct-2" }),
+    ]);
+    upstream = await startMockUpstream({
+      authKeyStatus: { "tok-acct-1": 429, "tok-acct-2": 200 },
+      authKeyBody: {
+        "tok-acct-1": {
+          error: { code: "usage_limit_reached", message: "usage limit reached" },
+        },
+      },
+      authKeySseChunks: responsesTextChunks(),
+    });
+    const config = makeConfig(
+      { chatgpt: upstream.url },
+      { providerOverrides: { chatgpt: chatgptOverride(tokenFile, tokenMock.url) } },
+    );
+    shim = await startShim(config);
+  });
+
+  afterAll(() => cleanup(shim.server, upstream.server, tokenMock.server));
+
+  it("treats the 429 quota error as account-level and rotates keys", async () => {
+    const { status, body } = await sendRequest(shim.port, basicRequest());
+    expect(status).toBe(200);
+
+    const { frames } = parseResponse(body);
+    expect(frames.some((f) => "error" in f)).toBe(false);
+    expect(responseText(frames)).toBe("thinkingHello world");
+    expect(upstream.receivedAuths).toEqual(["Bearer tok-acct-1", "Bearer tok-acct-2"]);
+    expect(upstream.callCount.value).toBe(2);
+    // One forced refresh was attempted for the quota-exhausted account.
+    expect(tokenMock.refreshCalls).toEqual(["rt-revoked-acct-1"]);
+  });
+});
+
+describe("server integration: chatgpt 401 triggers token refresh then retry", () => {
+  let shim: { server: http.Server; port: number };
+  let upstream: MockUpstream;
+  let tokenMock: { server: http.Server; url: string; refreshCalls: string[] };
+  let tokenFile: string;
+
+  beforeAll(async () => {
+    tokenMock = await startOAuthTokenMock();
+    // "tok-stale" is revoked server-side but not near expiry, so the first
+    // call uses it as-is; the 401 hook force-refreshes and retries the same
+    // account with "tok-fresh-acct-1".
+    tokenFile = writeChatgptTokenFile([
+      chatgptAccount("acct-1", { accessToken: "tok-stale" }),
+    ]);
+    upstream = await startMockUpstream({
+      authKeyStatus: { "tok-stale": 401, "tok-fresh-acct-1": 200 },
+      authKeySseChunks: responsesTextChunks(),
+    });
+    const config = makeConfig(
+      { chatgpt: upstream.url },
+      { providerOverrides: { chatgpt: chatgptOverride(tokenFile, tokenMock.url) } },
+    );
+    shim = await startShim(config);
+  });
+
+  afterAll(() => cleanup(shim.server, upstream.server, tokenMock.server));
+
+  it("refreshes the access token once and retries the same account", async () => {
+    const { status, body } = await sendRequest(shim.port, basicRequest());
+    expect(status).toBe(200);
+
+    const { frames } = parseResponse(body);
+    expect(frames.some((f) => "error" in f)).toBe(false);
+    expect(responseText(frames)).toBe("thinkingHello world");
+    expect(upstream.receivedAuths).toEqual(["Bearer tok-stale", "Bearer tok-fresh-acct-1"]);
+    expect(tokenMock.refreshCalls).toEqual(["rt-acct-1"]);
+
+    // The refreshed tokens (incl. the rotated refresh token) were persisted.
+    const persisted = new ChatGptTokenStore(tokenFile).load();
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0].accessToken).toBe("tok-fresh-acct-1");
+    expect(persisted[0].refreshToken).toBe("rt-acct-1-2");
+  });
+});
+
+// ===========================================================================
+// Claude (Anthropic Messages) + Antigravity (Gemini v1internal) OAuth
+// ===========================================================================
+
+/** Mock claude token endpoint (JSON refresh grant). */
+function startClaudeTokenMock(): Promise<{
+  server: http.Server;
+  url: string;
+  refreshCalls: string[];
+}> {
+  const refreshCalls: string[] = [];
+  return new Promise((resolve, reject) => {
+    const server = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("end", () => {
+        try {
+          const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+            refresh_token?: string;
+          };
+          refreshCalls.push(body.refresh_token ?? "");
+        } catch {
+          refreshCalls.push("");
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ access_token: "claude-fresh", expires_in: 3600 }));
+      });
+    });
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        server,
+        url: `http://127.0.0.1:${(server.address() as { port: number }).port}/v1/oauth/token`,
+        refreshCalls,
+      });
+    });
+  });
+}
+
+/** Mock Google token endpoint (form refresh grant). */
+function startGoogleTokenMock(): Promise<{
+  server: http.Server;
+  url: string;
+  refreshCalls: string[];
+}> {
+  const refreshCalls: string[] = [];
+  return new Promise((resolve, reject) => {
+    const server = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("end", () => {
+        const params = new URLSearchParams(Buffer.concat(chunks).toString("utf8"));
+        refreshCalls.push(params.get("refresh_token") ?? "");
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ access_token: "google-fresh", expires_in: 3600 }));
+      });
+    });
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        server,
+        url: `http://127.0.0.1:${(server.address() as { port: number }).port}/token`,
+        refreshCalls,
+      });
+    });
+  });
+}
+
+/** Anthropic SSE events for a tool-calling completion. */
+function anthropicToolChunks(): object[] {
+  return [
+    { type: "message_start", message: { usage: { input_tokens: 21 } } },
+    { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_1", name: "get_weather" } },
+    { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"city":' } },
+    { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '"NYC"}' } },
+    { type: "content_block_stop", index: 0 },
+    { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 9 } },
+    { type: "message_stop" },
+  ];
+}
+
+function claudeOverride(tokenFile: string, tokenUrl: string): Partial<ProviderConfig> {
+  return {
+    apiKey: "",
+    auth: { type: "claude-oauth", tokenFile, tokenUrl },
+    endpointPath: "/v1/messages",
+    wireApi: "anthropic-messages",
+    defaultModel: "claude-sonnet-4-5",
+    models: { "test-model": "claude-sonnet-4-5", "sand-default": "claude-sonnet-4-5" },
+    compat: { supportsImages: false, supportsReasoningEffort: false },
+  };
+}
+
+describe("server integration: claude oauth provider (anthropic messages wire)", () => {
+  let shim: { server: http.Server; port: number };
+  let upstream: MockUpstream;
+  let tokenMock: { server: http.Server; url: string; refreshCalls: string[] };
+  let tokenFile: string;
+
+  beforeAll(async () => {
+    tokenMock = await startClaudeTokenMock();
+    tokenFile = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "byok-claude-")),
+      "claude-tokens.json",
+    );
+    fs.writeFileSync(
+      tokenFile,
+      JSON.stringify({
+        version: 1,
+        accounts: [
+          {
+            accountId: "acc-claude",
+            accessToken: "claude-tok",
+            refreshToken: "rt-claude",
+            expiresAtMs: Date.now() + 55 * 60 * 1000,
+            obtainedAtMs: Date.now(),
+            enabled: true,
+          },
+        ],
+      }),
+    );
+    upstream = await startMockUpstream({
+      sseChunks: anthropicToolChunks(),
+      authKeyStatus: { "claude-tok": 200 },
+    });
+    const config = makeConfig(
+      { claude: upstream.url },
+      { providerOverrides: { claude: claudeOverride(tokenFile, tokenMock.url) } },
+    );
+    shim = await startShim(config);
+  });
+
+  afterAll(() => cleanup(shim.server, upstream.server, tokenMock.server));
+
+  it("translates the anthropic stream end-to-end with oauth headers and wire body", async () => {
+    const { status, body } = await sendRequest(shim.port, basicRequest());
+    expect(status).toBe(200);
+
+    const { frames } = parseResponse(body);
+    expect(frames.some((f) => "error" in f)).toBe(false);
+    const toolFrame = frames.find((f) => "toolCallPart" in f) as
+      | { toolCallPart: { toolName: string; args: string; isComplete: boolean } }
+      | undefined;
+    expect(toolFrame?.toolCallPart.toolName).toBe("get_weather");
+    expect(toolFrame?.toolCallPart.args).toBe('{"city":"NYC"}');
+    const usage = frames.find((f) => "usage" in f) as
+      | { usage: { promptTokens: number; completionTokens: number } }
+      | undefined;
+    expect(usage?.usage.promptTokens).toBe(21);
+    expect(usage?.usage.completionTokens).toBe(9);
+
+    // Upstream saw the Claude OAuth headers + the Messages wire format.
+    expect(upstream.receivedAuths).toEqual(["Bearer claude-tok"]);
+    expect(upstream.receivedHeaderMaps[0]["anthropic-version"]).toBe("2023-06-01");
+    expect(String(upstream.receivedHeaderMaps[0]["anthropic-beta"])).toContain("oauth-2025-04-20");
+    const sentBody = JSON.parse(upstream.receivedBodies[0]);
+    expect(sentBody.model).toBe("claude-sonnet-4-5");
+    expect(sentBody.max_tokens).toBeGreaterThan(0);
+    expect(sentBody.messages[0].role).toBe("user");
+    expect(tokenMock.refreshCalls).toHaveLength(0);
+  });
+});
+
+describe("server integration: claude 401 triggers refresh then retry", () => {
+  let shim: { server: http.Server; port: number };
+  let upstream: MockUpstream;
+  let tokenMock: { server: http.Server; url: string; refreshCalls: string[] };
+  let tokenFile: string;
+
+  beforeAll(async () => {
+    tokenMock = await startClaudeTokenMock();
+    tokenFile = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "byok-claude2-")),
+      "claude-tokens.json",
+    );
+    fs.writeFileSync(
+      tokenFile,
+      JSON.stringify({
+        version: 1,
+        accounts: [
+          {
+            accountId: "acc-claude",
+            accessToken: "claude-stale",
+            refreshToken: "rt-claude",
+            expiresAtMs: Date.now() + 55 * 60 * 1000,
+            obtainedAtMs: Date.now(),
+            enabled: true,
+          },
+        ],
+      }),
+    );
+    upstream = await startMockUpstream({
+      authKeyStatus: { "claude-stale": 401, "claude-fresh": 200 },
+      authKeySseChunks: [
+        { type: "message_start", message: { usage: { input_tokens: 4 } } },
+        { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } },
+        { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
+        { type: "message_stop" },
+      ],
+    });
+    const config = makeConfig(
+      { claude: upstream.url },
+      { providerOverrides: { claude: claudeOverride(tokenFile, tokenMock.url) } },
+    );
+    shim = await startShim(config);
+  });
+
+  afterAll(() => cleanup(shim.server, upstream.server, tokenMock.server));
+
+  it("force-refreshes once and retries the same account", async () => {
+    const { status, body } = await sendRequest(shim.port, basicRequest());
+    expect(status).toBe(200);
+    const { frames } = parseResponse(body);
+    expect(frames.some((f) => "error" in f)).toBe(false);
+    expect(responseText(frames)).toBe("ok");
+    expect(upstream.receivedAuths).toEqual(["Bearer claude-stale", "Bearer claude-fresh"]);
+    expect(tokenMock.refreshCalls).toEqual(["rt-claude"]);
+  });
+});
+
+describe("server integration: antigravity oauth provider (gemini v1internal wire)", () => {
+  let shim: { server: http.Server; port: number };
+  let upstream: MockUpstream;
+  let tokenMock: { server: http.Server; url: string; refreshCalls: string[] };
+  let tokenFile: string;
+
+  beforeAll(async () => {
+    tokenMock = await startGoogleTokenMock();
+    tokenFile = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "byok-ag-")),
+      "antigravity-tokens.json",
+    );
+    fs.writeFileSync(
+      tokenFile,
+      JSON.stringify({
+        version: 1,
+        accounts: [
+          {
+            accountId: "user@example.com",
+            accessToken: "google-tok",
+            refreshToken: "rt-google",
+            expiresAtMs: Date.now() + 55 * 60 * 1000,
+            obtainedAtMs: Date.now(),
+            enabled: true,
+            projectId: "proj-42",
+          },
+        ],
+      }),
+    );
+    upstream = await startMockUpstream({
+      sseChunks: [
+        { response: { candidates: [{ content: { role: "model", parts: [{ text: "thinking", thought: true }] } }] } },
+        { response: { candidates: [{ content: { role: "model", parts: [{ text: "Hello world" }] } }] } },
+        {
+          response: {
+            candidates: [{ content: { role: "model", parts: [{ text: "" }] }, finishReason: "STOP" }],
+            usageMetadata: { promptTokenCount: 8, candidatesTokenCount: 3, totalTokenCount: 11 },
+          },
+        },
+      ],
+      authKeyStatus: { "google-tok": 200 },
+    });
+    const config = makeConfig(
+      { antigravity: upstream.url },
+      {
+        providerOverrides: {
+          antigravity: {
+            apiKey: "",
+            auth: { type: "antigravity-oauth", tokenFile, tokenUrl: tokenMock.url },
+            endpointPath: "/v1internal:streamGenerateContent?alt=sse",
+            wireApi: "gemini-v1internal",
+            defaultModel: "gemini-3-pro-preview",
+            models: { "test-model": "gemini-3-pro-preview", "sand-default": "gemini-3-pro-preview" },
+            compat: { supportsImages: false, supportsReasoningEffort: false },
+          },
+        },
+      },
+    );
+    shim = await startShim(config);
+  });
+
+  afterAll(() => cleanup(shim.server, upstream.server, tokenMock.server));
+
+  it("translates the gemini stream end-to-end with project metadata + hub UA", async () => {
+    const { status, body } = await sendRequest(shim.port, basicRequest());
+    expect(status).toBe(200);
+
+    const { frames } = parseResponse(body);
+    expect(frames.some((f) => "error" in f)).toBe(false);
+    // Thought parts surface as reasoning (text frames) + content arrives.
+    expect(responseText(frames)).toBe("thinkingHello world");
+    const usage = frames.find((f) => "usage" in f) as
+      | { usage: { promptTokens: number; completionTokens: number; totalTokens?: number } }
+      | undefined;
+    expect(usage?.usage.promptTokens).toBe(8);
+    expect(usage?.usage.totalTokens).toBe(11);
+
+    // Upstream call shape: alt=sse path, hub UA, Bearer, v1internal body.
+    expect(upstream.receivedAuths).toEqual(["Bearer google-tok"]);
+    expect(String(upstream.receivedHeaderMaps[0]["user-agent"])).toMatch(/^antigravity\/hub\//);
+    const sentBody = JSON.parse(upstream.receivedBodies[0]);
+    // Project rides as a query param (added by the fetch layer), never in the body.
+    expect("metadata" in sentBody).toBe(false);
+    expect("metadata" in sentBody.request).toBe(false);
+    expect(Array.isArray(sentBody.request.contents)).toBe(true);
+    expect(sentBody.request.contents[0].role).toBe("user");
+  });
 });
