@@ -104,6 +104,7 @@ export const shimConfigSchema = z.object({
   routingStrategy: z.enum(["priority", "round-robin", "weighted-round-robin", "fill-first", "latency"]).default("priority"),
   sessionAffinity: sessionAffinitySchema,
   visionFallbackModel: z.string().default(""),
+  passthroughUpstream: z.string().url().optional(),
   providers: providersSchema,
   hostConfig: hostConfigSchema,
 });

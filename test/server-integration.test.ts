@@ -1014,6 +1014,51 @@ describe("server integration: quota-class 429 fails over without long sleep", ()
   });
 });
 
+describe("server integration: passthroughUpstream proxies non-inference RPCs", () => {
+  let shim: { server: http.Server; port: number };
+  let apiMock: MockUpstream;
+
+  beforeAll(async () => {
+    apiMock = await startMockUpstream({ sseChunks: textSseChunks() });
+    const config = makeConfig({ primary: apiMock.url });
+    config.passthroughUpstream = apiMock.url;
+    shim = await startShim(config);
+  });
+
+  afterAll(() => cleanup(shim.server, apiMock.server));
+
+  it("proxies non-stream paths verbatim while Stream stays local", async () => {
+    // GET passthrough (headers + status + body verbatim).
+    const getResp = await fetch(`http://127.0.0.1:${shim.port}/some/rpc/path`);
+    expect(getResp.status).toBe(200);
+
+    // POST passthrough with a body + auth header.
+    const postResp = await fetch(
+      `http://127.0.0.1:${shim.port}/aiserver.v1.DashboardService/GetState`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer x" },
+        body: JSON.stringify({ hi: 1 }),
+      },
+    );
+    expect(postResp.status).toBe(200);
+
+    // The inference stream path is still served by the LOCAL provider chain.
+    const { status, body } = await sendRequest(shim.port, basicRequest());
+    expect(status).toBe(200);
+    const { frames } = parseResponse(body);
+    const text = frames
+      .filter(
+        (f) =>
+          "textPart" in f &&
+          !(f as { textPart: { isFinal: boolean } }).textPart.isFinal,
+      )
+      .map((f) => (f as { textPart: { text: string } }).textPart.text)
+      .join("");
+    expect(text).toBe("Hello world");
+  });
+});
+
 describe("server integration: 401 triggers key rotation", () => {
   let shim: { server: http.Server; port: number };
   let upstream: MockUpstream;

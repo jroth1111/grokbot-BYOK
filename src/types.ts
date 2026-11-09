@@ -393,6 +393,14 @@ export interface ShimConfig {
    * VISION_FALLBACK_MODEL env.
    */
   visionFallbackModel?: string;
+  /**
+   * When set (e.g. "https://api2.cursor.sh"), every request that is NOT the
+   * local inference stream path is transparently proxied to this upstream —
+   * headers and body forwarded verbatim, responses streamed back. Used with
+   * CURSOR_API_BASE_URL redirection so the host app's auth/dashboard/etc.
+   * RPCs keep working while inference is served locally.
+   */
+  passthroughUpstream?: string;
   providers: {
     priority: string[];
     configs: Record<string, ProviderConfig>;

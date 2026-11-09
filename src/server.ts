@@ -586,6 +586,99 @@ async function shadowProbe(
  * so provider routing state, circuit state, and session bindings persist for
  * the lifetime of the server.
  */
+/**
+ * Transparent reverse proxy for non-inference requests.
+ *
+ * When CURSOR_API_BASE_URL points the host app at the shim, every RPC other
+ * than the inference stream (auth, dashboard, models, analytics, updates…)
+ * is forwarded verbatim to the real backend — same method, headers (incl.
+ * the caller's Authorization), and body — and the response (including SSE /
+ * binary Connect payloads) is streamed back untouched. The local shim never
+ * inspects or logs these bodies.
+ */
+async function proxyPassThrough(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  upstreamBase: string,
+  logger: Logger,
+): Promise<void> {
+  const controller = new AbortController();
+  const teardown = (): void => {
+    controller.abort();
+    res.removeListener("close", teardown);
+    req.removeListener("aborted", teardown);
+  };
+  res.once("close", teardown);
+  req.once("aborted", teardown);
+
+  try {
+    const upstream = new URL(req.url ?? "/", upstreamBase);
+    // Forward every header except hop-by-hop framing ones the transport
+    // recomputes; Authorization/Cookie/User-Agent ride through unchanged.
+    const headers: Record<string, string> = {};
+    for (const [name, value] of Object.entries(req.headers)) {
+      if (value === undefined) continue;
+      if (["host", "connection", "content-length", "transfer-encoding"].includes(name)) {
+        continue;
+      }
+      headers[name] = Array.isArray(value) ? value.join(", ") : value;
+    }
+
+    const upstreamResp = await fetch(upstream, {
+      method: req.method,
+      headers,
+      body: req.method === "GET" || req.method === "HEAD" ? undefined : req,
+      signal: controller.signal,
+      // undici requires duplex for streamed request bodies.
+      ...(req.method === "GET" || req.method === "HEAD" ? {} : { duplex: "half" }),
+    } as RequestInit & { duplex?: string });
+
+    const responseHeaders: Record<string, string> = {};
+    upstreamResp.headers.forEach((value, name) => {
+      if (name === "transfer-encoding" || name === "content-length" || name === "connection") {
+        return;
+      }
+      responseHeaders[name] = value;
+    });
+    res.writeHead(upstreamResp.status, responseHeaders);
+    if (upstreamResp.body) {
+      const reader = upstreamResp.body.getReader();
+      res.on("close", () => {
+        void reader.cancel().catch(() => {
+          // upstream already closed
+        });
+      });
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!res.write(value)) {
+          await new Promise<void>((resolve) => res.once("drain", resolve));
+        }
+      }
+    }
+    res.end();
+    logger.info("passthrough", {
+      method: req.method,
+      path: req.url,
+      status: upstreamResp.status,
+    });
+  } catch (err) {
+    teardown();
+    if (!res.headersSent) {
+      res.writeHead(502, { "Content-Type": "text/plain" });
+    }
+    res.end(`passthrough failed: ${err instanceof Error ? err.message : String(err)}`);
+    logger.warn("passthrough failed", {
+      method: req.method,
+      path: req.url,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  } finally {
+    res.removeListener("close", teardown);
+    req.removeListener("aborted", teardown);
+  }
+}
+
 export function createServer(config: ShimConfig, baseLogger: Logger): http.Server {
   const registry = new ProviderRegistry(
     config.providers.configs,
@@ -646,8 +739,16 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
   metricsHandle.unref();
 
   const server = http.createServer(async (req, res) => {
-    // Only the streaming inference path is supported.
+    // Only the streaming inference path is served locally; everything else
+    // is either 404 or, when passthroughUpstream is configured, transparently
+    // proxied (used with CURSOR_API_BASE_URL redirection so the host app's
+    // auth/dashboard/analytics RPCs keep hitting the real backend while
+    // inference is served by local providers).
     if (req.method !== "POST" || req.url !== STREAM_PATH) {
+      if (config.passthroughUpstream) {
+        await proxyPassThrough(req, res, config.passthroughUpstream, baseLogger);
+        return;
+      }
       res.writeHead(404, { "Content-Type": "text/plain" });
       res.end("not found");
       return;
